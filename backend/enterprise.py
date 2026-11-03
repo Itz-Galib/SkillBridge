@@ -971,33 +971,56 @@ def admin_assessment_reviews(user=Depends(current_user)):
         except Exception:
             state = {}
         evidence = []
-        for index, saved in enumerate(state.get("answers", []), start=1):
-            question = QBYID.get(saved.get("qid"), {})
-            raw_answer = saved.get("answer")
-            options = question.get("options") or []
-            selected_option = None
-            if saved.get("type") == "mcq" and raw_answer not in (None, ""):
-                try:
-                    selected_option = options[int(raw_answer)]
-                except (ValueError, TypeError, IndexError):
-                    selected_option = str(raw_answer)
-            evidence.append({
-                "number": index,
-                "question_id": saved.get("qid"),
-                "topic": saved.get("topic") or question.get("topic"),
-                "type": saved.get("type") or question.get("type"),
-                "difficulty": saved.get("difficulty") or question.get("difficulty"),
-                "question": question.get("prompt") or "Question text unavailable",
-                "options": options,
-                "candidate_answer": raw_answer,
-                "selected_option": selected_option,
-                "answer_available": raw_answer is not None,
-                "automated_correct": saved.get("correct"),
-                "time_seconds": saved.get("seconds")
-            })
+        if state.get("graphrag"):
+            saved_answers = state.get("answers", {})
+            grade_map = {x.get("question_id"): x for x in (item.get("result") or {}).get("question_results", [])}
+            for index, question in enumerate(state.get("selected_questions", []), start=1):
+                raw_answer = saved_answers.get(question.get("id"))
+                grade = grade_map.get(question.get("id"), {})
+                qtype = str(question.get("question_type", "")).lower()
+                objective = qtype in ("mcq", "multiple choice") or ("sql" in qtype and bool(question.get("reference_answer")))
+                evidence.append({
+                    "number": index, "question_id": question.get("id"),
+                    "topic": question.get("assessment_topic"), "assessment_section": question.get("assessment_section"),
+                    "type": question.get("question_type"), "difficulty": question.get("difficulty_level"),
+                    "question": question.get("question_text") or "Question text unavailable",
+                    "options": question.get("options") or [], "candidate_answer": raw_answer,
+                    "selected_option": raw_answer if objective else None,
+                    "expected_answer": grade.get("correct_answer") or (question.get("correct_answer") if objective else question.get("reference_answer")),
+                    "explanation": question.get("explanation"),
+                    "grading_rubric": question.get("grading_rubric"),
+                    "answer_available": raw_answer is not None and str(raw_answer).strip() != "",
+                    "automated_correct": (grade.get("review_status") == "correct") if objective else None,
+                    "review_status": grade.get("review_status") or ("objective_auto_graded" if objective else "pending_human_review"),
+                    "marks": question.get("marks", 1), "time_allocation": question.get("time_allocation"),
+                    "time_seconds": grade.get("time_seconds", 0)
+                })
+        else:
+            for index, saved in enumerate(state.get("answers", []), start=1):
+                question = QBYID.get(saved.get("qid"), {})
+                raw_answer = saved.get("answer")
+                options = question.get("options") or []
+                selected_option = None
+                if saved.get("type") == "mcq" and raw_answer not in (None, ""):
+                    try:
+                        selected_option = options[int(raw_answer)]
+                    except (ValueError, TypeError, IndexError):
+                        selected_option = str(raw_answer)
+                evidence.append({
+                    "number": index, "question_id": saved.get("qid"),
+                    "topic": saved.get("topic") or question.get("topic"),
+                    "type": saved.get("type") or question.get("type"),
+                    "difficulty": saved.get("difficulty") or question.get("difficulty"),
+                    "question": question.get("prompt") or "Question text unavailable",
+                    "options": options, "candidate_answer": raw_answer,
+                    "selected_option": selected_option, "answer_available": raw_answer is not None,
+                    "automated_correct": saved.get("correct"), "time_seconds": saved.get("seconds")
+                })
         item["answer_evidence"] = evidence
         item["answer_evidence_complete"] = bool(evidence) and all(x["answer_available"] for x in evidence)
-        item["evaluation_method"] = "Deterministic answer-key / SQL grader; no generative AI score was produced."
+        item["manual_review_required"] = bool(item.get("result") and item["result"].get("manual_review_required"))
+        item["evaluation_method"] = ("MCQs auto-graded; coding, SQL, scenario and explanation answers require human review."
+            if state.get("graphrag") else "Deterministic answer-key / SQL grader; no generative AI score was produced.")
         items.append(item)
     return {"items":items}
 

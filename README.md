@@ -87,6 +87,61 @@ Enter your own email and a unique password of at least 14 characters when prompt
 | Bangla | UI + explanations. Question text is English only |
 | Not built (roadmap) | Recruiter/company/admin roles, camera proctoring, AI interviewer, MCP servers, pgvector, billing, SSO, virus scan |
 
+## GraphRAG-powered candidate assessment
+
+The assessment engine now has a GraphRAG retrieval path built around the existing, curator-governed `question_bank`. It retrieves and assembles approved questions; it does **not** fabricate assessment questions or answers at exam time.
+
+### Assessment blueprint
+
+- **Fundamental section:** 25 questions across DSA (5), OOP (4), Networking (4), Coding (5), Database (5), and Critical Thinking (2).
+- **Difficulty:** 40/30/30 is not an exact integer split for 25 questions. The engine uses the nearest whole-question allocation: 10 Easy, 8 Medium, 7 Hard. The per-topic matrix is returned with every blueprint.
+- **CV section:** five questions per candidate-confirmed CV skill: 1 Easy, 2 Medium, 2 Hard. CV skill extraction uses the redacted CV and the expanded technology taxonomy.
+- **Question formats:** the approved bank must cover scenario-based, explanation, SQL and coding questions in the fundamental section. Each CV skill must have practical (coding/SQL) and scenario/explanation coverage.
+- **Duration:** the server calculates the assessment duration by summing each selected question's configured `time_allocation`; it is not a fixed exam duration.
+- **Candidate experience:** five questions are shown per page in a table, with previous/next page navigation, per-question answer saving, a server-side timer and post-submit answer review. Correct answers are not exposed during the exam.
+- **Auditability:** each generated blueprint stores the selected question IDs, CV skill evidence, retrieval trace, provider status, quota gaps and retrieval latency. Attempt answers and submission results are stored in the existing attempt record. Subjective, scenario, coding and SQL answers are marked for human review; only MCQs are automatically graded in this first slice.
+
+### Retrieval architecture
+
+```
+Redacted CV
+   └─ spaCy tokenization + explicit skill alias extraction
+        └─ Pydantic CVSkill schema + candidate skill confirmation
+             └─ Assessment planner / quota validation
+                  ├─ Meilisearch: fast keyword recall
+                  └─ Neo4j: Skill → RELATED_TO → Topic → HAS_QUESTION
+                       └─ Reciprocal-rank fusion + deterministic quota selection
+                            └─ Approved question-bank snapshot → Assessment attempt
+```
+
+The relational question bank remains the source of truth. Meilisearch and Neo4j are optional retrieval accelerators; if either is not configured or unavailable, the selector falls back to deterministic question-bank filtering and reports the active provider status. The retrieval step is designed to complete quickly, but actual latency depends on question-bank size and external service availability; the measured `retrieval_ms` is stored and returned rather than promising a fixed 1–2 minute SLA.
+
+### Required question-bank preparation
+
+The selector fails closed when a quota is missing. Admins must create/import questions, set the correct category and subcategory, difficulty, question type, answer key/reference answer, explanation/rubric and per-question time allocation, then mark reviewed questions **Active**. Suggested subcategory labels include Python, Git, AI & Machine Learning, SQL, DSA, OOP, Networking and the other exact technology names found in CVs. Do not activate unreviewed questions. The Admin → Question Governance screen exposes GraphRAG readiness and a **Rebuild search + graph index** action.
+
+### Configure external retrieval services
+
+Set these on the backend service (Render for the current deployment):
+
+- `MEILISEARCH_URL`, `MEILISEARCH_API_KEY`, `MEILISEARCH_QUESTION_INDEX`
+- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`
+- `SPACY_MODEL` (defaults to `en_core_web_sm`; if the model is not installed, spaCy's blank English tokenizer and deterministic alias matching are used)
+
+After configuring both services, sign in as an admin, open **Question Governance**, and select **Rebuild search + graph index**. The Admin GraphRAG status endpoint reports question coverage and service configuration. Keep service credentials in Render environment variables, never in the frontend or repository.
+
+### API endpoints
+
+- `POST /api/assessment/blueprint` — create and persist a candidate-specific blueprint after CV skill confirmation.
+- `GET /api/assessment/blueprint/{blueprint_id}` — retrieve blueprint readiness metadata for its owner.
+- `POST /api/attempts` with `{"blueprint_id":"..." }` — start/resume the official attempt and consume existing retake credits under the existing policy.
+- `POST /api/attempts/{attempt_id}/answer` — save a question answer without revealing correctness.
+- `POST /api/attempts/{attempt_id}/navigate` — navigate to a question index.
+- `POST /api/attempts/{attempt_id}/submit` — submit the assessment; requires every question to be answered unless the server timer expires.
+- `GET /api/admin/assessment/graphrag/status` and `POST /api/admin/assessment/graphrag/reindex` — admin readiness and index maintenance.
+
+This implementation is an initial GraphRAG assessment slice. Meilisearch/Neo4j must be provisioned and configured separately, the approved question bank must meet every quota, and production end-to-end testing is still required before public use.
+
 ## Layout
 ```
 backend/   main.py (API) · engine.py (scoring, redaction, SQL sandbox) · content.py (taxonomy, questions, resources) · prompts/ · tests/

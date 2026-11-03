@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, t
 CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY, job_id TEXT NOT NULL, candidate_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'submitted', results_shared INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, UNIQUE(job_id, candidate_id));
 CREATE TABLE IF NOT EXISTS company_assessments(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, job_id TEXT, title TEXT NOT NULL, requirements TEXT NOT NULL, questions TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS candidate_profiles(user_id INTEGER PRIMARY KEY, headline TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', linkedin TEXT NOT NULL DEFAULT '', github TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL DEFAULT '', education TEXT NOT NULL DEFAULT '[]', experience TEXT NOT NULL DEFAULT '[]', projects TEXT NOT NULL DEFAULT '[]', preferences TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS assessment_blueprints(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS assessment_answer_events(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, question_id TEXT NOT NULL, revision INTEGER NOT NULL, answer_hash TEXT NOT NULL, answer_length INTEGER NOT NULL, created REAL NOT NULL);
 """
 
 
@@ -332,6 +334,100 @@ def confirm_skills(b: Confirm, u=Depends(current_user)):
     run("INSERT INTO profiles(user_id,confirmed) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET confirmed=excluded.confirmed", (u["id"], json.dumps(ids)))
     return {"confirmed": ids}
 
+# ------------------------------------------------------------------ GraphRAG assessment blueprint
+@app.post("/api/assessment/blueprint")
+def generate_assessment_blueprint(u=Depends(current_user)):
+    """Retrieve an auditable question set from the approved bank; no LLM question fabrication."""
+    need_consent(u)
+    prof = one("SELECT redacted,confirmed FROM profiles WHERE user_id=?", (u["id"],))
+    if not prof or not prof["redacted"]:
+        raise HTTPException(409, "Upload and analyse your CV before generating a CV-based assessment")
+    confirmed = set(json.loads(prof["confirmed"] or "[]")) if prof["confirmed"] else set()
+    if not confirmed:
+        raise HTTPException(409, "Confirm your CV skills before generating the assessment")
+    from graphrag import CVSkill, build_assessment, extract_cv_skills
+    extracted = extract_cv_skills(prof["redacted"])
+    skills = [s for s in extracted if s.skill_id in confirmed]
+    if not skills:
+        raise HTTPException(422, "No confirmed technical skills were found in the CV evidence")
+    import enterprise as admin_data
+    admin_data._seed_question_bank()
+    rows = allr("SELECT * FROM question_bank WHERE status='active' ORDER BY created_at DESC")
+    result = build_assessment(rows, skills, retrieval=True)
+    blueprint_id = uuid.uuid4().hex
+    snapshot = {**result, "user_id": u["id"], "blueprint_id": blueprint_id}
+    run("INSERT INTO assessment_blueprints(id,user_id,status,payload,created) VALUES (?,?,?,?,?)",
+        (blueprint_id, u["id"], result["status"], json.dumps(snapshot), time.time()))
+    audit(u["id"], "assessment_blueprint_generated",
+          f"{blueprint_id};questions={result['total_questions']};status={result['status']};ms={result['retrieval_ms']}")
+    return {
+        "blueprint_id": blueprint_id, "status": result["status"],
+        "fundamental_count": result["fundamental_count"], "cv_count": result["cv_count"],
+        "total_questions": result["total_questions"], "skills": result["skills"],
+        "estimated_duration_seconds": result["estimated_duration_seconds"],
+        "estimated_duration_minutes": result["estimated_duration_minutes"],
+        "difficulty_targets": result["difficulty_targets"],
+        "fundamental_targets": result["fundamental_targets"],
+        "fundamental_difficulty_matrix": result["fundamental_difficulty_matrix"],
+        "per_skill_targets": result["per_skill_targets"], "shortages": result["shortages"],
+        "retrieval_ms": result["retrieval_ms"], "retrieval_providers": result["retrieval_providers"],
+        "message": "Assessment question bank is ready." if result["status"] == "ready"
+            else "The approved question bank does not yet contain enough questions for every required quota. No questions were fabricated."
+    }
+
+
+@app.get("/api/admin/assessment/graphrag/status")
+def admin_graphrag_status(u=Depends(current_user)):
+    import enterprise as admin_data
+    admin_data.admin_only(u, "questions")
+    import graphrag as G
+    rows = allr("SELECT category_id,difficulty_level,COUNT(*) AS n FROM question_bank WHERE status='active' GROUP BY category_id,difficulty_level")
+    active_rows = allr("SELECT * FROM question_bank WHERE status='active'")
+    fundamental_check = G.build_assessment(active_rows, [], retrieval=False)
+    return {
+        "active_question_count": one("SELECT COUNT(*) AS n FROM question_bank WHERE status='active'")["n"],
+        "question_distribution": [dict(r) for r in rows],
+        "fundamental_readiness": fundamental_check["status"],
+        "fundamental_selected_count": fundamental_check["fundamental_count"],
+        "fundamental_shortages": fundamental_check["shortages"],
+        "fundamental_targets": G.FUNDAMENTAL_TARGETS,
+        "fundamental_difficulty_matrix": G.FUNDAMENTAL_DIFFICULTY_MATRIX,
+        "cv_questions_per_skill": G.PER_SKILL_TARGETS,
+        "meilisearch_configured": bool(os.getenv("MEILISEARCH_URL")),
+        "neo4j_configured": bool(os.getenv("NEO4J_URI")),
+        "note": "Only active, curator-approved question-bank records are eligible for retrieval."
+    }
+
+
+@app.post("/api/admin/assessment/graphrag/reindex")
+def admin_graphrag_reindex(u=Depends(current_user)):
+    import enterprise as admin_data
+    admin_data.admin_only(u, "questions")
+    import graphrag as G
+    admin_data._seed_question_bank()
+    rows = allr("SELECT * FROM question_bank WHERE status='active'")
+    result = G.index_question_bank(rows)
+    audit(u["id"], "graphrag_question_bank_reindex",
+          f"active={result['active_questions']};meili={result['meilisearch']};neo4j={result['neo4j']}")
+    return result
+
+
+@app.get("/api/assessment/blueprint/{blueprint_id}")
+def get_assessment_blueprint(blueprint_id: str, u=Depends(current_user)):
+    row = one("SELECT status,payload,created FROM assessment_blueprints WHERE id=? AND user_id=?",
+              (blueprint_id, u["id"]))
+    if not row:
+        raise HTTPException(404, "Assessment blueprint not found")
+    payload = json.loads(row["payload"])
+    return {"blueprint_id": blueprint_id, "status": row["status"],
+            "total_questions": payload["total_questions"],
+            "fundamental_count": payload["fundamental_count"], "cv_count": payload["cv_count"],
+            "estimated_duration_seconds": payload["estimated_duration_seconds"],
+            "retrieval_ms": payload["retrieval_ms"], "shortages": payload["shortages"],
+            "created": row["created"]}
+
+
+
 
 # ------------------------------------------------------------------ job + gap
 def topic_scores(uid):
@@ -358,6 +454,31 @@ def seen_before(uid):
 
 def view(att):
     st = json.loads(att["state"])
+    if st.get("graphrag"):
+        import graphrag as G
+        questions = st["selected_questions"]
+        duration = int(st["duration_seconds"])
+        remaining = max(0, int(att["started"] + duration - time.time()))
+        index = int(st.get("question_index", 0))
+        current = questions[index] if questions else None
+        page = G.question_page(questions, index // G.QUESTION_PAGE_SIZE, st.get("answers", {}))
+        public = None
+        if current:
+            public = {k: current.get(k) for k in ("id", "assessment_section", "assessment_topic",
+                "skill_id", "question_type", "difficulty_level", "marks", "time_allocation")}
+            public["prompt"] = current.get("question_text", "")
+            public["options"] = current.get("options", [])
+            if "sql" in str(current.get("question_type", "")).lower():
+                public["schema"] = E.SQL_SCHEMA
+            public["index"] = index
+            public["total"] = len(questions)
+        return {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"],
+            "remaining": remaining, "answered": len(st.get("answers", {})), "total": len(questions),
+            "graphrag": True, "blueprint_id": st["blueprint_id"], "question": public,
+            "page": page, "question_index": index, "duration_seconds": duration,
+            "manual_review_count": sum(1 for q in questions if not (
+                str(q.get("question_type", "")).lower() in ("mcq", "multiple choice") or
+                ("sql" in str(q.get("question_type", "")).lower() and bool(str(q.get("reference_answer", "")).strip()))))}
     remaining = max(0, int(att["started"] + E.TEST_SECONDS - time.time()))
     out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "answered": len(st["answers"]), "total": len(E.SLOTS)}
     if att["status"] == "active" and st["current"]:
@@ -373,9 +494,63 @@ def save(att_id, st, **kw):
 
 def finalize(att, st):
     ev = {r["type"]: r["n"] for r in allr("SELECT type, COUNT(*) n FROM events WHERE attempt_id=? GROUP BY type", (att["id"],))}
-    res = E.score(st["answers"])
-    label, reasons = E.trust_label(ev, st["answers"])
-    res.update({"trust": label, "trust_reasons": reasons, "percentile": None, "kind": att["kind"], "date": time.strftime("%Y-%m-%d")})
+    if st.get("graphrag"):
+        now = time.time()
+        current_id = st.get("current")
+        if current_id:
+            elapsed = max(0, now - float(st.get("question_viewed_at") or now))
+            times = st.setdefault("question_time_seconds", {})
+            times[current_id] = round(float(times.get(current_id, 0)) + elapsed, 1)
+        answers = st.get("answers", {})
+        topics = {}
+        review_rows, trust_answers = [], []
+        for q in st["selected_questions"]:
+            raw_answer = answers.get(q["id"], "")
+            qtype = str(q.get("question_type", "")).lower()
+            is_mcq = qtype in ("mcq", "multiple choice")
+            is_sql_auto = "sql" in qtype and bool(str(q.get("reference_answer", "")).strip())
+            objective = is_mcq or is_sql_auto
+            if is_mcq:
+                correct = (str(raw_answer).strip().casefold() == str(q.get("correct_answer", "")).strip().casefold()) if raw_answer != "" else False
+            elif is_sql_auto:
+                correct = E.grade_sql(st["seed"], {"ref": q["reference_answer"]}, str(raw_answer or ""))
+            else:
+                correct = None
+            topic = q.get("assessment_topic") or "General"
+            metric = topics.setdefault(topic, {"earned": 0, "possible": 0, "n": 0})
+            if objective:
+                metric["possible"] += int(q.get("marks") or 1)
+                metric["n"] += 1
+                if correct: metric["earned"] += int(q.get("marks") or 1)
+            review_rows.append({"question_id": q["id"], "topic": topic, "question": q["question_text"],
+                "question_type": q.get("question_type"), "answer": raw_answer,
+                "correct_answer": (q.get("correct_answer") if is_mcq else q.get("reference_answer")) if objective else None,
+                "explanation": q.get("explanation") if objective else None,
+                "review_status": ("correct" if correct else "incorrect") if objective else "pending_human_review",
+                "time_seconds": st.get("question_time_seconds", {}).get(q["id"], 0)})
+            trust_answers.append({"type": "mcq" if objective else "subjective", "correct": bool(correct),
+                "difficulty": {"Easy": 1, "Medium": 2, "Hard": 3}.get(q.get("difficulty_level"), 2),
+                "seconds": st.get("question_time_seconds", {}).get(q["id"], 0)})
+        topic_scores = {}
+        for topic, metric in topics.items():
+            pct = round(100 * metric["earned"] / metric["possible"]) if metric["possible"] else None
+            topic_scores[topic] = {"score": pct, "level": E.level_of(pct or 0), "n": metric["n"]}
+        possible = sum(x["possible"] for x in topics.values())
+        earned = sum(x["earned"] for x in topics.values())
+        overall = round(100 * earned / possible) if possible else None
+        label, reasons = E.trust_label(ev, trust_answers)
+        manual = any(x["review_status"] == "pending_human_review" for x in review_rows)
+        res = {"overall": overall, "level": E.level_of(overall or 0), "topics": topic_scores,
+            "trust": label, "trust_reasons": reasons, "percentile": None,
+            "kind": att["kind"], "date": time.strftime("%Y-%m-%d"),
+            "review_status": "pending_human_review" if manual else "auto_graded",
+            "manual_review_required": manual, "question_results": review_rows,
+            "blueprint_id": st["blueprint_id"], "total_questions": len(st["selected_questions"]),
+            "answered_questions": len(answers)}
+    else:
+        res = E.score(st["answers"])
+        label, reasons = E.trust_label(ev, st["answers"])
+        res.update({"trust": label, "trust_reasons": reasons, "percentile": None, "kind": att["kind"], "date": time.strftime("%Y-%m-%d")})
     run("UPDATE attempts SET status='done', finished=?, result=?, state=? WHERE id=?", (time.time(), json.dumps(res), json.dumps(st), att["id"]))
     audit(att["user_id"], "attempt_done", att["id"])
 
@@ -386,8 +561,12 @@ def get_att(att_id, uid):
     return dict(a)
 
 
+class StartAttempt(BaseModel):
+    blueprint_id: Optional[str] = None
+
+
 @app.post("/api/attempts")
-def start_attempt(u=Depends(current_user)):
+def start_attempt(b: Optional[StartAttempt] = None, u=Depends(current_user)):
     need_consent(u)
     act = one("SELECT * FROM attempts WHERE user_id=? AND status='active'", (u["id"],))
     if act:
@@ -397,9 +576,25 @@ def start_attempt(u=Depends(current_user)):
             return view(dict(act))                       # resume after a dropped connection
 
     seed = secrets.randbelow(10**9)
-    st = E.new_state(seed)
-    q = E.pick_question(st, seen_before(u["id"]))
-    st["current"], st["served_at"] = q["id"], time.time()
+    if b and b.blueprint_id:
+        blueprint = one("SELECT status,payload FROM assessment_blueprints WHERE id=? AND user_id=?",
+                        (b.blueprint_id, u["id"]))
+        if not blueprint:
+            raise HTTPException(404, "Assessment blueprint not found")
+        if blueprint["status"] != "ready":
+            raise HTTPException(409, "The approved question bank is incomplete for this assessment")
+        payload = json.loads(blueprint["payload"])
+        selected = payload.get("questions") or []
+        if not selected or len(selected) != payload.get("total_questions"):
+            raise HTTPException(409, "Assessment blueprint validation failed")
+        st = {"graphrag": True, "blueprint_id": b.blueprint_id, "selected_questions": selected,
+              "question_index": 0, "answers": {}, "duration_seconds": int(payload["estimated_duration_seconds"]),
+              "served_at": time.time(), "question_viewed_at": time.time(), "question_time_seconds": {}, "seed": seed}
+        st["current"] = selected[0]["id"]
+    else:
+        st = E.new_state(seed)
+        q = E.pick_question(st, seen_before(u["id"]))
+        st["current"], st["served_at"] = q["id"], time.time()
     aid = uuid.uuid4().hex[:12]
     now = time.time()
     # Serialize attempt creation per candidate. This prevents double-clicks or
@@ -453,6 +648,22 @@ def answer(aid: str, b: Ans, u=Depends(current_user)):
     st = json.loads(att["state"])
     if time.time() > att["started"] + E.TEST_SECONDS + E.GRACE:      # server owns the timer
         finalize(att, st); return view(get_att(aid, u["id"]))
+    if st.get("graphrag"):
+        question = next((q for q in st["selected_questions"] if q["id"] == b.question_id), None)
+        if not question:
+            raise HTTPException(404, "Question is not part of this assessment")
+        if b.question_id != st.get("current"):
+            raise HTTPException(409, "Navigate to this question before saving its answer")
+        answer_value = str(b.answer or "")
+        revision = one("SELECT COUNT(*) AS n FROM assessment_answer_events WHERE attempt_id=? AND question_id=?",
+                       (aid, b.question_id))["n"] + 1
+        run("INSERT INTO assessment_answer_events(id,attempt_id,question_id,revision,answer_hash,answer_length,created) VALUES (?,?,?,?,?,?,?)",
+            (uuid.uuid4().hex, aid, b.question_id, revision,
+             hashlib.sha256(answer_value.encode("utf-8")).hexdigest(), len(answer_value), time.time()))
+        st.setdefault("answers", {})[b.question_id] = answer_value
+        st["current"] = b.question_id
+        save(aid, st)
+        return view(get_att(aid, u["id"]))
     if b.question_id != st["current"]: raise HTTPException(409, "Question mismatch")
     q = QBYID[st["current"]]
     E.record_answer(st, q, b.answer, time.time() - (st["served_at"] or time.time()))
@@ -465,6 +676,51 @@ def answer(aid: str, b: Ans, u=Depends(current_user)):
     return view(get_att(aid, u["id"]))                      # never reveals correctness during the exam
 
 
+class NavigateQuestion(BaseModel):
+    index: int = Field(ge=0)
+
+
+@app.post("/api/attempts/{aid}/navigate")
+def navigate_question(aid: str, b: NavigateQuestion, u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    st = json.loads(att["state"])
+    if att["status"] != "active" or not st.get("graphrag"):
+        raise HTTPException(409, "Question navigation is unavailable")
+    if time.time() > att["started"] + int(st["duration_seconds"]) + E.GRACE:
+        finalize(att, st)
+        return view(get_att(aid, u["id"]))
+    if b.index >= len(st["selected_questions"]):
+        raise HTTPException(422, "Question index is outside this assessment")
+    now = time.time()
+    previous_id = st.get("current")
+    if previous_id:
+        elapsed = max(0, now - float(st.get("question_viewed_at") or now))
+        times = st.setdefault("question_time_seconds", {})
+        times[previous_id] = round(float(times.get(previous_id, 0)) + elapsed, 1)
+    st["question_index"] = b.index
+    st["current"] = st["selected_questions"][b.index]["id"]
+    st["question_viewed_at"] = now
+    run("INSERT INTO events(attempt_id,type,ts) VALUES (?,?,?)", (aid, "question_navigate", now))
+    save(aid, st)
+    return view(get_att(aid, u["id"]))
+
+
+@app.post("/api/attempts/{aid}/submit")
+def submit_graphrag_attempt(aid: str, u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    st = json.loads(att["state"])
+    if att["status"] != "active" or not st.get("graphrag"):
+        raise HTTPException(409, "This is not an active GraphRAG assessment")
+    if time.time() > att["started"] + int(st["duration_seconds"]) + E.GRACE:
+        finalize(att, st)
+        return view(get_att(aid, u["id"]))
+    unanswered = len(st["selected_questions"]) - len(st.get("answers", {}))
+    if unanswered:
+        raise HTTPException(409, {"message": "Please answer all questions before submitting.", "unanswered": unanswered})
+    finalize(att, st)
+    return view(get_att(aid, u["id"]))
+
+
 class SqlRun(BaseModel):
     sql: str
 
@@ -473,6 +729,11 @@ class SqlRun(BaseModel):
 def sql_run(aid: str, b: SqlRun, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     st = json.loads(att["state"])
+    if st.get("graphrag"):
+        q = next((x for x in st["selected_questions"] if x["id"] == st.get("current")), None)
+        if att["status"] != "active" or not q or "sql" not in str(q.get("question_type", "")).lower():
+            raise HTTPException(409, "No SQL question active")
+        return E.run_query(att["seed"], b.sql)
     if att["status"] != "active" or not st["current"] or QBYID[st["current"]]["type"] != "sql": raise HTTPException(409, "No SQL question active")
     return E.run_query(att["seed"], b.sql)                  # visible dataset only; scoring uses hidden datasets
 

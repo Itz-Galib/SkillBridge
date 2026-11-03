@@ -273,6 +273,7 @@ function Gap({ onStart, refreshKey }) {
 
 /* ---------- exam ---------- */
 function ExamRun({ initial, onFinished }) {
+  if (initial.graphrag) return <GraphRAGExamRun initial={initial} onFinished={onFinished} />;
   const t = useT();
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState("");
@@ -323,16 +324,10 @@ function ExamRun({ initial, onFinished }) {
         <>
           <details open><summary>{t("schema")}</summary><pre className="pre">{q.schema}</pre></details>
           <p className="note">{t("sqlHelp")}</p>
-          <textarea className="code" rows={6} spellCheck={false} value={ans} onChange={(e) => setAns(e.target.value)} onPaste={onPaste} placeholder="SELECT ..." />
+          <textarea className="code" rows={6} spellCheck={false} value={ans} onChange={(e) => setAns(e.target.value)} onPaste={onPaste} placeholder="Write your answer..." />
           <p className="muted">{t("pasteNote")}</p>
-          <button className="btn ghost" onClick={runSql} disabled={!ans.trim()}>{t("run")}</button>
-          {out && (out.error ? <p className="err">{t("sqlError")}: {out.error}</p> : (
-            <div className="tablewrap">
-              <table><thead><tr>{out.columns.map((c) => <th key={c}>{c}</th>)}</tr></thead>
-                <tbody>{out.rows.slice(0, 20).map((r, i) => <tr key={i}>{r.map((c, j) => <td key={j}>{String(c)}</td>)}</tr>)}</tbody></table>
-              <small className="muted">{out.rows.length} {t("rows")}</small>
-            </div>
-          ))}
+          {String(q.type).toLowerCase().includes("sql") && <button className="btn ghost" onClick={runSql} disabled={!ans.trim()}>{t("run")}</button>}
+          {out && <pre className="pre">{JSON.stringify(out, null, 2)}</pre>}
         </>
       )}
       <Err e={err} />
@@ -341,9 +336,128 @@ function ExamRun({ initial, onFinished }) {
   );
 }
 
+function GraphRAGExamRun({ initial, onFinished }) {
+  const [v, setV] = useState(initial);
+  const [ans, setAns] = useState(initial.page?.answers?.[initial.question?.id] || "");
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [left, setLeft] = useState(initial.remaining);
+  const [sqlOut, setSqlOut] = useState(null);
+  const aid = v.attempt_id;
+  const q = v.question;
+  const page = v.page || {questions:[], page:0, page_count:0, answers:{}};
+
+  useEffect(() => { const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000); return () => clearInterval(i); }, []);
+  useEffect(() => { setAns(page.answers?.[q?.id] || ""); setSqlOut(null); }, [q?.id, v.question_index]);
+  useEffect(() => {
+    const onBlur = () => api(`/attempts/${aid}/event`, {method:"POST",body:{type:"blur"}}).catch(()=>{});
+    window.addEventListener("blur", onBlur);
+    return () => window.removeEventListener("blur", onBlur);
+  }, [aid]);
+
+  const saveAnswer = async () => {
+    if (!q || !String(ans).trim()) return v;
+    const next = await api(`/attempts/${aid}/answer`, {method:"POST",body:{question_id:q.id,answer:String(ans)}});
+    setV(next);
+    return next;
+  };
+  const goTo = async (index) => {
+    if (busy) return;
+    setBusy(true); setErr(null);
+    try {
+      await saveAnswer();
+      const next = await api(`/attempts/${aid}/navigate`, {method:"POST",body:{index}});
+      setV(next); setAns(next.page?.answers?.[next.question?.id] || "");
+    } catch(e) { setErr(e); } finally { setBusy(false); }
+  };
+  const save = async () => {
+    setBusy(true); setErr(null);
+    try { await saveAnswer(); } catch(e) { setErr(e); } finally { setBusy(false); }
+  };
+  const runSql = async () => {
+    try { setSqlOut(await api(`/attempts/${aid}/sql-run`,{method:"POST",body:{sql:ans}})); } catch(e) { setErr(e); }
+  };
+  const submit = async () => {
+    setBusy(true); setErr(null);
+    try {
+      await saveAnswer();
+      const r = await api(`/attempts/${aid}/submit`,{method:"POST"});
+      if (r.status === "done") onFinished(aid); else setV(r);
+    } catch(e) { setErr(e); } finally { setBusy(false); }
+  };
+  if (!q) return <p>Loading assessment…</p>;
+  const isChoice = ["mcq","multiple choice"].includes(String(q.question_type).toLowerCase());
+  const answered = page.answers?.[q.id] != null && String(page.answers[q.id]).trim() !== "";
+  const previousIndex = Math.max(0, page.page * 5 - 1);
+  const nextIndex = Math.min(v.total - 1, (page.page + 1) * 5);
+  return (
+    <section className="card exam gr-exam">
+      <div className="examhead">
+        <span>Question {v.answered} of {v.total} answered</span>
+        <progress value={v.answered} max={v.total} />
+        <span className={"timer" + (left < 120 ? " low" : "")}>Time left: {fmt(left)}</span>
+      </div>
+      <div className="gr-exam-meta">
+        <span>{v.total} questions · {Math.ceil(v.duration_seconds / 60)} minutes allocated</span>
+        <span>Fundamental + CV skills</span>
+      </div>
+      <div className="gr-question-table">
+        <table>
+          <thead><tr><th>#</th><th>Question / Topic</th><th>Level</th><th>Type</th><th>Status</th></tr></thead>
+          <tbody>{page.questions.map((item) => (
+            <tr key={item.id} className={item.id === q.id ? "selected" : ""} onClick={() => goTo(item.question_number - 1)}>
+              <td>{item.question_number}</td>
+              <td><strong>{item.assessment_topic}</strong><small>{item.question_text}</small></td>
+              <td>{item.difficulty_level}</td><td>{item.question_type}</td>
+              <td>{page.answers?.[item.id] ? "Answered" : "Pending"}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+      <div className="gr-question-current">
+        <div className="gr-question-label">
+          <span>{q.assessment_section === "cv" ? "CV-BASED" : "FUNDAMENTAL"} · {q.assessment_topic}</span>
+          <span>{q.difficulty_level} · {q.question_type}</span>
+        </div>
+        <h3 className="qtext">{q.prompt}</h3>
+        {isChoice ? (
+          <fieldset className="opts">
+            {q.options.map((option, index) => (
+              <label key={index} className={"opt" + (String(ans) === String(option) ? " on" : "")}>
+                <input type="radio" name={"gr-option-"+q.id} checked={String(ans) === String(option)} onChange={() => setAns(String(option))} /> {option}
+              </label>
+            ))}
+          </fieldset>
+        ) : (
+          <>
+            {String(q.question_type).toLowerCase().includes("sql")&&<details open><summary>SQL schema</summary><pre className="pre">{q.schema||"Schema supplied by the question author."}</pre></details>}
+            <textarea className="code" rows={7} spellCheck={false} value={ans} onChange={(e)=>setAns(e.target.value)}
+              onPaste={()=>api(`/attempts/${aid}/event`,{method:"POST",body:{type:"paste"}}).catch(()=>{})}
+              placeholder={String(q.question_type).toLowerCase().includes("sql") ? "SELECT ..." : "Write your explanation, scenario response or code here…"} />
+            {String(q.question_type).toLowerCase().includes("sql") && <button className="btn ghost" onClick={runSql} disabled={!ans.trim()}>Run SQL</button>}
+            {sqlOut && <pre className="pre">{JSON.stringify(sqlOut,null,2)}</pre>}
+          </>
+        )}
+      </div>
+      <div className="gr-exam-actions">
+        <button className="btn ghost" onClick={()=>goTo(previousIndex)} disabled={page.page===0 || busy}>Previous 5</button>
+        <span>Page {page.page+1} of {page.page_count}</span>
+        <button className="btn ghost" onClick={()=>goTo(nextIndex)} disabled={!page.has_next || busy}>Next 5</button>
+        <button className="btn ghost" onClick={save} disabled={busy || !String(ans).trim()}>Save answer</button>
+        <button className="btn" onClick={submit} disabled={busy || v.answered + (answered ? 0 : (String(ans).trim() ? 1 : 0)) < v.total}>
+          {busy ? "Saving…" : "Submit assessment"}
+        </button>
+      </div>
+      <p className="muted">Answers are saved to your attempt. Correct answers and explanations remain hidden until submission. Coding, SQL, scenario and explanation responses may require human review.</p>
+      <Err e={err} />
+    </section>
+  );
+}
+
 function Result({ aid, next, nextLabel }) {
   const t = useT();
   const [r, setR] = useState(null);
+  const [reviewPage,setReviewPage]=useState(0);
   const [note, setNote] = useState("");
   const [sent, setSent] = useState(false);
   const [err, setErr] = useState(null);
@@ -355,7 +469,7 @@ function Result({ aid, next, nextLabel }) {
     <section>
       <h2>{t("resultTitle")}</h2>
       <div className="card result">
-        <div className="bignum"><span>{r.overall}</span><small>%</small></div>
+        <div className="bignum"><span>{r.overall==null?"Pending":r.overall}</span><small>{r.overall==null?"review":"%"}</small></div>
         <dl className="facts">
           <div><dt>{t("level")}</dt><dd>{t("levels")[r.level]}</dd></div>
           <div><dt>{t("trust")}</dt><dd><TrustChip trust={r.trust} /></dd></div>
@@ -367,13 +481,22 @@ function Result({ aid, next, nextLabel }) {
         <ul className="gaps">
           {Object.entries(r.topics).map(([k, v]) => (
             <li key={k}>
-              <div className="gaprow"><strong>{k}</strong><span className="muted">{t("levels")[v.level]}</span><span>{v.score}%</span></div>
-              <Bar score={v.score} />
+              <div className="gaprow"><strong>{k}</strong><span className="muted">{v.score==null?"Pending review":t("levels")[v.level]}</span><span>{v.score==null?"—":v.score+"%"}</span></div>
+              <Bar score={v.score??0} />
             </li>
           ))}
         </ul>
         <p className="muted">{t("percentile")}</p>
+        {r.manual_review_required&&<p className="note">Some coding, SQL, scenario or explanation responses are awaiting human review. The displayed score covers automatically gradable questions only.</p>}
       </div>
+      {r.question_results?.length>0&&<div className="card gr-review">
+        <h3>Question and answer review</h3>
+        <p className="muted">Correct answers are revealed only after submission. Five questions are shown per page.</p>
+        <div className="gr-question-table"><table><thead><tr><th>#</th><th>Question</th><th>Your answer</th><th>Expected answer / review</th><th>Status</th></tr></thead><tbody>
+          {r.question_results.slice(reviewPage*5,reviewPage*5+5).map((item,index)=><tr key={item.question_id}><td>{reviewPage*5+index+1}</td><td>{item.question}</td><td>{item.answer||"No answer"}</td><td>{item.correct_answer||"Pending human review"}</td><td>{item.review_status}</td></tr>)}
+        </tbody></table></div>
+        <div className="gr-exam-actions"><button className="btn ghost" onClick={()=>setReviewPage(x=>Math.max(0,x-1))} disabled={reviewPage===0}>Previous 5</button><span>Page {reviewPage+1} of {Math.ceil(r.question_results.length/5)}</span><button className="btn ghost" onClick={()=>setReviewPage(x=>Math.min(Math.ceil(r.question_results.length/5)-1,x+1))} disabled={(reviewPage+1)*5>=r.question_results.length}>Next 5</button></div>
+      </div>}
       <div className="card quiet">
         <p>{t("trustNote")}</p>
         {r.trust_reasons.length > 0 && <ul>{r.trust_reasons.map((x) => <li key={x.key}>{x.n} × {t("reasonLabels")[x.key]}</li>)}</ul>}
@@ -421,7 +544,15 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const act = st.attempts.find((a) => a.status === "active");
   const start = useCallback(async () => {
     setErr(null);
-    try { const v = await api("/attempts", { method: "POST" }); if (v.status === "active") setActive(v); else refresh(); } catch (e) { setErr(e); }
+    try {
+      const blueprint = await api("/assessment/blueprint", {method:"POST"});
+      if (blueprint.status !== "ready") {
+        const missing = (blueprint.shortages || []).slice(0, 5).map((x) => `${x.topic} · ${x.difficulty}: ${x.available_selected}/${x.required}`).join("; ");
+        throw new Error("The approved question bank is not ready yet. " + (missing || "Add and approve the required questions in Admin → Question Bank."));
+      }
+      const v = await api("/attempts", {method:"POST",body:{blueprint_id:blueprint.blueprint_id}});
+      if (v.status === "active") setActive(v); else refresh();
+    } catch (e) { setErr(e); }
   }, [refresh]);
   const finished = async () => { setActive(null); await refresh(); };
 
@@ -438,6 +569,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     <section className="card narrow">
       <h2>{kind === "pre" ? t("startTest") : t("steps").retest}</h2>
       <p>{kind === "pre" ? t("testIntro") : t("retestIntro")}</p>
+      <p className="muted">This assessment uses 25 fundamental questions plus five questions for every CV skill you confirm. Analyse your CV and confirm the detected technologies first. The question bank must also contain enough approved questions for every topic, difficulty and question format.</p>
       <Err e={err} />
       <button className="btn" onClick={start}>{t("startTest")}</button>
     </section>
@@ -669,7 +801,7 @@ function AdminConsole({ onLogout }) {
     const endpoints={
       overview:"/admin/console/overview",users:"/admin/console/users",staff:"/admin/console/staff",companies:"/admin/console/company-verifications",
       jobs:"/admin/console/job-review-queue",assessments:"/admin/assessment-reviews",appeals:"/admin/appeals",
-      questions:"/admin/questions",learning:"/admin/learning",ai:"/admin/ai-operations",billing:"/admin/billing",privacy:"/admin/privacy",
+      questions:"/admin/questions",graphrag:"/admin/assessment/graphrag/status",learning:"/admin/learning",ai:"/admin/ai-operations",billing:"/admin/billing",privacy:"/admin/privacy",
       quality:"/admin/quality",audit:"/admin/audit-logs",phaseTwo:"/admin/phase-two-requests"
     };
     const keys=Object.keys(endpoints);
@@ -789,6 +921,10 @@ function AdminConsole({ onLogout }) {
           const activeCategory=cats.find(c=>c.id===questionCategory);
           return <section className="ad-question-workspace">
             <div className="ad-question-hero"><div><div className="ad-eyebrow">ASSESSMENT CONTENT · GOVERNANCE</div><h2>Build a stronger question bank.</h2><p>Organise, author and import assessment questions across nine skill domains. Every change is versioned and audited.</p><div className="ad-question-hero-tags"><span>✓ Database-backed</span><span>◈ Versioned edits</span><span>↗ Bulk import</span></div></div><div className="ad-question-hero-icon">Q<span>+</span></div></div>
+            <div className="ad-graphrag-panel">
+              <div><span className="ad-eyebrow">GRAPH RETRIEVAL · ASSESSMENT READINESS</span><h3>CV + Fundamental GraphRAG</h3><p>{data.graphrag?.active_question_count??"—"} active questions · Fundamental {data.graphrag?.fundamental_selected_count??0}/25 · Meilisearch {data.graphrag?.meilisearch_configured?"configured":"not connected"} · Neo4j {data.graphrag?.neo4j_configured?"configured":"not connected"}</p><small>Fundamental readiness: {data.graphrag?.fundamental_readiness||"loading"}. Required: 25 fundamental questions plus 5 approved questions for every confirmed CV skill. Use category + subcategory, difficulty and format carefully.</small>{data.graphrag?.fundamental_shortages?.length>0&&<small>Missing: {data.graphrag.fundamental_shortages.slice(0,4).map(x=>x.format||x.topic+" "+x.difficulty).join(" · ")}</small>}</div>
+              <button className="ad-q-add-btn" onClick={async()=>{try{const result=await api("/admin/assessment/graphrag/reindex",{method:"POST"});flash("Graph index updated · "+result.active_questions+" approved questions.");await load();}catch(x){setError(x.message||"Graph index update failed.");}}}>Rebuild search + graph index</button>
+            </div>
             <div className="ad-question-stats"><article><span className="ad-qstat-icon">▤</span><div><small>Total questions</small><strong>{qdata.summary?.total??allQuestions.length}</strong><em>Across all categories</em></div></article><article><span className="ad-qstat-icon ad-qstat-green">✓</span><div><small>Active</small><strong>{qdata.summary?.active??0}</strong><em>Ready for use</em></div></article><article><span className="ad-qstat-icon ad-qstat-amber">◷</span><div><small>Draft</small><strong>{qdata.summary?.draft??0}</strong><em>Awaiting approval</em></div></article><article><span className="ad-qstat-icon ad-qstat-grey">▣</span><div><small>Archived</small><strong>{qdata.summary?.archived??0}</strong><em>Retained for history</em></div></article></div>
             <div className="ad-question-section-head"><div><h3>Explore by category</h3><p>Select a domain to view its question inventory.</p></div><button className="ad-q-add-btn" onClick={()=>openQuestionEditor()}>＋ Create question</button></div>
             <div className="ad-category-grid">{cats.map((c,i)=><button key={c.id} className={"ad-category-card "+(questionCategory===c.id?"selected":"")} onClick={()=>setQuestionCategory(questionCategory===c.id?"all":c.id)}><span className={"ad-category-icon ad-cat-"+(i+1)}>{c.icon}</span><span className="ad-category-copy"><b>{c.name}</b><small>{c.description}</small></span><strong>{c.count||0}<small>questions</small></strong></button>)}</div>
@@ -845,13 +981,13 @@ function AdminConsole({ onLogout }) {
     </main>
     {questionModal&&<div className="ad-modal-backdrop" onClick={()=>!questionSaving&&setQuestionModal(false)}><form className="ad-question-modal" onSubmit={saveQuestion} onClick={e=>e.stopPropagation()}><header><div><div className="ad-eyebrow">QUESTION AUTHORING</div><h2>{questionEditing?"Edit question":"Create a question"}</h2><p>Define the question, answer key and fair assessment timing.</p></div><button type="button" onClick={()=>setQuestionModal(false)}>×</button></header><div className="ad-q-form-grid">
       <label>Category<select required value={questionDraft.category_id} onChange={e=>setQuestionDraft(v=>({...v,category_id:e.target.value}))}>{(data.questions?.categories||[]).map(c=><option value={c.id}>{c.name}</option>)}</select></label><label>Subcategory<input required value={questionDraft.subcategory} onChange={e=>setQuestionDraft(v=>({...v,subcategory:e.target.value}))} placeholder="e.g. Joins"/></label>
-      <label>Question type<select value={questionDraft.question_type} onChange={e=>setQuestionDraft(v=>({...v,question_type:e.target.value}))}>{["MCQ","Coding","Short Answer","Scenario-Based","System Design","True/False"].map(x=><option>{x}</option>)}</select></label><label>Difficulty<select value={questionDraft.difficulty_level} onChange={e=>setQuestionDraft(v=>({...v,difficulty_level:e.target.value}))}>{["Easy","Medium","Hard"].map(x=><option>{x}</option>)}</select></label>
+      <label>Question type<select value={questionDraft.question_type} onChange={e=>setQuestionDraft(v=>({...v,question_type:e.target.value}))}>{["MCQ","Coding","SQL","Explanation","Short Answer","Scenario-Based","System Design","True/False"].map(x=><option>{x}</option>)}</select></label><label>Difficulty<select value={questionDraft.difficulty_level} onChange={e=>setQuestionDraft(v=>({...v,difficulty_level:e.target.value}))}>{["Easy","Medium","Hard"].map(x=><option>{x}</option>)}</select></label>
       <label className="ad-q-full">Question text<textarea required rows="4" value={questionDraft.question_text} onChange={e=>setQuestionDraft(v=>({...v,question_text:e.target.value}))} placeholder="Write a clear, unambiguous question…"/></label>
       {questionDraft.question_type==="MCQ"&&<label className="ad-q-full">Options <small>One option per line</small><textarea rows="4" value={questionDraft.options} onChange={e=>setQuestionDraft(v=>({...v,options:e.target.value}))} placeholder={"Option A\nOption B\nOption C\nOption D"}/></label>}
       <label>Correct answer<input value={questionDraft.correct_answer} onChange={e=>setQuestionDraft(v=>({...v,correct_answer:e.target.value}))} placeholder="Exact answer or option"/></label><label>Marks<input type="number" min="1" max="100" value={questionDraft.marks} onChange={e=>setQuestionDraft(v=>({...v,marks:e.target.value}))}/></label><label>Time allocation (minutes)<input type="number" min="0.25" max="120" step="0.25" value={questionDraft.time_minutes} onChange={e=>setQuestionDraft(v=>({...v,time_minutes:e.target.value}))}/></label><label>Status<select value={questionDraft.status} onChange={e=>setQuestionDraft(v=>({...v,status:e.target.value}))}><option value="draft">Draft</option><option value="active">Active</option><option value="archived">Archived</option></select></label>
-      <label className="ad-q-full">Explanation<textarea rows="2" value={questionDraft.explanation} onChange={e=>setQuestionDraft(v=>({...v,explanation:e.target.value}))}/></label><label className="ad-q-full">Reference answer<textarea rows="2" value={questionDraft.reference_answer} onChange={e=>setQuestionDraft(v=>({...v,reference_answer:e.target.value}))}/></label><label className="ad-q-full">Grading rubric<textarea rows="2" value={questionDraft.grading_rubric} onChange={e=>setQuestionDraft(v=>({...v,grading_rubric:e.target.value}))}/></label>
+      <label className="ad-q-full">Explanation<textarea rows="2" value={questionDraft.explanation} onChange={e=>setQuestionDraft(v=>({...v,explanation:e.target.value}))}/></label><label className="ad-q-full">Reference answer<textarea rows="2" value={questionDraft.reference_answer} onChange={e=>setQuestionDraft(v=>({...v,reference_answer:e.target.value}))} placeholder={questionDraft.question_type==="SQL"?"Canonical SQL query used for automatic grading against hidden datasets.":"Expected answer, reference implementation or guidance for human review."}/></label><label className="ad-q-full">Grading rubric<textarea rows="2" value={questionDraft.grading_rubric} onChange={e=>setQuestionDraft(v=>({...v,grading_rubric:e.target.value}))}/></label>
     </div><div className="ad-q-system-meta"><span>Created by: {questionEditing?.created_by||"Current admin"}</span><span>Version: {questionEditing?"v"+questionEditing.version+" → v"+(Number(questionEditing.version)+1):"v1 on save"}</span><span>Created date: {questionEditing?stamp(questionEditing.created_date):"Generated on save"}</span></div><footer><button type="button" onClick={()=>setQuestionModal(false)} disabled={questionSaving}>Cancel</button><button className="ad-q-add-btn" disabled={questionSaving}>{questionSaving?"Saving…":questionEditing?"Save new version":"Create question"}</button></footer></form></div>}
-    {selectedReport&&<div className="ad-modal-backdrop" onClick={()=>setSelectedReport(null)}><section className="ad-report-modal" onClick={e=>e.stopPropagation()}><header><div><div className="ad-eyebrow">CANDIDATE EVIDENCE · MANUAL REVIEW</div><h2>Assessment evaluation report</h2><p>{selectedReport.candidate_name} · {selectedReport.email} · {selectedReport.kind} assessment</p></div><button type="button" onClick={()=>setSelectedReport(null)}>×</button></header><div className="ad-report-summary"><div><small>Overall score</small><strong>{selectedReport.result?.overall??"—"}<small>/100</small></strong></div><div><small>Level</small><strong>{selectedReport.result?.level??"—"}</strong></div><div><small>Integrity signal</small><strong>{selectedReport.result?.trust??"—"}</strong></div></div><div className="ad-info-banner">{selectedReport.evaluation_method||"Automated evaluation method unavailable."} This is a deterministic grading summary, not a generative AI judgement. Use your own judgement for the final manual review.</div>{!selectedReport.answer_evidence_complete&&<div className="ad-warning-banner">Some or all candidate responses were not captured for this older attempt. The original question list may be visible, but missing answers cannot be reconstructed.</div>}<h3>Topic performance</h3><div className="ad-report-topics">{Object.entries(selectedReport.result?.topics||{}).map(([topic,v])=><div><b>{topic}</b><span>{v.score}% · {v.level} · {v.n} questions</span></div>)}</div><h3>Questions and candidate answers ({selectedReport.answer_evidence?.length||0})</h3><div className="ad-report-questions">{(selectedReport.answer_evidence||[]).map(q=><article><div className="ad-report-qmeta">Q{q.number} · {q.topic} · {q.type} · Difficulty {q.difficulty}</div><h4>{q.question}</h4>{q.options?.length>0&&<ol>{q.options.map(o=><li>{o}</li>)}</ol>}<div className="ad-report-answer"><b>Candidate answer</b><pre>{q.selected_option??q.candidate_answer??"Not captured in this attempt"}</pre></div><div className="ad-report-qmeta">Automated evaluation: {q.automated_correct===true?"Correct":q.automated_correct===false?"Incorrect":"Unavailable"} · Response time: {q.time_seconds??"—"} sec</div></article>)}</div><footer><span>Use browser print dialog and choose “Save as PDF” for a downloadable report.</span><button className="ad-mini-primary" onClick={()=>printAssessmentReport(selectedReport)}>Print / Save PDF</button><button onClick={()=>setSelectedReport(null)}>Close</button></footer></section></div>}
+    {selectedReport&&<div className="ad-modal-backdrop" onClick={()=>setSelectedReport(null)}><section className="ad-report-modal" onClick={e=>e.stopPropagation()}><header><div><div className="ad-eyebrow">CANDIDATE EVIDENCE · MANUAL REVIEW</div><h2>Assessment evaluation report</h2><p>{selectedReport.candidate_name} · {selectedReport.email} · {selectedReport.kind} assessment</p></div><button type="button" onClick={()=>setSelectedReport(null)}>×</button></header><div className="ad-report-summary"><div><small>Overall score</small><strong>{selectedReport.result?.overall??"—"}<small>/100</small></strong></div><div><small>Level</small><strong>{selectedReport.result?.level??"—"}</strong></div><div><small>Integrity signal</small><strong>{selectedReport.result?.trust??"—"}</strong></div></div><div className="ad-info-banner">{selectedReport.evaluation_method||"Automated evaluation method unavailable."} This is a deterministic grading summary, not a generative AI judgement. Use your own judgement for the final manual review.</div>{!selectedReport.answer_evidence_complete&&<div className="ad-warning-banner">Some or all candidate responses were not captured for this older attempt. The original question list may be visible, but missing answers cannot be reconstructed.</div>}<h3>Topic performance</h3><div className="ad-report-topics">{Object.entries(selectedReport.result?.topics||{}).map(([topic,v])=><div><b>{topic}</b><span>{v.score}% · {v.level} · {v.n} questions</span></div>)}</div><h3>Questions and candidate answers ({selectedReport.answer_evidence?.length||0})</h3><div className="ad-report-questions">{(selectedReport.answer_evidence||[]).map(q=><article><div className="ad-report-qmeta">Q{q.number} · {q.topic} · {q.type} · Difficulty {q.difficulty}</div><h4>{q.question}</h4>{q.options?.length>0&&<ol>{q.options.map(o=><li>{o}</li>)}</ol>}<div className="ad-report-answer"><b>Candidate answer</b><pre>{q.selected_option??q.candidate_answer??"Not captured in this attempt"}</pre></div>{q.expected_answer&&<div className="ad-report-answer"><b>Expected / reference answer</b><pre>{q.expected_answer}</pre></div>}{q.explanation&&<p className="ad-report-qmeta">Explanation: {q.explanation}</p>}{q.grading_rubric&&<p className="ad-report-qmeta">Rubric: {q.grading_rubric}</p>}<div className="ad-report-qmeta">Evaluation: {q.review_status|| (q.automated_correct===true?"Correct":q.automated_correct===false?"Incorrect":"Unavailable")} · Response time: {q.time_seconds??"—"} sec</div></article>)}</div><footer><span>Use browser print dialog and choose “Save as PDF” for a downloadable report.</span><button className="ad-mini-primary" onClick={()=>printAssessmentReport(selectedReport)}>Print / Save PDF</button><button onClick={()=>setSelectedReport(null)}>Close</button></footer></section></div>}
     {action&&<div className="ad-modal-backdrop" onClick={()=>!saving&&setAction(null)}><form className="ad-modal" onSubmit={submitAction} onClick={e=>e.stopPropagation()}><button type="button" className="ad-modal-close" onClick={()=>setAction(null)}>×</button><div className="ad-eyebrow">REASON-CODED ADMIN ACTION</div><h2>Confirm {action.decision.replaceAll("_"," ")}</h2><p>This decision will be recorded with your administrator identity and timestamp. Add a clear reason for the audit trail.</p><label>Decision reason<textarea required minLength={action.kind==="learning-resource"?8:3} rows="4" value={reason} onChange={e=>setReason(e.target.value)} placeholder="Explain the evidence reviewed and why this action is appropriate…"/></label><div className="ad-modal-actions"><button type="button" onClick={()=>setAction(null)} disabled={saving}>Cancel</button><button className="ad-modal-confirm" disabled={saving||reason.trim().length<(action.kind==="learning-resource"?8:3)}>{saving?"Saving…":"Confirm decision"}</button></div></form></div>}
   </div>;
 }

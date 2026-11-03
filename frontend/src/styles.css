@@ -516,3 +516,31 @@ summary { cursor: pointer; font-weight: 600; margin: .4rem 0; }
 .ad-learning{display:grid;gap:14px}.ad-learning-hero{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:23px 25px;border:1px solid #dce9e1;border-radius:14px;background:linear-gradient(115deg,#f2f9f4,#fff)}.ad-learning-hero h2{margin:7px 0;color:#214838;font-size:1.35rem;letter-spacing:-.04em}.ad-learning-hero p{max-width:680px;margin:0;color:#819087;font-size:.65rem;line-height:1.7}.ad-learning-mark{display:grid;place-items:center;flex:0 0 64px;height:64px;border-radius:17px;background:#e6f2e9;color:#24714e;font-size:1.8rem}.ad-learning-form,.ad-learning-policy,.ad-learning-credit-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;align-items:end;margin:13px 0 17px;padding:14px;border:1px solid #e8eee9;border-radius:10px;background:#f9fbf9}.ad-learning-policy{grid-template-columns:repeat(3,minmax(0,1fr))}.ad-learning-credit-form{grid-template-columns:repeat(3,minmax(0,1fr))}.ad-learning-form label,.ad-learning-policy label,.ad-learning-credit-form label{display:grid;gap:5px;color:#62766a;font-size:.54rem;font-weight:750}.ad-learning-form input,.ad-learning-form select,.ad-learning-policy input,.ad-learning-credit-form input{width:100%;min-width:0;height:35px;padding:0 9px;border:1px solid #dfe8e1;border-radius:7px;background:#fff;color:#345044;font:500 .58rem Inter,sans-serif;outline:none}.ad-learning-actions{display:flex;flex-wrap:wrap;gap:5px}.ad-learning-actions button{padding:6px 7px;font-size:.5rem}.ad-learning .ad-table td{max-width:240px;overflow-wrap:anywhere}.ad-learning .ad-table td small{display:block;margin-top:3px;color:#93a097;font-size:.49rem;overflow-wrap:anywhere}.ad-learning .ad-table td a{color:#438060;text-decoration:none}.ad-learning .ad-panel{min-width:0}
 @media(max-width:900px){.ad-learning-form{grid-template-columns:repeat(2,minmax(0,1fr))}.ad-learning-policy,.ad-learning-credit-form{grid-template-columns:1fr 1fr}}
 @media(max-width:560px){.ad-learning-hero{align-items:flex-start}.ad-learning-mark{display:none}.ad-learning-form,.ad-learning-policy,.ad-learning-credit-form{grid-template-columns:1fr}.ad-learning .ad-table-wrap{overflow-x:auto}}
+
+
+/* GraphRAG assessment workspace — five-question pages with persistent answer status */
+.gr-exam{display:grid;gap:15px}
+.gr-exam-meta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;color:#718078;font-size:.65rem}
+.gr-question-table{width:100%;overflow:auto;border:1px solid #e5ece7;border-radius:11px}
+.gr-question-table table{width:100%;border-collapse:collapse;min-width:600px}
+.gr-question-table th{padding:10px 12px;background:#f6f9f6;color:#7d8d82;text-align:left;font-size:.55rem;letter-spacing:.06em}
+.gr-question-table td{padding:10px 12px;border-top:1px solid #edf1ed;color:#52665a;font-size:.59rem;vertical-align:middle}
+.gr-question-table tbody tr{cursor:pointer;transition:background .15s}
+.gr-question-table tbody tr:hover{background:#f7faf7}
+.gr-question-table tbody tr.selected{background:#edf6ef;box-shadow:inset 3px 0 #267451}
+.gr-question-table td strong{display:block;color:#315541;font-size:.62rem}
+.gr-question-table td small{display:block;max-width:420px;margin-top:3px;color:#91a097;font-size:.52rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gr-question-current{padding:17px;border:1px solid #e5ece7;border-radius:12px;background:#fff}
+.gr-question-label{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:11px;color:#6d8878;font-size:.55rem;font-weight:800;letter-spacing:.06em}
+.gr-question-current .qtext{margin:8px 0 15px;color:#263f32;font-size:.95rem;line-height:1.65}
+.gr-exam-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.gr-exam-actions>span{margin-right:auto;color:#8b9990;font-size:.58rem}
+.gr-exam-actions .btn{min-height:35px;padding:0 12px;font-size:.6rem}
+@media(max-width:640px){.gr-question-current{padding:13px}.gr-exam-actions{justify-content:stretch}.gr-exam-actions .btn{flex:1}.gr-exam-actions>span{width:100%;text-align:center}.gr-question-label{font-size:.51rem}}
+
+
+.ad-graphrag-panel{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:17px 19px;border:1px solid #dce9e1;border-radius:12px;background:#f6faf7}
+.ad-graphrag-panel h3{margin:5px 0;color:#294b3a;font-size:.88rem}
+.ad-graphrag-panel p{margin:0 0 5px;color:#63796b;font-size:.62rem}
+.ad-graphrag-panel small{color:#8a9990;font-size:.54rem;line-height:1.5}
+@media(max-width:700px){.ad-graphrag-panel{align-items:flex-start;flex-direction:column}}
