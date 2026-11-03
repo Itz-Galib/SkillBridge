@@ -974,7 +974,7 @@ def admin_integrity_attempts(user=Depends(current_user), q: str = "", status: st
 
 @router.get("/api/admin/integrity/attempts/{attempt_id}")
 def admin_integrity_attempt_detail(attempt_id: str, user=Depends(current_user)):
-    admin_only(user, "assessment_review")
+    admin_only(user, "integrity_review")
     row = one("""SELECT a.*,u.name AS candidate_name,u.email,
                  r.decision AS review_decision,r.reason AS review_reason,
                  r.reviewed_at,r.reviewer_id
