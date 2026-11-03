@@ -32,8 +32,8 @@ function Bar({ score, threshold, unverified }) {
 
 function TrustChip({ trust }) {
   const t = useT();
-  const cls = trust === "High" ? "chip-ok" : trust === "Medium" ? "chip-mid" : "chip-rev";
-  return <span className={"chip " + cls}>{t("trusts")[trust]}</span>;
+  const cls = trust === "High trust" || trust === "High" ? "chip-ok" : trust === "Medium" ? "chip-mid" : "chip-rev";
+  return <span className={"chip " + cls}>{t("trusts")[trust] || trust || "Not scored"}</span>;
 }
 
 /* ---------- landing + auth ---------- */
