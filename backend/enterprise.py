@@ -833,6 +833,7 @@ ADMIN_SCOPE_ROLES = {
     "overview": {"super_admin"}, "users_read": {"super_admin", "support_agent", "trust_safety_reviewer"},
     "users_write": {"super_admin", "trust_safety_reviewer"}, "company_verification": {"super_admin", "company_verification_admin"},
     "job_moderation": {"super_admin", "company_verification_admin"}, "assessment_review": {"super_admin", "trust_safety_reviewer"},
+    "integrity_review": {"super_admin", "trust_safety_reviewer"},
     "appeals": {"super_admin", "trust_safety_reviewer"}, "phase_two": {"super_admin", "question_content_admin", "company_verification_admin"},
     "questions": {"super_admin", "question_content_admin"}, "ai": {"super_admin", "compliance_officer"},
     "billing": {"super_admin", "finance_admin"}, "learning": {"super_admin", "question_content_admin", "finance_admin"}, "privacy": {"super_admin", "compliance_officer"},
@@ -945,6 +946,82 @@ def admin_job_review_queue_v2(user=Depends(current_user)):
                    WHERE j.status IN ('pending_review','needs_changes','rejected')
                    ORDER BY CASE WHEN j.status='pending_review' THEN 0 ELSE 1 END,j.created ASC""")
     return {"items": [dict(r) for r in rows]}
+
+
+@router.get("/api/admin/integrity/attempts")
+def admin_integrity_attempts(user=Depends(current_user), q: str = "", status: str = "all", kind: str = "all", trust: str = "all", limit: int = 300):
+    admin_only(user, "integrity_review")
+    limit = max(1, min(limit, 500))
+    query = """SELECT a.id,a.user_id,a.kind,a.status,a.started,a.finished,a.result,a.appeal,
+               u.name AS candidate_name,u.email,
+               r.decision AS review_decision,r.reason AS review_reason,r.reviewed_at,
+               (SELECT COUNT(*) FROM events e WHERE e.attempt_id=a.id) AS event_count
+               FROM attempts a JOIN users u ON u.id=a.user_id
+               LEFT JOIN admin_attempt_reviews r ON r.attempt_id=a.id WHERE 1=1"""
+    args = []
+    if status in ("active", "done"):
+        query += " AND a.status=?"; args.append(status)
+    if kind in ("pre", "post"):
+        query += " AND a.kind=?"; args.append(kind)
+    if q.strip():
+        needle = "%" + q.strip().lower() + "%"
+        query += " AND (LOWER(u.name) LIKE ? OR LOWER(u.email) LIKE ? OR LOWER(a.id) LIKE ?)"
+        args.extend([needle, needle, needle])
+    query += " ORDER BY COALESCE(a.finished,a.started) DESC LIMIT ?"
+    args.append(limit)
+    items = []
+    for row in allr(query, tuple(args)):
+        item = dict(row)
+        try: item["result"] = json.loads(item["result"]) if item["result"] else None
+        except Exception: item["result"] = None
+        item["trust"] = (item["result"] or {}).get("trust", "Not scored")
+        if trust != "all" and item["trust"] != trust:
+            continue
+        items.append(item)
+    return {"items": items, "limit": limit}
+
+
+@router.get("/api/admin/integrity/attempts/{attempt_id}")
+def admin_integrity_attempt_detail(attempt_id: str, user=Depends(current_user)):
+    admin_only(user, "integrity_review")
+    row = one("""SELECT a.*,u.name AS candidate_name,u.email,
+                 r.decision AS review_decision,r.reason AS review_reason,
+                 r.reviewed_at,r.reviewer_id
+                 FROM attempts a JOIN users u ON u.id=a.user_id
+                 LEFT JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+                 WHERE a.id=?""", (attempt_id,))
+    if not row:
+        raise HTTPException(404, "Assessment attempt not found")
+    item = dict(row)
+    try: item["result"] = json.loads(item["result"]) if item["result"] else None
+    except Exception: item["result"] = None
+    try:
+        state = json.loads(item["state"]) if item.get("state") else {}
+    except Exception:
+        state = {}
+    raw_answers = state.get("answers", [])
+    if isinstance(raw_answers, dict):
+        questions = {q.get("id"): q for q in state.get("selected_questions", [])}
+        item["answers"] = [{
+            "question_id": qid, "topic": (questions.get(qid) or {}).get("assessment_topic"),
+            "question": (questions.get(qid) or {}).get("question_text"),
+            "answer": answer, "type": (questions.get(qid) or {}).get("question_type"),
+            "difficulty": (questions.get(qid) or {}).get("difficulty_level"),
+            "seconds": state.get("question_time_seconds", {}).get(qid), "answered": True,
+        } for qid, answer in raw_answers.items()]
+    else:
+        item["answers"] = [{
+            "question_id": a.get("qid"), "topic": a.get("topic"), "type": a.get("type"),
+            "difficulty": a.get("difficulty"), "seconds": a.get("seconds"), "answered": True,
+        } for a in raw_answers if isinstance(a, dict)]
+    item.pop("state", None)
+    item["events"] = [dict(e) for e in allr(
+        "SELECT id,type,ts AS server_ts FROM events WHERE attempt_id=? ORDER BY ts,id",
+        (attempt_id,)
+    )]
+    item["integrity"] = item["result"] or {}
+    audit(user["id"], "integrity_attempt_viewed", attempt_id)
+    return item
 
 
 @router.get("/api/admin/assessment-reviews")
