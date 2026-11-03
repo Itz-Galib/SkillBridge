@@ -309,7 +309,7 @@ function ExamIntegrityBanner({integrity,onRestartShare}) {
   const t=useT();
   return <><div className={"exam-integrity-banner"+(integrity.shareActive&&integrity.fullscreenActive?" active":" warning")} role="status">
     <strong>{integrity.shareActive?t("shareActive"):t("shareStopped")}</strong><span>{t("sharePrivacy")}</span>
-    {!integrity.shareActive&&<button type="button" className="btn sm" onClick={onRestartShare}>{t("restartShare")}</button>}
+    {!integrity.shareActive&&<button type="button" className="btn sm" onClick={async()=>{const stream=await onRestartShare?.();if(!stream)integrity.setNotice(t("shareRequired"));}}>{t("restartShare")}</button>}
     <strong>{integrity.fullscreenActive?t("fullscreenActive"):t("fullscreenWarning")}</strong>
     {!integrity.fullscreenActive&&<button type="button" className="btn sm" onClick={integrity.restartFullscreen}>{t("restartFullscreen")}</button>}
   </div>{integrity.notice&&<p className="exam-integrity-notice" role="status">{integrity.notice}</p>}{integrity.shareError&&<p className="err" role="alert">{integrity.shareError}</p>}</>;
