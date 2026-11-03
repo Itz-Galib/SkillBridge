@@ -250,7 +250,7 @@ def trust_label(events, answers, rules=None, exam_seconds=1200, question_times=N
         n = sum(1 for e in events if _event_value(e, "type") == kind)
         if n:
             charged = min(n, caps.get(reason_key, 3))
-            value = charged * weights.get(reason_key, 1)
+            value = charged * weights.get(reason_key, 2 if reason_key == "heartbeat_gap" else 1)
             points += value
             reasons.append({"key": reason_key, "n": charged, "points": value})
     for event in events:
