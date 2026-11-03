@@ -45,15 +45,17 @@ def test_full_attempt_and_adaptivity():
 
 def test_trust_never_fails():
     lab, why = trust_label({"paste": 5, "blur": 9}, [])
-    assert lab == "Needs review" and why
-    assert trust_label({}, [])[0] == "High"
+    assert lab["label"] == "Needs review" and lab["points"] > 0
+    assert lab["rule_version"] == "phase1-v1"
+    assert trust_label({}, [])["label"] == "High trust"
 
 def test_trust_integrity_events_are_advisory_and_explainable():
     events = {"copy": 1, "cut": 1, "paste": 1, "tab_hidden": 2, "fullscreen_exit": 1, "screen_share_stopped": 1}
     label, reasons = trust_label(events, [])
-    assert label == "Needs review"
-    assert {r["key"] for r in reasons} == set(events)
-    assert trust_label({}, [])[0] == "High"
+    assert label["label"] == "Needs review"
+    assert label["points"] >= 7
+    assert label["rule_version"] == "phase1-v1"
+    assert trust_label({}, [])["label"] == "High trust"
 
 
 def test_path_honest():
@@ -63,3 +65,50 @@ def test_path_honest():
 
 def test_sign():
     assert sign_payload({"a": 1}, "k") == sign_payload({"a": 1}, "k") != sign_payload({"a": 2}, "k")
+
+ 
+def test_trust_caps_external_clipboard_events():
+    events = [{"type": "paste", "server_ts": i, "external": True} for i in range(10)]
+    result = trust_label(events, [], {"rule_version": "test-v1", "normalize_per_30_minutes": False,
+        "weights": {"external_clipboard": 2}, "caps": {"external_clipboard": 3}})
+    assert result["points"] == 6
+    assert result["reasons"] == [{"key": "external_clipboard", "n": 3, "points": 6}]
+
+def test_trust_groups_tab_blur_fullscreen_into_one_incident():
+    events = [
+        {"type": "tab_hidden", "server_ts": 100},
+        {"type": "blur", "server_ts": 101},
+        {"type": "fullscreen_exit", "server_ts": 102},
+    ]
+    result = trust_label(events, [], {"rule_version": "test-v1", "normalize_per_30_minutes": False})
+    assert [r["key"] for r in result["reasons"]] == ["leave_window"]
+    assert result["points"] == 1
+
+def test_trust_hard_flags_require_review():
+    result = trust_label([{"type": "identity_mismatch", "server_ts": 1, "hard_flag": "identity_mismatch"}], [])
+    assert result["label"] == "Needs review"
+    assert result["hard_flags"] == ["identity_mismatch"]
+
+def test_trust_heartbeat_gap_duration_and_caps():
+    events = [{"type": "heartbeat_gap", "server_ts": i} for i in range(5)]
+    result = trust_label(events, [], {"rule_version": "test-v1", "normalize_per_30_minutes": False})
+    assert result["points"] == 6
+    assert result["reasons"] == [{"key": "heartbeat_gap", "n": 3, "points": 6}]
+
+def test_trust_fast_answer_fallback_and_percentile():
+    answer = {"qid": "q1", "type": "mcq", "correct": True, "difficulty": 2, "seconds": 2}
+    fallback = trust_label([], [answer], {"rule_version": "test-v1", "normalize_per_30_minutes": False})
+    assert fallback["points"] == 1
+    slow_prior = trust_label([], [answer], {"rule_version": "test-v1", "normalize_per_30_minutes": False},
+                             question_times={"q1": [4] * 30})
+    assert slow_prior["points"] == 1
+    fast_prior = trust_label([], [answer], {"rule_version": "test-v1", "normalize_per_30_minutes": False},
+                             question_times={"q1": [1] * 30})
+    assert fast_prior["points"] == 0
+
+def test_technical_score_is_independent_of_trust_result():
+    answers = [{"qid": "q", "topic": "sql", "difficulty": 2, "type": "mcq", "correct": True, "seconds": 1}]
+    before = score(answers)
+    trust_label([{"type": "paste", "server_ts": 1}], answers)
+    after = score(answers)
+    assert before == after
