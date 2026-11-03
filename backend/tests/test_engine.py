@@ -112,3 +112,17 @@ def test_technical_score_is_independent_of_trust_result():
     trust_label([{"type": "paste", "server_ts": 1}], answers)
     after = score(answers)
     assert before == after
+
+
+def test_trust_leave_window_duration_points():
+    events = [
+        {"type": "tab_hidden", "server_ts": 100},
+        {"type": "blur", "server_ts": 101},
+        {"type": "fullscreen_exit", "server_ts": 102},
+        {"type": "tab_visible", "server_ts": 221},
+    ]
+    result = trust_label(events, [], {"rule_version": "test-v1", "normalize_per_30_minutes": False})
+    leave = next(reason for reason in result["reasons"] if reason["key"] == "leave_window")
+    assert leave["duration_seconds"] == 121
+    assert leave["points"] == 3
+    assert len([r for r in result["reasons"] if r["key"] == "fullscreen_exit"]) == 0
