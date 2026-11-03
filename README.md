@@ -70,7 +70,7 @@ Enter your own email and a unique password of at least 14 characters when prompt
 
 ## Demo path (about 5 minutes)
 1. Create account → accept consent. 2. **Use sample CV** → Analyse (see what was redacted) → confirm skills.
-3. **Gap** shows the MOCK role vs. your claimed skills. 4. **Verify**: a server-timed assessment with 25 fundamental questions plus five questions per confirmed CV skill; the duration is calculated from question time allocations.
+3. **Gap** shows the MOCK role vs. your claimed skills. 4. **Verify**: the standard server-timed 10-question adaptive assessment (20 minutes). Difficulty adapts to candidate answers; correct answers remain hidden during the test.
 5. Result with topic scores and trust label. 6. **Learn**: cited resources for weak topics. 7. **Re-test** → uplift. 8. **Passport**: choose skills, share link, revoke.
 
 ## What is real vs. mock (honest list)
@@ -87,9 +87,11 @@ Enter your own email and a unique password of at least 14 characters when prompt
 | Bangla | UI + explanations. Question text is English only |
 | Not built (roadmap) | Recruiter/company/admin roles, camera proctoring, AI interviewer, MCP servers, pgvector, billing, SSO, virus scan |
 
-## GraphRAG-powered candidate assessment
+## Optional GraphRAG assessment prototype
 
-The assessment engine now has a GraphRAG retrieval path built around the existing, curator-governed `question_bank`. It retrieves and assembles approved questions; it does **not** fabricate assessment questions or answers at exam time.
+The repository includes an experimental GraphRAG blueprint path built around the existing, curator-governed `question_bank`. It is separate from the standard candidate assessment. The standard candidate flow uses the existing server-timed 10-question adaptive engine (20 minutes) and does not require CV confirmation, a complete GraphRAG bank, Meilisearch, or Neo4j.
+
+The experimental GraphRAG blueprint path is built around the existing, curator-governed `question_bank`. It retrieves and assembles approved questions; it does **not** fabricate assessment questions or answers at exam time.
 
 ### Assessment blueprint
 

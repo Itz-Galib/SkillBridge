@@ -545,12 +545,9 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const start = useCallback(async () => {
     setErr(null);
     try {
-      const blueprint = await api("/assessment/blueprint", {method:"POST"});
-      if (blueprint.status !== "ready") {
-        const missing = (blueprint.shortages || []).slice(0, 5).map((x) => `${x.topic} · ${x.difficulty}: ${x.available_selected}/${x.required}`).join("; ");
-        throw new Error("The approved question bank is not ready yet. " + (missing || "Add and approve the required questions in Admin → Question Bank."));
-      }
-      const v = await api("/attempts", {method:"POST",body:{blueprint_id:blueprint.blueprint_id}});
+      // The candidate assessment uses the existing 10-question adaptive engine.
+      // GraphRAG question-bank readiness is optional and must not block this flow.
+      const v = await api("/attempts", {method:"POST"});
       if (v.status === "active") setActive(v); else refresh();
     } catch (e) { setErr(e); }
   }, [refresh]);
@@ -569,7 +566,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     <section className="card narrow">
       <h2>{kind === "pre" ? t("startTest") : t("steps").retest}</h2>
       <p>{kind === "pre" ? t("testIntro") : t("retestIntro")}</p>
-      <p className="muted">This assessment uses 25 fundamental questions plus five questions for every CV skill you confirm. Analyse your CV and confirm the detected technologies first. The question bank must also contain enough approved questions for every topic, difficulty and question format.</p>
+      <p className="muted">This assessment contains 10 adaptive questions and lasts up to 20 minutes. The difficulty adjusts to your answers. Correct answers are never shown during the test. You do not need to analyse your CV or complete GraphRAG question-bank setup to start.</p>
       <Err e={err} />
       <button className="btn" onClick={start}>{t("startTest")}</button>
     </section>
@@ -922,7 +919,7 @@ function AdminConsole({ onLogout }) {
           return <section className="ad-question-workspace">
             <div className="ad-question-hero"><div><div className="ad-eyebrow">ASSESSMENT CONTENT · GOVERNANCE</div><h2>Build a stronger question bank.</h2><p>Organise, author and import assessment questions across nine skill domains. Every change is versioned and audited.</p><div className="ad-question-hero-tags"><span>✓ Database-backed</span><span>◈ Versioned edits</span><span>↗ Bulk import</span></div></div><div className="ad-question-hero-icon">Q<span>+</span></div></div>
             <div className="ad-graphrag-panel">
-              <div><span className="ad-eyebrow">GRAPH RETRIEVAL · ASSESSMENT READINESS</span><h3>CV + Fundamental GraphRAG</h3><p>{data.graphrag?.active_question_count??"—"} active questions · Fundamental {data.graphrag?.fundamental_selected_count??0}/25 · Meilisearch {data.graphrag?.meilisearch_configured?"configured":"not connected"} · Neo4j {data.graphrag?.neo4j_configured?"configured":"not connected"}</p><small>Fundamental readiness: {data.graphrag?.fundamental_readiness||"loading"}. Required: 25 fundamental questions plus 5 approved questions for every confirmed CV skill. Use category + subcategory, difficulty and format carefully.</small>{data.graphrag?.fundamental_shortages?.length>0&&<small>Missing: {data.graphrag.fundamental_shortages.slice(0,4).map(x=>x.format||x.topic+" "+x.difficulty).join(" · ")}</small>}</div>
+              <div><span className="ad-eyebrow">OPTIONAL GRAPH RETRIEVAL · EXPERIMENTAL</span><h3>CV + Fundamental GraphRAG</h3><p>{data.graphrag?.active_question_count??"—"} active questions · Fundamental {data.graphrag?.fundamental_selected_count??0}/25 · Meilisearch {data.graphrag?.meilisearch_configured?"configured":"not connected"} · Neo4j {data.graphrag?.neo4j_configured?"configured":"not connected"}</p><small>This experimental 25-question + CV-skill blueprint is separate from the standard 10-question adaptive candidate assessment. Its readiness status does not block candidates from taking the standard test.</small>{data.graphrag?.fundamental_shortages?.length>0&&<small>Missing: {data.graphrag.fundamental_shortages.slice(0,4).map(x=>x.format||x.topic+" "+x.difficulty).join(" · ")}</small>}</div>
               <button className="ad-q-add-btn" onClick={async()=>{try{const result=await api("/admin/assessment/graphrag/reindex",{method:"POST"});flash("Graph index updated · "+result.active_questions+" approved questions.");await load();}catch(x){setError(x.message||"Graph index update failed.");}}}>Rebuild search + graph index</button>
             </div>
             <div className="ad-question-stats"><article><span className="ad-qstat-icon">▤</span><div><small>Total questions</small><strong>{qdata.summary?.total??allQuestions.length}</strong><em>Across all categories</em></div></article><article><span className="ad-qstat-icon ad-qstat-green">✓</span><div><small>Active</small><strong>{qdata.summary?.active??0}</strong><em>Ready for use</em></div></article><article><span className="ad-qstat-icon ad-qstat-amber">◷</span><div><small>Draft</small><strong>{qdata.summary?.draft??0}</strong><em>Awaiting approval</em></div></article><article><span className="ad-qstat-icon ad-qstat-grey">▣</span><div><small>Archived</small><strong>{qdata.summary?.archived??0}</strong><em>Retained for history</em></div></article></div>
