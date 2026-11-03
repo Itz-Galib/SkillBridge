@@ -544,3 +544,29 @@ summary { cursor: pointer; font-weight: 600; margin: .4rem 0; }
 .ad-graphrag-panel p{margin:0 0 5px;color:#63796b;font-size:.62rem}
 .ad-graphrag-panel small{color:#8a9990;font-size:.54rem;line-height:1.5}
 @media(max-width:700px){.ad-graphrag-panel{align-items:flex-start;flex-direction:column}}
+
+/* Exam integrity controls */
+.exam-integrity-banner{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;margin:0 0 16px;border:1px solid #d9e3ef;border-radius:12px;background:#f6f8fc;color:#24354c;font-size:.82rem}
+.exam-integrity-banner strong{font-weight:800}
+.exam-integrity-banner span{flex:1;min-width:180px;color:#65738a}
+.exam-integrity-banner.active{background:#e8f7f0;border-color:#a9ddc5;color:#116047}
+.exam-integrity-banner.warning{background:#fff4e5;border-color:#edc98d;color:#80520b}
+.exam-integrity-notice,.exam-integrity-note{padding:10px 13px;border-radius:9px;background:#fff4e5;border:1px solid #edc98d;color:#80520b;font-size:.82rem}
+.exam-copy-locked{user-select:none;-webkit-user-select:none}
+.exam textarea{user-select:text;-webkit-user-select:text}
+.exam-integrity-banner .btn{white-space:nowrap}
+
+.exam-setup-steps{display:grid;gap:10px;margin:18px 0}
+.exam-setup-steps>div{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid #e2e9e4;border-radius:10px;background:#fbfdfb}
+.exam-setup-steps>div>span{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#edf2ee;color:#527260;font-weight:800}
+.exam-setup-steps>div.ready{border-color:#a8d7bd;background:#f1faf4}
+.exam-setup-steps>div.ready>span{background:#d9f1e2;color:#247448}
+.exam-setup-steps>div>div{flex:1;min-width:0}
+.exam-setup-steps b,.exam-setup-steps small{display:block}
+.exam-setup-steps b{font-size:.8rem;color:#315441}
+.exam-setup-steps small{font-size:.65rem;color:#829187}
+.exam-setup-steps .btn{white-space:nowrap}
+.ad-detail-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:14px 0}
+.ad-detail-list>div{display:flex;justify-content:space-between;gap:10px;padding:10px;border:1px solid #edf1ed;border-radius:8px;background:#fafcfb;font-size:.65rem}
+.ad-detail-list span{color:#849188}.ad-detail-list b{color:#315541;text-align:right}
+@media(max-width:600px){.ad-detail-list{grid-template-columns:1fr}.exam-setup-steps>div{align-items:flex-start;flex-wrap:wrap}.exam-setup-steps>div>div{min-width:calc(100% - 50px)}.exam-setup-steps .btn{margin-left:42px}}
