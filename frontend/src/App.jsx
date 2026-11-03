@@ -316,7 +316,7 @@ function ExamRun({ initial, onFinished, screenStream }) {
     };
     const contextMenu = (event) => { event.preventDefault(); };
     const blur = () => report("blur");
-    const visibility = () => { if (document.visibilityState === "hidden") report("tab_hidden"); };
+    const visibility = () => { report(document.visibilityState === "hidden" ? "tab_hidden" : "tab_visible"); };
     const fullscreen = () => {
       const active = Boolean(document.fullscreenElement);
       setFullscreenActive(active);
