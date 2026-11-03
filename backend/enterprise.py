@@ -1,7 +1,7 @@
 """Initial hiring workflow APIs for SkillBridge PRD."""
-import json, time, uuid, os, re, secrets
+import json, time, uuid, os, re, secrets, csv, io
 from typing import Optional, List
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 from main import current_user, one, allr, run, audit, QBYID
 
@@ -806,7 +806,15 @@ def ensure_admin_console_schema():
             reviewer_id INTEGER NOT NULL, decided_at REAL NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS admin_staff_roles (
             user_id INTEGER PRIMARY KEY, admin_role TEXT NOT NULL DEFAULT 'super_admin',
-            updated_by INTEGER NOT NULL, updated_at REAL NOT NULL)"""
+            updated_by INTEGER NOT NULL, updated_at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS question_bank (
+            id TEXT PRIMARY KEY, category_id TEXT NOT NULL, subcategory TEXT NOT NULL DEFAULT '',
+            question_type TEXT NOT NULL, difficulty_level TEXT NOT NULL, question_text TEXT NOT NULL,
+            options TEXT NOT NULL DEFAULT '[]', correct_answer TEXT NOT NULL DEFAULT '',
+            explanation TEXT NOT NULL DEFAULT '', reference_answer TEXT NOT NULL DEFAULT '',
+            grading_rubric TEXT NOT NULL DEFAULT '', marks INTEGER NOT NULL DEFAULT 1,
+            time_allocation INTEGER NOT NULL DEFAULT 60, status TEXT NOT NULL DEFAULT 'draft',
+            created_by TEXT NOT NULL, created_at REAL NOT NULL, version INTEGER NOT NULL DEFAULT 1)"""
     ]:
         run(statement)
     # Existing internally provisioned admin accounts retain their current authority.
@@ -1075,14 +1083,208 @@ def admin_audit_logs(user=Depends(current_user), limit: int = 100, action: str =
     return {"items":[dict(r) for r in rows]}
 
 
+
+QUESTION_CATEGORIES = [
+    {"id":"CAT-01","name":"SQL","icon":"▤","description":"Queries, joins, indexing and database operations","subcategories":["SQL Basics","Joins","Aggregation","Subqueries","Indexing","Transactions","Query Optimization"]},
+    {"id":"CAT-02","name":"DSA","icon":"⌘","description":"Data structures, algorithms and complexity","subcategories":["Arrays & Strings","Linked Lists","Stacks & Queues","Trees","Graphs","Sorting & Searching","Dynamic Programming","Big-O Analysis"]},
+    {"id":"CAT-03","name":"Coding","icon":"</>","description":"Programming exercises and implementation","subcategories":["Python","C++","Problem Solving","Debugging","Functions","OOP Coding"]},
+    {"id":"CAT-04","name":"RAG & AI","icon":"✳","description":"LLMs, retrieval, embeddings and AI agents","subcategories":["LLM Fundamentals","RAG Pipelines","Embeddings","Vector Databases","Prompt Engineering","AI Agents","Evaluation"]},
+    {"id":"CAT-05","name":"Java","icon":"☕","description":"Java language, JVM and ecosystem","subcategories":["Core Java","OOP","Collections","Exception Handling","Multithreading","JVM & Memory","Spring Basics"]},
+    {"id":"CAT-06","name":"Scenario-Based","icon":"◇","description":"Practical workplace and technical situations","subcategories":["Troubleshooting","Decision Making","Production Issues","Team Collaboration","Case Study","Debugging Scenario"]},
+    {"id":"CAT-07","name":"IQ & Aptitude","icon":"◎","description":"Logical, numerical and analytical reasoning","subcategories":["Logical Reasoning","Numerical Ability","Pattern Recognition","Verbal Reasoning","Data Interpretation"]},
+    {"id":"CAT-08","name":"CS Fundamentals","icon":"▦","description":"Core computer science and engineering concepts","subcategories":["Operating Systems","Computer Networks","DBMS","OOP Concepts","Software Engineering","Computer Architecture","Compiler Basics"]},
+    {"id":"CAT-09","name":"System Design","icon":"⌘","description":"Architecture, APIs, scalability and reliability","subcategories":["Architecture","API Design","Scalability","Caching","Messaging","Database Design","Security & Reliability"]}
+]
+QUESTION_CATEGORY_BY_ID = {x["id"]:x for x in QUESTION_CATEGORIES}
+QUESTION_CATEGORY_BY_NAME = {x["name"].lower():x["id"] for x in QUESTION_CATEGORIES}
+
+def _seed_question_bank():
+    if one("SELECT id FROM question_bank LIMIT 1"):
+        return
+    from content import QUESTIONS as curated_questions
+    legacy_map = {"sql":"CAT-01","python":"CAT-03","statistics":"CAT-08","visualization":"CAT-08","excel":"CAT-08","git":"CAT-08","communication":"CAT-06"}
+    now = time.time()
+    for q in curated_questions:
+        options = q.get("options") or []
+        answer = options[q["answer"]] if q.get("type") == "mcq" and isinstance(q.get("answer"), int) and options else q.get("ref", "")
+        run("""INSERT INTO question_bank(id,category_id,subcategory,question_type,difficulty_level,question_text,
+               options,correct_answer,explanation,reference_answer,grading_rubric,marks,time_allocation,status,
+               created_by,created_at,version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING""",
+            (q["id"],legacy_map.get(q.get("topic"),"CAT-08"),"Legacy curated", "MCQ" if q.get("type")=="mcq" else "Coding",
+             {1:"Easy",2:"Medium",3:"Hard"}.get(q.get("difficulty"),"Medium"),q.get("prompt",""),
+             json.dumps(options),str(answer or ""),q.get("explanation",""),q.get("ref",""),
+             "Deterministic answer-key comparison for legacy curated content",1,
+             {1:60,2:90,3:120}.get(q.get("difficulty"),90),"active","Curated question bank",now,1))
+
+def _question_payload(raw, actor="Admin"):
+    raw = dict(raw or {})
+    category = str(raw.get("category_id") or raw.get("category") or "").strip()
+    category_id = category.upper() if category.upper() in QUESTION_CATEGORY_BY_ID else QUESTION_CATEGORY_BY_NAME.get(category.lower())
+    qtext = str(raw.get("question_text") or raw.get("question") or raw.get("prompt") or "").strip()
+    qtype = str(raw.get("question_type") or raw.get("type") or ("MCQ" if raw.get("options") else "Short Answer")).strip()
+    difficulty = str(raw.get("difficulty_level") or raw.get("difficulty") or "Medium").strip().title()
+    if difficulty not in ("Easy","Medium","Hard"):
+        difficulty = {"1":"Easy","2":"Medium","3":"Hard"}.get(difficulty,"")
+    options = raw.get("options") or []
+    if isinstance(options,str):
+        try: options=json.loads(options)
+        except Exception: options=[x.strip() for x in re.split(r"\s*[|;]\s*",options) if x.strip()]
+    if not isinstance(options,list): options=[]
+    options=[str(x).strip() for x in options if str(x).strip()]
+    try: marks=int(raw.get("marks") or 1)
+    except (TypeError,ValueError): marks=0
+    try:
+        if raw.get("time_allocation") not in (None,""):
+            seconds=int(float(raw.get("time_allocation")))
+        elif raw.get("time_allocation_seconds") not in (None,""):
+            seconds=int(float(raw.get("time_allocation_seconds")))
+        else:
+            seconds=int(float(raw.get("time_allocation_minutes") or raw.get("time_minutes") or 1)*60)
+    except (TypeError,ValueError): seconds=0
+    status=str(raw.get("status") or "draft").lower()
+    errors=[]
+    if not category_id: errors.append("Choose a valid category.")
+    if not qtext: errors.append("Question text is required.")
+    if not qtype: errors.append("Question type is required.")
+    if difficulty not in ("Easy","Medium","Hard"): errors.append("Difficulty must be Easy, Medium or Hard.")
+    if marks<1 or marks>100: errors.append("Marks must be between 1 and 100.")
+    if seconds<15 or seconds>7200: errors.append("Time allocation must be 15–7200 seconds.")
+    if status not in ("draft","active","archived"): errors.append("Status must be Draft, Active or Archived.")
+    if len(qtext)>10000: errors.append("Question text is too long.")
+    if len(options)>10: errors.append("A question can have at most 10 options.")
+    if qtype.lower() in ("mcq","multiple choice") and len(options)<2: errors.append("MCQ requires at least two options.")
+    return {"id":str(raw.get("id") or uuid.uuid4().hex[:12]),"category_id":category_id or "",
+        "subcategory":str(raw.get("subcategory") or "General").strip()[:100],"question_type":qtype[:40],
+        "difficulty_level":difficulty,"question_text":qtext,"options":options,
+        "correct_answer":str(raw.get("correct_answer") if raw.get("correct_answer") is not None else raw.get("answer") or "").strip(),
+        "explanation":str(raw.get("explanation") or "").strip(),
+        "reference_answer":str(raw.get("reference_answer") or raw.get("reference") or "").strip(),
+        "grading_rubric":str(raw.get("grading_rubric") or raw.get("rubric") or "").strip(),
+        "marks":marks,"time_allocation":seconds,"status":status,"created_by":actor,
+        "created_at":time.time(),"version":int(raw.get("version") or 1),"errors":errors}
+
+def _question_row(row):
+    item=dict(row)
+    try: item["options"]=json.loads(item.get("options") or "[]")
+    except Exception: item["options"]=[]
+    item["created_date"]=item.pop("created_at",None)
+    return item
+
 @router.get("/api/admin/questions")
 def admin_questions(user=Depends(current_user)):
     admin_only(user, "questions")
-    from content import QUESTIONS
-    return {"items":[{"id":q["id"],"topic":q["topic"],"difficulty":q["difficulty"],
-                      "type":q["type"],"prompt":q["prompt"][:240],
-                      "status":"active_curated","version":"r0-static"} for q in QUESTIONS],
-            "governance":"The current R0 bank is static curated content. Versioned authoring, independent approval, exposure monitoring and retirement are not connected to live delivery yet."}
+    _seed_question_bank()
+    items=[_question_row(r) for r in allr("SELECT * FROM question_bank ORDER BY created_at DESC")]
+    counts={c["id"]:0 for c in QUESTION_CATEGORIES}
+    for q in items: counts[q["category_id"]]=counts.get(q["category_id"],0)+1
+    return {"items":items,"categories":[{**c,"count":counts.get(c["id"],0)} for c in QUESTION_CATEGORIES],
+        "summary":{"total":len(items),"active":sum(q["status"]=="active" for q in items),
+        "draft":sum(q["status"]=="draft" for q in items),"archived":sum(q["status"]=="archived" for q in items)},
+        "governance":"Database-backed question bank with versioned edits, explicit status and audited imports."}
+
+@router.post("/api/admin/questions")
+def admin_create_question(body: dict, user=Depends(current_user)):
+    admin_only(user,"questions")
+    payload=_question_payload(body,user.get("name") or "Admin")
+    if payload["errors"]: raise HTTPException(422,{"errors":payload["errors"]})
+    duplicate=one("SELECT id FROM question_bank WHERE lower(question_text)=lower(?) AND category_id=?",(payload["question_text"],payload["category_id"]))
+    if duplicate: raise HTTPException(409,"A question with the same text already exists in this category.")
+    run("""INSERT INTO question_bank(id,category_id,subcategory,question_type,difficulty_level,question_text,
+        options,correct_answer,explanation,reference_answer,grading_rubric,marks,time_allocation,status,
+        created_by,created_at,version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (payload["id"],payload["category_id"],payload["subcategory"],payload["question_type"],payload["difficulty_level"],
+        payload["question_text"],json.dumps(payload["options"]),payload["correct_answer"],payload["explanation"],
+        payload["reference_answer"],payload["grading_rubric"],payload["marks"],payload["time_allocation"],
+        payload["status"],payload["created_by"],payload["created_at"],1))
+    audit(user["id"],"question_created",payload["id"])
+    return _question_row(one("SELECT * FROM question_bank WHERE id=?",(payload["id"],)))
+
+@router.put("/api/admin/questions/{question_id}")
+def admin_update_question(question_id: str, body: dict, user=Depends(current_user)):
+    admin_only(user,"questions")
+    current=one("SELECT * FROM question_bank WHERE id=?",(question_id,))
+    if not current: raise HTTPException(404,"Question not found")
+    merged=dict(current); merged.update(body); merged["id"]=question_id
+    payload=_question_payload(merged,user.get("name") or "Admin")
+    if payload["errors"]: raise HTTPException(422,{"errors":payload["errors"]})
+    duplicate=one("SELECT id FROM question_bank WHERE lower(question_text)=lower(?) AND category_id=? AND id<>?",
+        (payload["question_text"],payload["category_id"],question_id))
+    if duplicate: raise HTTPException(409,"A question with the same text already exists in this category.")
+    version=int(current["version"] or 1)+1
+    run("""UPDATE question_bank SET category_id=?,subcategory=?,question_type=?,difficulty_level=?,question_text=?,
+        options=?,correct_answer=?,explanation=?,reference_answer=?,grading_rubric=?,marks=?,time_allocation=?,
+        status=?,version=? WHERE id=?""",
+        (payload["category_id"],payload["subcategory"],payload["question_type"],payload["difficulty_level"],
+        payload["question_text"],json.dumps(payload["options"]),payload["correct_answer"],payload["explanation"],
+        payload["reference_answer"],payload["grading_rubric"],payload["marks"],payload["time_allocation"],
+        payload["status"],version,question_id))
+    audit(user["id"],"question_updated",question_id+":v"+str(version))
+    return _question_row(one("SELECT * FROM question_bank WHERE id=?",(question_id,)))
+
+@router.post("/api/admin/questions/import/preview")
+async def admin_preview_question_import(file: UploadFile=File(...), category_id: str=Form(""), user=Depends(current_user)):
+    admin_only(user,"questions")
+    name=(file.filename or "").lower(); data=await file.read()
+    if len(data)>5_000_000: raise HTTPException(413,"Upload must be smaller than 5 MB.")
+    try:
+        if name.endswith(".csv"):
+            records=list(csv.DictReader(io.StringIO(data.decode("utf-8-sig"))))
+        elif name.endswith(".json"):
+            parsed=json.loads(data.decode("utf-8-sig"))
+            records=parsed if isinstance(parsed,list) else parsed.get("questions",[])
+        elif name.endswith(".pdf"):
+            from pypdf import PdfReader
+            extracted="\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(data)).pages)
+            matches=re.findall(r"(?:^|\n)\s*(?:Q(?:uestion)?\s*)?\d{1,4}[\).:\-]\s*(.+?)(?=(?:\n\s*(?:Q(?:uestion)?\s*)?\d{1,4}[\).:\-]\s*)|$)",extracted,re.S|re.I)
+            records=[{"category_id":category_id,"subcategory":"PDF import","question_type":"Short Answer",
+                "difficulty_level":"Medium","question_text":re.sub(r"\s+"," ",m).strip(),"marks":1,
+                "time_allocation_minutes":2,"status":"draft"} for m in matches]
+            if not records and extracted.strip():
+                records=[{"category_id":category_id,"subcategory":"PDF import","question_type":"Short Answer",
+                    "difficulty_level":"Medium","question_text":extracted.strip()[:10000],"marks":1,
+                    "time_allocation_minutes":2,"status":"draft"}]
+        else: raise HTTPException(415,"Upload a CSV, JSON or PDF file.")
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(422,"Could not read this file: "+str(exc)[:180])
+    if not isinstance(records,list) or not records: raise HTTPException(422,"No question records were found in the uploaded file.")
+    if len(records)>1000: raise HTTPException(413,"A single import can contain at most 1,000 questions.")
+    preview=[]
+    for raw in records:
+        if not isinstance(raw,dict): raw={"question_text":str(raw),"category_id":category_id}
+        if not raw.get("category_id") and category_id: raw["category_id"]=category_id
+        item=_question_payload(raw,user.get("name") or "Admin")
+        dup=one("SELECT id FROM question_bank WHERE lower(question_text)=lower(?) AND category_id=?",
+            (item["question_text"],item["category_id"])) if item["question_text"] and item["category_id"] else None
+        item["duplicate"]=bool(dup)
+        if dup: item["errors"].append("Duplicate question already exists.")
+        preview.append(item)
+    valid=sum(not x["errors"] for x in preview)
+    return {"filename":file.filename,"total":len(preview),"valid":valid,"invalid":len(preview)-valid,
+        "items":preview,"pdf_note":"PDF extraction is text-based. Review and correct extracted questions before importing." if name.endswith(".pdf") else None}
+
+class QuestionImportCommit(BaseModel):
+    questions: List[dict] = Field(default_factory=list,max_length=1000)
+
+@router.post("/api/admin/questions/import/commit")
+def admin_commit_question_import(body: QuestionImportCommit,user=Depends(current_user)):
+    admin_only(user,"questions")
+    added=0; skipped=0; rejected=0
+    for raw in body.questions:
+        payload=_question_payload(raw,user.get("name") or "Admin")
+        if payload["errors"]: rejected+=1; continue
+        duplicate=one("SELECT id FROM question_bank WHERE lower(question_text)=lower(?) AND category_id=?",
+            (payload["question_text"],payload["category_id"]))
+        if duplicate: skipped+=1; continue
+        run("""INSERT INTO question_bank(id,category_id,subcategory,question_type,difficulty_level,question_text,
+            options,correct_answer,explanation,reference_answer,grading_rubric,marks,time_allocation,status,
+            created_by,created_at,version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (payload["id"],payload["category_id"],payload["subcategory"],payload["question_type"],payload["difficulty_level"],
+            payload["question_text"],json.dumps(payload["options"]),payload["correct_answer"],payload["explanation"],
+            payload["reference_answer"],payload["grading_rubric"],payload["marks"],payload["time_allocation"],
+            payload["status"],payload["created_by"],payload["created_at"],1))
+        added+=1
+    audit(user["id"],"question_bulk_import",f"added={added};skipped={skipped};rejected={rejected}")
+    return {"added":added,"skipped":skipped,"rejected":rejected}
 
 
 @router.get("/api/admin/ai-operations")
