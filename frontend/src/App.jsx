@@ -323,9 +323,9 @@ function ExamIntegrityBanner({integrity,onRestartShare}) {
 }
 
 /* ---------- exam ---------- */
-function ExamRun({ initial, onFinished, screenStream }) {
+function ExamRun({ initial, onFinished, screenStream, onRestartShare }) {
   const integrity=useExamIntegrity(initial.attempt_id,screenStream);
-  if (initial.graphrag) return <GraphRAGExamRun initial={initial} onFinished={onFinished} integrity={integrity} onRestartShare={integrity.restartShare} />;
+  if (initial.graphrag) return <GraphRAGExamRun initial={initial} onFinished={onFinished} integrity={integrity} onRestartShare={onRestartShare} />;
   const t = useT();
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState("");
@@ -337,12 +337,6 @@ function ExamRun({ initial, onFinished, screenStream }) {
 
   useEffect(() => { const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000); return () => clearInterval(i); }, []);
   useEffect(() => { setAns(""); setOut(null); }, [v.question?.id]);
-  useEffect(() => {
-    const onBlur = () => api(`/attempts/${aid}/event`, { method: "POST", body: { type: "blur" } }).catch(() => {});
-    window.addEventListener("blur", onBlur);
-    return () => window.removeEventListener("blur", onBlur);
-  }, [aid]);
-
   const q = v.question;
   const submit = async () => {
     if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error(!integrity.shareActive?t("shareRequired"):t("fullscreenRequired")));return;}
@@ -354,7 +348,6 @@ function ExamRun({ initial, onFinished, screenStream }) {
     } catch (e) { setErr(e); } finally { setBusy(false); }
   };
   const runSql = async () => { if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error(t("shareRequired")));return;} try { setOut(await api(`/attempts/${aid}/sql-run`, { method: "POST", body: { sql: ans } })); } catch (e) { setErr(e); } };
-  const onPaste = () => api(`/attempts/${aid}/event`, { method: "POST", body: { type: "paste" } }).catch(() => {});
 
   if (!q) return <p>{t("loading")}</p>;
   return (
@@ -364,7 +357,7 @@ function ExamRun({ initial, onFinished, screenStream }) {
         <progress value={q.index} max={q.total} />
         <span className={"timer" + (left < 120 ? " low" : "")}>{t("timeLeft")}: {fmt(left)}</span>
       </div>
-      <ExamIntegrityBanner integrity={integrity} onRestartShare={async()=>{const stream=await integrity.restartShare();if(stream)stream.getTracks().forEach(track=>track.stop());}} />
+      <ExamIntegrityBanner integrity={integrity} onRestartShare={onRestartShare} />
       <h3 className="qtext exam-copy-locked">{q.prompt}</h3>
       {q.type === "mcq" ? (
         <fieldset className="opts">
@@ -390,7 +383,7 @@ function ExamRun({ initial, onFinished, screenStream }) {
   );
 }
 
-function GraphRAGExamRun({ initial, onFinished }) {
+function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState(initial.page?.answers?.[initial.question?.id] || "");
   const [err, setErr] = useState(null);
@@ -410,6 +403,7 @@ function GraphRAGExamRun({ initial, onFinished }) {
   }, [aid]);
 
   const saveAnswer = async () => {
+    if(!integrity.shareActive||!integrity.fullscreenActive)throw new Error(!integrity.shareActive?"screen_share_required":"fullscreen_required");
     if (!q || !String(ans).trim()) return v;
     const next = await api(`/attempts/${aid}/answer`, {method:"POST",body:{question_id:q.id,answer:String(ans)}});
     setV(next);
@@ -417,6 +411,7 @@ function GraphRAGExamRun({ initial, onFinished }) {
   };
   const goTo = async (index) => {
     if (busy) return;
+    if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error(!integrity.shareActive?"screen_share_required":"fullscreen_required"));return;}
     setBusy(true); setErr(null);
     try {
       await saveAnswer();
@@ -429,9 +424,11 @@ function GraphRAGExamRun({ initial, onFinished }) {
     try { await saveAnswer(); } catch(e) { setErr(e); } finally { setBusy(false); }
   };
   const runSql = async () => {
+    if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error("screen_share_required"));return;}
     try { setSqlOut(await api(`/attempts/${aid}/sql-run`,{method:"POST",body:{sql:ans}})); } catch(e) { setErr(e); }
   };
   const submit = async () => {
+    if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error("screen_share_required"));return;}
     setBusy(true); setErr(null);
     try {
       await saveAnswer();
@@ -451,6 +448,7 @@ function GraphRAGExamRun({ initial, onFinished }) {
         <progress value={v.answered} max={v.total} />
         <span className={"timer" + (left < 120 ? " low" : "")}>Time left: {fmt(left)}</span>
       </div>
+      <ExamIntegrityBanner integrity={integrity} onRestartShare={onRestartShare} />
       <div className="gr-exam-meta">
         <span>{v.total} questions · {Math.ceil(v.duration_seconds / 60)} minutes allocated</span>
         <span>Fundamental + CV skills</span>
@@ -497,8 +495,8 @@ function GraphRAGExamRun({ initial, onFinished }) {
         <button className="btn ghost" onClick={()=>goTo(previousIndex)} disabled={page.page===0 || busy}>Previous 5</button>
         <span>Page {page.page+1} of {page.page_count}</span>
         <button className="btn ghost" onClick={()=>goTo(nextIndex)} disabled={!page.has_next || busy}>Next 5</button>
-        <button className="btn ghost" onClick={save} disabled={busy || !String(ans).trim()}>Save answer</button>
-        <button className="btn" onClick={submit} disabled={busy || v.answered + (answered ? 0 : (String(ans).trim() ? 1 : 0)) < v.total}>
+        <button className="btn ghost" onClick={save} disabled={busy || !integrity.shareActive || !integrity.fullscreenActive || !String(ans).trim()}>Save answer</button>
+        <button className="btn" onClick={submit} disabled={busy || !integrity.shareActive || !integrity.fullscreenActive || v.answered + (answered ? 0 : (String(ans).trim() ? 1 : 0)) < v.total}>
           {busy ? "Saving…" : "Submit assessment"}
         </button>
       </div>
