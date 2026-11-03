@@ -589,40 +589,77 @@ function Uplift() {
 
 function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const t = useT();
-  const [active, setActive] = useState(null);
-  const [err, setErr] = useState(null);
-  const done = st.attempts.filter((a) => a.status === "done");
-  const mine = kind === "pre" ? done[0] : done.length > 1 ? done[done.length - 1] : null;
-  const act = st.attempts.find((a) => a.status === "active");
-  const start = useCallback(async () => {
+  const [active,setActive]=useState(null),[err,setErr]=useState(null);
+  const [screenStream,setScreenStream]=useState(null),[shareReady,setShareReady]=useState(false),[fullscreenReady,setFullscreenReady]=useState(Boolean(document.fullscreenElement)),[setupBusy,setSetupBusy]=useState(false);
+  const done=st.attempts.filter(a=>a.status==="done");
+  const mine=kind==="pre"?done[0]:done.length>1?done[done.length-1]:null;
+  const act=st.attempts.find(a=>a.status==="active");
+  useEffect(()=>{
+    const track=screenStream?.getVideoTracks()[0];
+    if(!track){setShareReady(false);return;}
+    const sync=()=>setShareReady(track.readyState==="live");
+    sync();track.addEventListener("ended",sync);return()=>track.removeEventListener("ended",sync);
+  },[screenStream]);
+  useEffect(()=>{
+    const sync=()=>setFullscreenReady(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange",sync);return()=>document.removeEventListener("fullscreenchange",sync);
+  },[]);
+  useEffect(()=>()=>{screenStream?.getTracks().forEach(track=>track.stop());},[screenStream]);
+  const enableScreenShare=async()=>{
     setErr(null);
-    try {
-      // The candidate assessment uses the existing 10-question adaptive engine.
-      // GraphRAG question-bank readiness is optional and must not block this flow.
-      const v = await api("/attempts", {method:"POST"});
-      if (v.status === "active") setActive(v); else refresh();
-    } catch (e) { setErr(e); }
-  }, [refresh]);
-  const finished = async () => { setActive(null); await refresh(); };
-
-  if (active) return <ExamRun initial={active} onFinished={finished} />;
-  if (act && (act.kind === kind)) return <section className="card narrow"><button className="btn" onClick={start}>{t("resume")}</button><Err e={err} /></section>;
-  if (mine) return (
-    <>
-      <Result aid={mine.id} next={afterResult} nextLabel={afterLabel} />
-      {kind === "post" && <Uplift />}
-    </>
-  );
-  if (kind === "post" && done.length === 0) return <p className="note">{t("needPre")}</p>;
-  return (
-    <section className="card narrow">
-      <h2>{kind === "pre" ? t("startTest") : t("steps").retest}</h2>
-      <p>{kind === "pre" ? t("testIntro") : t("retestIntro")}</p>
-      <p className="muted">This assessment contains 10 adaptive questions and lasts up to 20 minutes. The difficulty adjusts to your answers. Correct answers are never shown during the test. You do not need to analyse your CV or complete GraphRAG question-bank setup to start.</p>
-      <Err e={err} />
-      <button className="btn" onClick={start}>{t("startTest")}</button>
-    </section>
-  );
+    try{
+      if(!navigator.mediaDevices?.getDisplayMedia)throw new Error(t("shareUnsupported"));
+      const stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:5},audio:false});
+      setScreenStream(stream);setShareReady(stream.getVideoTracks().some(track=>track.readyState==="live"));
+    }catch(e){setShareReady(false);setErr(new Error(e?.name==="NotAllowedError"?t("shareRequired"):e.message||t("shareRequired")));}
+  };
+  const enableFullscreen=async()=>{
+    setErr(null);
+    try{
+      if(!document.documentElement.requestFullscreen)throw new Error(t("fullscreenUnsupported"));
+      await document.documentElement.requestFullscreen();setFullscreenReady(Boolean(document.fullscreenElement));
+      if(!document.fullscreenElement)throw new Error(t("fullscreenRequired"));
+    }catch(e){setFullscreenReady(Boolean(document.fullscreenElement));setErr(new Error(e?.name==="NotAllowedError"?t("fullscreenClickAgain"):e.message||t("fullscreenUnsupported")));}
+  };
+  const restartShare=async()=>{
+    try{
+      if(!navigator.mediaDevices?.getDisplayMedia)throw new Error(t("shareUnsupported"));
+      const stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:5},audio:false});
+      const aid=active?.attempt_id||act?.id;
+      if(aid)await api("/attempts/"+aid+"/event",{method:"POST",body:{type:"screen_share_started"}});
+      setScreenStream(stream);setShareReady(true);setErr(null);return stream;
+    }catch(e){setErr(new Error(e.message||t("shareRequired")));return null;}
+  };
+  const start=useCallback(async()=>{
+    setErr(null);
+    const sharing=Boolean(screenStream?.getVideoTracks().some(track=>track.readyState==="live"));
+    const fullscreen=Boolean(document.fullscreenElement);
+    setShareReady(sharing);setFullscreenReady(fullscreen);
+    if(!sharing||!fullscreen){setErr(new Error(!sharing?t("shareRequired"):t("fullscreenRequired")));return;}
+    setSetupBusy(true);
+    try{
+      const v=await api("/attempts",{method:"POST"});
+      if(v.status==="active"){
+        await api("/attempts/"+v.attempt_id+"/event",{method:"POST",body:{type:"screen_share_started"}});
+        setActive(v);
+      }else{screenStream?.getTracks().forEach(track=>track.stop());setScreenStream(null);await refresh();}
+    }catch(e){setErr(e);}finally{setSetupBusy(false);}
+  },[refresh,screenStream,t]);
+  const finished=async()=>{screenStream?.getTracks().forEach(track=>track.stop());setScreenStream(null);setActive(null);if(document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen().catch(()=>{});await refresh();};
+  if(active)return <ExamRun initial={active} onFinished={finished} screenStream={screenStream} onRestartShare={restartShare}/>;
+  if(mine)return <><Result aid={mine.id} next={afterResult} nextLabel={afterLabel}/>{kind==="post"&&<Uplift/>}</>;
+  if(kind==="post"&&done.length===0)return <p className="note">{t("needPre")}</p>;
+  return <section className="card narrow exam-setup">
+    <h2>{kind==="pre"?t("startTest"):t("steps").retest}</h2>
+    <p>{kind==="pre"?t("testIntro"):t("retestIntro")}</p>
+    <p className="muted">Before starting or resuming, enable screen sharing and full-screen mode. The browser will ask for permission separately. SkillBridge does not record or upload the shared screen stream.</p>
+    <div className="exam-setup-steps">
+      <div className={shareReady?"ready":""}><span>{shareReady?"✓":"1"}</span><div><b>{t("shareSetupStep")}</b><small>{shareReady?t("shareActive"):t("shareRequired")}</small></div><button type="button" className="btn ghost" onClick={enableScreenShare}>{shareReady?t("shareActive"):t("restartShare")}</button></div>
+      <div className={fullscreenReady?"ready":""}><span>{fullscreenReady?"✓":"2"}</span><div><b>{t("fullscreenSetupStep")}</b><small>{fullscreenReady?t("fullscreenActive"):t("fullscreenRequired")}</small></div><button type="button" className="btn ghost" onClick={enableFullscreen}>{fullscreenReady?t("fullscreenActive"):t("restartFullscreen")}</button></div>
+    </div>
+    <Err e={err}/>
+    <button className="btn" onClick={start} disabled={setupBusy||!shareReady||!fullscreenReady}>{setupBusy?t("saving"):act&&act.kind===kind?t("resume"):t("startTest")}</button>
+  </section>;
 }
 
 /* ---------- learning path ---------- */
