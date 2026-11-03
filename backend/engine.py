@@ -185,6 +185,12 @@ def _group_integrity_incidents(events, window_seconds=3):
     for event in ordered:
         kind = _event_value(event, "type", "")
         ts = float(_event_value(event, "server_ts", _event_value(event, "ts", 0)) or 0)
+        if kind == "tab_visible":
+            if current:
+                current["end_ts"] = max(current["start_ts"], ts)
+                current["types"].add(kind)
+                current = None
+            continue
         if kind in {"tab_hidden", "blur", "fullscreen_exit"}:
             if current and ts - current["end_ts"] <= window_seconds:
                 current["end_ts"] = max(current["end_ts"], ts)
