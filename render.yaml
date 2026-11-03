@@ -25,6 +25,8 @@ services:
         value: "3"
       - key: SEED_DEMO
         value: "true"
+      - key: SEED_GRAPHRAG_QUESTIONS
+        value: "false"
       - key: CORS_ORIGINS
         value: https://skillbridge-seven-peach.vercel.app,https://skillbridge.onrender.com
       - key: ANTHROPIC_API_KEY

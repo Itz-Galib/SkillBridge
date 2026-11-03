@@ -70,7 +70,7 @@ Enter your own email and a unique password of at least 14 characters when prompt
 
 ## Demo path (about 5 minutes)
 1. Create account → accept consent. 2. **Use sample CV** → Analyse (see what was redacted) → confirm skills.
-3. **Gap** shows the MOCK role vs. your claimed skills. 4. **Verify**: 10 adaptive questions (MCQ + hands-on SQL), server-timed.
+3. **Gap** shows the MOCK role vs. your claimed skills. 4. **Verify**: a server-timed assessment with 25 fundamental questions plus five questions per confirmed CV skill; the duration is calculated from question time allocations.
 5. Result with topic scores and trust label. 6. **Learn**: cited resources for weak topics. 7. **Re-test** → uplift. 8. **Passport**: choose skills, share link, revoke.
 
 ## What is real vs. mock (honest list)
@@ -128,12 +128,14 @@ The repository includes an explicit, repeatable seed script with **45 synthetic 
 - Per-skill difficulty: 1 Easy, 2 Medium, 2 Hard.
 - Includes MCQ, coding, SQL, scenario and explanation formats, answer keys/reference solutions, rubrics and per-question time allocations.
 
-Run this only against a **development or staging database**. From the Render service Shell (or from the backend directory locally), execute:
+Run this only against a **development or staging database**. If your Render Free service does not provide Shell access, you can use the temporary startup option instead:
 
-```bash
-cd /app
-python seed_graphrag_questions.py
-```
+1. In Render → your SkillBridge backend service → **Environment**, add or change `SEED_GRAPHRAG_QUESTIONS` to `true`.
+2. Save the change and let Render redeploy the backend. The startup script runs `python /app/seed_graphrag_questions.py` before starting the API and prints the seed summary in deployment logs.
+3. After the logs confirm that 45 questions were inserted/verified, change `SEED_GRAPHRAG_QUESTIONS` back to `false` and redeploy. The script is disabled by default and does not run on ordinary restarts after that.
+4. Rebuild search + graph index from Admin → Question Governance.
+
+The seed uses stable IDs and `ON CONFLICT DO NOTHING`, so a repeated run does not duplicate or overwrite these seeded records. If the seed command fails, startup stops and the deployment logs show the error; correct the database/configuration issue before disabling the flag. This startup option requires the Render service to use the repository's `start.sh` entrypoint (the supplied Render Blueprint does).
 
 The script is idempotent: it uses stable question IDs and `ON CONFLICT DO NOTHING`, so rerunning it will not duplicate or overwrite existing questions. It does not create candidate accounts or write candidate data. Existing question-bank records are preserved.
 
