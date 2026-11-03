@@ -493,7 +493,9 @@ def save(att_id, st, **kw):
 
 
 def finalize(att, st):
-    ev = {r["type"]: r["n"] for r in allr("SELECT type, COUNT(*) n FROM events WHERE attempt_id=? GROUP BY type", (att["id"],))}
+    event_rows = allr("SELECT type, ts FROM events WHERE attempt_id=? ORDER BY ts, id", (att["id"],))
+    ev = [{"type": r["type"], "server_ts": r["ts"]} for r in event_rows]
+    exam_seconds = int(st.get("duration_seconds") or E.TEST_SECONDS)
     if st.get("graphrag"):
         now = time.time()
         current_id = st.get("current")
@@ -528,7 +530,7 @@ def finalize(att, st):
                 "explanation": q.get("explanation") if objective else None,
                 "review_status": ("correct" if correct else "incorrect") if objective else "pending_human_review",
                 "time_seconds": st.get("question_time_seconds", {}).get(q["id"], 0)})
-            trust_answers.append({"type": "mcq" if objective else "subjective", "correct": bool(correct),
+            trust_answers.append({"qid": q["id"], "type": "mcq" if is_mcq else ("sql" if is_sql_auto else "subjective"), "correct": bool(correct),
                 "difficulty": {"Easy": 1, "Medium": 2, "Hard": 3}.get(q.get("difficulty_level"), 2),
                 "seconds": st.get("question_time_seconds", {}).get(q["id"], 0)})
         topic_scores = {}
@@ -538,10 +540,12 @@ def finalize(att, st):
         possible = sum(x["possible"] for x in topics.values())
         earned = sum(x["earned"] for x in topics.values())
         overall = round(100 * earned / possible) if possible else None
-        label, reasons = E.trust_label(ev, trust_answers)
+        integrity = E.trust_label(ev, trust_answers, exam_seconds=exam_seconds)
         manual = any(x["review_status"] == "pending_human_review" for x in review_rows)
         res = {"overall": overall, "level": E.level_of(overall or 0), "topics": topic_scores,
-            "trust": label, "trust_reasons": reasons, "percentile": None,
+            "trust": integrity["label"], "trust_points": integrity["points"],
+            "trust_rule_version": integrity["rule_version"], "trust_reasons": integrity["reasons"],
+            "trust_hard_flags": integrity["hard_flags"], "percentile": None,
             "kind": att["kind"], "date": time.strftime("%Y-%m-%d"),
             "review_status": "pending_human_review" if manual else "auto_graded",
             "manual_review_required": manual, "question_results": review_rows,
@@ -549,8 +553,11 @@ def finalize(att, st):
             "answered_questions": len(answers)}
     else:
         res = E.score(st["answers"])
-        label, reasons = E.trust_label(ev, st["answers"])
-        res.update({"trust": label, "trust_reasons": reasons, "percentile": None, "kind": att["kind"], "date": time.strftime("%Y-%m-%d")})
+        integrity = E.trust_label(ev, st["answers"], exam_seconds=exam_seconds)
+        res.update({"trust": integrity["label"], "trust_points": integrity["points"],
+            "trust_rule_version": integrity["rule_version"], "trust_reasons": integrity["reasons"],
+            "trust_hard_flags": integrity["hard_flags"], "percentile": None,
+            "kind": att["kind"], "date": time.strftime("%Y-%m-%d")})
     run("UPDATE attempts SET status='done', finished=?, result=?, state=? WHERE id=?", (time.time(), json.dumps(res), json.dumps(st), att["id"]))
     audit(att["user_id"], "attempt_done", att["id"])
 
@@ -559,6 +566,15 @@ def get_att(att_id, uid):
     a = one("SELECT * FROM attempts WHERE id=? AND user_id=?", (att_id, uid))
     if not a: raise HTTPException(404, "Attempt not found")
     return dict(a)
+
+
+def require_screen_share(att_id):
+    latest = one(
+        "SELECT type FROM events WHERE attempt_id=? AND type IN ('screen_share_started','screen_share_stopped','screen_share_unavailable') ORDER BY ts DESC, id DESC LIMIT 1",
+        (att_id,),
+    )
+    if not latest or latest["type"] != "screen_share_started":
+        raise HTTPException(409, "screen_share_required")
 
 
 class StartAttempt(BaseModel):
@@ -645,6 +661,7 @@ class Ans(BaseModel):
 def answer(aid: str, b: Ans, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     if att["status"] != "active": raise HTTPException(409, "Attempt already finished")
+    require_screen_share(aid)
     st = json.loads(att["state"])
     if time.time() > att["started"] + E.TEST_SECONDS + E.GRACE:      # server owns the timer
         finalize(att, st); return view(get_att(aid, u["id"]))
@@ -686,6 +703,7 @@ def navigate_question(aid: str, b: NavigateQuestion, u=Depends(current_user)):
     st = json.loads(att["state"])
     if att["status"] != "active" or not st.get("graphrag"):
         raise HTTPException(409, "Question navigation is unavailable")
+    require_screen_share(aid)
     if time.time() > att["started"] + int(st["duration_seconds"]) + E.GRACE:
         finalize(att, st)
         return view(get_att(aid, u["id"]))
@@ -711,6 +729,7 @@ def submit_graphrag_attempt(aid: str, u=Depends(current_user)):
     st = json.loads(att["state"])
     if att["status"] != "active" or not st.get("graphrag"):
         raise HTTPException(409, "This is not an active GraphRAG assessment")
+    require_screen_share(aid)
     if time.time() > att["started"] + int(st["duration_seconds"]) + E.GRACE:
         finalize(att, st)
         return view(get_att(aid, u["id"]))
@@ -729,6 +748,7 @@ class SqlRun(BaseModel):
 def sql_run(aid: str, b: SqlRun, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     st = json.loads(att["state"])
+    require_screen_share(aid)
     if st.get("graphrag"):
         q = next((x for x in st["selected_questions"] if x["id"] == st.get("current")), None)
         if att["status"] != "active" or not q or "sql" not in str(q.get("question_type", "")).lower():
@@ -739,13 +759,17 @@ def sql_run(aid: str, b: SqlRun, u=Depends(current_user)):
 
 
 class Ev(BaseModel):
-    type: str
+    type: str = Field(min_length=1, max_length=40)
 
 
 @app.post("/api/attempts/{aid}/event")
 def event(aid: str, b: Ev, u=Depends(current_user)):
     att = get_att(aid, u["id"])
-    if att["status"] == "active" and b.type in ("paste", "blur"):
+    allowed = {
+        "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
+        "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
+    }
+    if att["status"] == "active" and b.type in allowed:
         run("INSERT INTO events(attempt_id,type,ts) VALUES (?,?,?)", (aid, b.type, time.time()))
     return {"ok": True}
 
