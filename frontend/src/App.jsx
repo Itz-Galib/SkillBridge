@@ -299,13 +299,6 @@ function useExamIntegrity(aid, screenStream) {
     sync();track.addEventListener("ended",ended);
     return()=>track.removeEventListener("ended",ended);
   },[screenStream,report,t]);
-  const restartShare=async()=>{
-    try{if(!navigator.mediaDevices?.getDisplayMedia)throw new Error(t("shareUnsupported"));
-      const stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:5},audio:false});
-      await api("/attempts/"+aid+"/event",{method:"POST",body:{type:"screen_share_started"}});
-      return stream;
-    }catch(e){setShareError(e.message||t("shareRequired"));report("screen_share_unavailable");return null;}
-  };
   const restartFullscreen=async()=>{
     try{if(!document.documentElement.requestFullscreen)throw new Error(t("fullscreenUnsupported"));await document.documentElement.requestFullscreen();setFullscreenActive(Boolean(document.fullscreenElement));}
     catch(e){setShareError(e.message||t("fullscreenRequired"));}
@@ -396,12 +389,6 @@ function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
 
   useEffect(() => { const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000); return () => clearInterval(i); }, []);
   useEffect(() => { setAns(page.answers?.[q?.id] || ""); setSqlOut(null); }, [q?.id, v.question_index]);
-  useEffect(() => {
-    const onBlur = () => api(`/attempts/${aid}/event`, {method:"POST",body:{type:"blur"}}).catch(()=>{});
-    window.addEventListener("blur", onBlur);
-    return () => window.removeEventListener("blur", onBlur);
-  }, [aid]);
-
   const saveAnswer = async () => {
     if(!integrity.shareActive||!integrity.fullscreenActive)throw new Error(!integrity.shareActive?"screen_share_required":"fullscreen_required");
     if (!q || !String(ans).trim()) return v;
