@@ -221,10 +221,18 @@ def trust_label(events, answers, rules=None, exam_seconds=1200, question_times=N
         value = min(caps.get("leave_window", 4), weights.get("leave_window", 1) + int(duration // 60))
         points += value
         reasons.append({"key": "leave_window", "n": 1, "points": value, "duration_seconds": round(duration, 1)})
-    fs_events = [e for e in events if _event_value(e, "type") == "fullscreen_exit"
-                 and not any(_event_value(e, "type") in {"tab_hidden", "blur"} and
-                             abs(float(_event_value(e, "server_ts", 0) or 0) -
-                                 float(_event_value(e, "server_ts", 0) or 0)) <= 3 for _ in [0])]
+    fs_events = []
+    for event in events:
+        if _event_value(event, "type") != "fullscreen_exit":
+            continue
+        ts = float(_event_value(event, "server_ts", 0) or 0)
+        grouped = any(
+            _event_value(other, "type") in {"tab_hidden", "blur"}
+            and abs(float(_event_value(other, "server_ts", 0) or 0) - ts) <= 3
+            for other in events
+        )
+        if not grouped:
+            fs_events.append(event)
     fs_n = min(len(fs_events), caps.get("fullscreen_exit", 3))
     if fs_n:
         value = fs_n * weights.get("fullscreen_exit", 1)
