@@ -19,7 +19,7 @@ COOLDOWN_HOURS = float(os.getenv("RETEST_COOLDOWN_HOURS", "0"))   # spec default
 MAX_ATTEMPTS_90D = int(os.getenv("MAX_ATTEMPTS_90D", "3"))
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-5-5")
-CONSENT_VERSION = "r0-1"
+CONSENT_VERSION = "r0-2"
 
 
 def _secret() -> str:
