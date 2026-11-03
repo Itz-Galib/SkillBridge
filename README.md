@@ -81,6 +81,14 @@ During an active attempt, the frontend blocks ordinary copy, cut, paste, keyboar
 
 **Browser-enforced limits:** browsers do not let a website silently start screen sharing. The candidate must approve the browser prompt, and the browser may allow sharing a single tab/window instead of the entire desktop. A web page cannot reliably prevent screenshots, another device, OS-level shortcuts, developer tools, browser extensions or a determined user from bypassing client-side controls. The API also checks that the latest reported screen-sharing event is active before accepting an answer or running SQL. This is a consistency check, not cryptographic proof: browser telemetry is client-reported and a determined user can forge requests. These controls are deterrents and review signals, not a secure remote-proctoring system. No camera or microphone is requested, and the screen stream is not recorded or uploaded by this application. Use HTTPS (or localhost for development) and test in supported desktop browsers.
 
+## Phase 1 exam-integrity update (in progress)
+
+The current branch adds a versioned, explainable integrity result (phase1-v1) that is stored separately from the technical assessment score. It groups tab-hidden, blur and fullscreen-exit reports into a single leave-window incident when they occur close together; a return-to-tab event closes the incident so away duration can contribute points. Clipboard, screen-share interruption, heartbeat-gap and wrong-share-surface rules have configurable weights/caps in backend/engine.py. The result stores the label, points, rule version, reason list and hard-flag list. The current hard-flag hook is ready for later evidence phases; this branch does not yet collect camera/identity evidence.
+
+**Important: Phase 1 is not complete yet.** Server-side answer timing and the exam deadline were already implemented before this update. The current event API is authenticated and checks attempt ownership, but the remaining Phase 1 work still includes per-attempt session binding and single-session invalidation, event sequence validation and anomaly persistence, rate limiting and richer event metadata, 10-second heartbeats and lazy heartbeat-gap creation, event buffering/sendBeacon delivery, strict full-monitor surface enforcement, clipboard-origin tracking for the code editor, and the full pre-exam system-check page. Until those are implemented and tested, browser telemetry remains candidate-reported and must not be treated as proof of misconduct.
+
+Trust labels are review signals only. They must not change the technical score or automatically fail a candidate. Existing screen-share/fullscreen checks are browser-level checks, not proof that the candidate is using only one device or sharing the entire desktop.
+
 ## What is real vs. mock (honest list)
 | Area | R0 status |
 |---|---|
