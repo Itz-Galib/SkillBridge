@@ -4,7 +4,6 @@ export const LangCtx = createContext("en");
 
 const en = {
   brand: "SkillBridge",
-  mockBanner: "R0 PROTOTYPE. The job profile, question pool and learning index are small, hand-curated samples (MOCK). No percentile or hiring decision is produced.",
   heroTitle: "Proven skills, not paper claims.",
   heroSub: "Upload a CV, see your gap for a real role, take a secure test, follow a cited learning path, re-test and share a Skill Passport. AI assists; scores come from a stored answer key; humans decide.",
   loop: ["Profile", "Gap", "Verify", "Learn", "Re-test", "Passport"],
@@ -61,7 +60,6 @@ const en = {
 const bn = {
   ...en,
   brand: "স্কিলব্রিজ",
-  mockBanner: "R0 প্রোটোটাইপ। চাকরির প্রোফাইল, প্রশ্নভান্ডার ও শেখার তালিকা ছোট ও হাতে বাছাই করা নমুনা (MOCK)। এখানে পার্সেন্টাইল বা নিয়োগ-সিদ্ধান্ত দেওয়া হয় না।",
   heroTitle: "কাগজের দাবি নয়, প্রমাণিত দক্ষতাই পরিচয়।",
   heroSub: "সিভি দিন, একটি বাস্তব পদের জন্য আপনার ঘাটতি দেখুন, নিরাপদ পরীক্ষা দিন, উৎসসহ শেখার পথ অনুসরণ করুন, আবার পরীক্ষা দিয়ে উন্নতি মাপুন এবং স্কিল পাসপোর্ট শেয়ার করুন। AI সহায়তা করে; স্কোর আসে সার্ভারে রাখা উত্তরপত্র থেকে; সিদ্ধান্ত নেয় মানুষ।",
   loop: ["প্রোফাইল", "ঘাটতি", "যাচাই", "শেখা", "পুনঃপরীক্ষা", "পাসপোর্ট"],

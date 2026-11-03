@@ -1297,11 +1297,186 @@ def admin_ai_operations(user=Depends(current_user)):
             "note":"Provider latency, token/cost telemetry, prompt evaluation history and a remote kill switch are not instrumented in this deployment."}
 
 
+def ensure_billing_schema():
+    for statement in [
+        """CREATE TABLE IF NOT EXISTS billing_plans (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            amount_minor INTEGER NOT NULL, currency TEXT NOT NULL DEFAULT 'BDT',
+            interval TEXT NOT NULL DEFAULT 'one_time', retake_credits INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 0, created_by INTEGER NOT NULL,
+            created REAL NOT NULL, updated REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS billing_invoices (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, plan_id TEXT NOT NULL,
+            amount_minor INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'payment_pending',
+            provider TEXT NOT NULL DEFAULT 'sslcommerz', provider_reference TEXT NOT NULL DEFAULT '',
+            issued_at REAL NOT NULL, paid_at REAL)""",
+        """CREATE TABLE IF NOT EXISTS billing_subscriptions (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, plan_id TEXT NOT NULL,
+            invoice_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending_payment',
+            started_at REAL, ends_at REAL, created REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS billing_refunds (
+            id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL, amount_minor INTEGER NOT NULL,
+            currency TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'requested',
+            requested_by INTEGER NOT NULL, reviewed_by INTEGER, review_reason TEXT NOT NULL DEFAULT '',
+            requested_at REAL NOT NULL, reviewed_at REAL)""",
+        """CREATE TABLE IF NOT EXISTS billing_credit_ledger (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, delta INTEGER NOT NULL,
+            entry_type TEXT NOT NULL, source_ref TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL, actor_id INTEGER NOT NULL, created REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS billing_payment_events (
+            id TEXT PRIMARY KEY, provider TEXT NOT NULL, event_id TEXT NOT NULL,
+            invoice_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL,
+            payload_hash TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0,
+            received_at REAL NOT NULL, UNIQUE(provider,event_id))"""
+    ]:
+        run(statement)
+
+
+ensure_billing_schema()
+
+
+class BillingPlanInput(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    description: str = Field(default="", max_length=1000)
+    amount_minor: int = Field(gt=0, le=100000000)
+    currency: str = Field(default="BDT", regex="^[A-Z]{3}$")
+    interval: str = Field(default="one_time")
+    retake_credits: int = Field(default=0, ge=0, le=1000)
+
+
+class BillingCreditInput(BaseModel):
+    user_id: int = Field(gt=0)
+    delta: int = Field(ge=-1000, le=1000)
+    reason: str = Field(min_length=5, max_length=1000)
+
+
+class BillingRefundRequest(BaseModel):
+    invoice_id: str = Field(min_length=8, max_length=80)
+    reason: str = Field(min_length=5, max_length=1000)
+
+
+class BillingRefundDecision(BaseModel):
+    decision: str
+    reason: str = Field(min_length=5, max_length=1000)
+
+
 @router.get("/api/admin/billing")
 def admin_billing(user=Depends(current_user)):
     admin_only(user, "billing")
-    return {"enabled":False,"provider_configured":False,"plans":[],"invoices":[],"refunds":[],
-            "ledger":[],"note":"Billing, payment webhooks, credit ledger, invoices and refund reconciliation are not implemented/configured in this deployment. No financial records are fabricated."}
+    plans = allr("SELECT * FROM billing_plans ORDER BY created DESC")
+    invoices = allr("""SELECT i.*,u.email AS customer_email,p.name AS plan_name
+                       FROM billing_invoices i LEFT JOIN users u ON u.id=i.user_id
+                       LEFT JOIN billing_plans p ON p.id=i.plan_id
+                       ORDER BY i.issued_at DESC LIMIT 100""")
+    refunds = allr("""SELECT r.*,i.user_id,u.email AS customer_email
+                      FROM billing_refunds r JOIN billing_invoices i ON i.id=r.invoice_id
+                      LEFT JOIN users u ON u.id=i.user_id ORDER BY r.requested_at DESC LIMIT 100""")
+    ledger = allr("""SELECT l.*,u.email AS customer_email FROM billing_credit_ledger l
+                     LEFT JOIN users u ON u.id=l.user_id ORDER BY l.created DESC LIMIT 100""")
+    paid = one("SELECT COUNT(*) AS n, COALESCE(SUM(amount_minor),0) AS total FROM billing_invoices WHERE status='paid'")
+    pending = one("SELECT COUNT(*) AS n FROM billing_invoices WHERE status='payment_pending'")
+    provider_configured = bool(os.getenv("SSLCOMMERZ_STORE_ID") and os.getenv("SSLCOMMERZ_STORE_PASSWORD"))
+    live_enabled = provider_configured and os.getenv("BILLING_LIVE_ENABLED","false").lower()=="true"
+    return {
+        "enabled": True, "provider": "SSLCommerz", "provider_configured": provider_configured,
+        "live_enabled": live_enabled, "mode": "live" if live_enabled else "sandbox_or_disabled",
+        "summary": {"paid_invoices": paid["n"], "gross_paid_minor": paid["total"],
+                    "pending_invoices": pending["n"], "plans": len(plans),
+                    "refund_requests": len([r for r in refunds if r["status"]=="requested"])},
+        "plans": [dict(x) for x in plans], "invoices": [dict(x) for x in invoices],
+        "refunds": [dict(x) for x in refunds], "ledger": [dict(x) for x in ledger],
+        "note": "Billing records are database-backed. Live checkout and payment confirmation remain disabled until an approved merchant account, credentials, verified callback integration and production testing are complete. No payment is marked paid by admin action."
+    }
+
+
+@router.post("/api/admin/billing/plans")
+def admin_create_billing_plan(body: BillingPlanInput, user=Depends(current_user)):
+    admin_only(user, "billing")
+    if body.interval not in ("one_time","monthly","yearly"):
+        raise HTTPException(422, "Interval must be one_time, monthly or yearly")
+    plan_id = uuid.uuid4().hex
+    now = time.time()
+    run("""INSERT INTO billing_plans(id,name,description,amount_minor,currency,interval,retake_credits,active,created_by,created,updated)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (plan_id,body.name.strip(),body.description.strip(),body.amount_minor,body.currency,
+         body.interval,body.retake_credits,0,user["id"],now,now))
+    audit(user["id"],"billing_plan_created",plan_id)
+    return {"id":plan_id,"active":False,"message":"Plan saved as inactive. Review pricing and enable only after payment configuration is approved."}
+
+
+@router.patch("/api/admin/billing/plans/{plan_id}")
+def admin_update_billing_plan(plan_id: str, body: dict, user=Depends(current_user)):
+    admin_only(user, "billing")
+    row = one("SELECT id FROM billing_plans WHERE id=?", (plan_id,))
+    if not row: raise HTTPException(404,"Billing plan not found")
+    if set(body.keys()) != {"active"} or not isinstance(body["active"], bool):
+        raise HTTPException(422,"Only the active boolean can be changed")
+    if body["active"]:
+        raise HTTPException(409,"Plans cannot be activated until a verified payment provider is configured")
+    run("UPDATE billing_plans SET active=0,updated=? WHERE id=?", (time.time(),plan_id))
+    audit(user["id"],"billing_plan_deactivated",plan_id)
+    return {"id":plan_id,"active":False}
+
+
+@router.get("/api/billing/credits")
+def billing_my_credits(user=Depends(current_user)):
+    balance = one("SELECT COALESCE(SUM(delta),0) AS n FROM billing_credit_ledger WHERE user_id=?", (user["id"],))["n"]
+    entries = allr("SELECT id,delta,entry_type,source_ref,reason,created FROM billing_credit_ledger WHERE user_id=? ORDER BY created DESC LIMIT 50",(user["id"],))
+    return {"balance":balance,"ledger":[dict(x) for x in entries]}
+
+
+@router.post("/api/admin/billing/credits")
+def admin_adjust_billing_credits(body: BillingCreditInput, user=Depends(current_user)):
+    admin_only(user, "billing")
+    if body.delta == 0: raise HTTPException(422,"Credit adjustment cannot be zero")
+    if not one("SELECT id FROM users WHERE id=?", (body.user_id,)):
+        raise HTTPException(404,"User not found")
+    current = one("SELECT COALESCE(SUM(delta),0) AS n FROM billing_credit_ledger WHERE user_id=?", (body.user_id,))["n"]
+    if current + body.delta < 0:
+        raise HTTPException(409,"Credit balance cannot become negative")
+    entry_id=uuid.uuid4().hex
+    run("""INSERT INTO billing_credit_ledger(id,user_id,delta,entry_type,source_ref,reason,actor_id,created)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (entry_id,body.user_id,body.delta,"admin_adjustment","",body.reason.strip(),user["id"],time.time()))
+    audit(user["id"],"billing_credit_adjusted",f"{body.user_id}:{body.delta}:{entry_id}")
+    return {"id":entry_id,"balance":current+body.delta}
+
+
+@router.post("/api/billing/refunds")
+def billing_request_refund(body: BillingRefundRequest, user=Depends(current_user)):
+    invoice=one("SELECT id,amount_minor,currency,status FROM billing_invoices WHERE id=? AND user_id=?",
+                (body.invoice_id,user["id"]))
+    if not invoice: raise HTTPException(404,"Invoice not found")
+    if invoice["status"]!="paid": raise HTTPException(409,"Only a confirmed paid invoice can be considered for refund")
+    existing=one("SELECT id FROM billing_refunds WHERE invoice_id=? AND status IN ('requested','approved_pending_provider','processing')",
+                 (body.invoice_id,))
+    if existing: raise HTTPException(409,"A refund request is already open for this invoice")
+    refund_id=uuid.uuid4().hex
+    run("""INSERT INTO billing_refunds(id,invoice_id,amount_minor,currency,reason,status,requested_by,requested_at)
+           VALUES (?,?,?,?,?,'requested',?,?)""",
+        (refund_id,body.invoice_id,invoice["amount_minor"],invoice["currency"],body.reason.strip(),user["id"],time.time()))
+    audit(user["id"],"billing_refund_requested",refund_id)
+    return {"id":refund_id,"status":"requested"}
+
+
+@router.post("/api/admin/billing/refunds/{refund_id}/decision")
+def admin_decide_billing_refund(refund_id: str, body: BillingRefundDecision, user=Depends(current_user)):
+    admin_only(user, "billing")
+    if body.decision not in ("approve","reject"):
+        raise HTTPException(422,"Decision must be approve or reject")
+    row=one("SELECT status FROM billing_refunds WHERE id=?",(refund_id,))
+    if not row: raise HTTPException(404,"Refund request not found")
+    if row["status"]!="requested": raise HTTPException(409,"Refund request has already been reviewed")
+    status="approved_pending_provider" if body.decision=="approve" else "rejected"
+    run("UPDATE billing_refunds SET status=?,reviewed_by=?,review_reason=?,reviewed_at=? WHERE id=?",
+        (status,user["id"],body.reason.strip(),time.time(),refund_id))
+    audit(user["id"],"billing_refund_reviewed",refund_id+":"+status)
+    return {"id":refund_id,"status":status,"note":"Approval is not a completed refund; provider processing and settlement confirmation are still required."}
+
+
+@router.post("/api/billing/checkout")
+def billing_checkout(user=Depends(current_user)):
+    raise HTTPException(503,"Online checkout is not enabled. SkillBridge must complete merchant onboarding and verified SSLCommerz integration before collecting payments.")
 
 
 @router.get("/api/admin/privacy")

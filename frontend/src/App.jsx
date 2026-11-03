@@ -580,7 +580,7 @@ function PublicPassport({ id }) {
           ))}
         </ul>
         {p.uplift && <p className="note">{t("upliftTitle")}: {p.uplift.pre}% → {p.uplift.post}% ({p.uplift.delta >= 0 ? "+" : ""}{p.uplift.delta})</p>}
-        <small className="muted">{p.issuer} · {t("mockBanner")}</small>
+        <small className="muted">{p.issuer}</small>
         <p><a href="#/" className="link">{t("back")}</a></p>
       </article>
     </main>
@@ -767,7 +767,7 @@ function AdminConsole({ onLogout }) {
   return <div className="ad-app">
     <aside className="ad-sidebar">
       <div className="ad-brand"><span className="ad-brand-mark">S</span><span>SkillBridge<small>PLATFORM CONTROL</small></span></div>
-      <div className="ad-admin-label"><span className="ad-online-dot"/> ADMIN CONSOLE <span className="ad-version">R1</span></div>
+      <div className="ad-admin-label"><span className="ad-online-dot"/> ADMIN CONSOLE</div>
       <nav className="ad-nav">{visibleNav.map(([id,label,icon])=><button key={id} className={page===id?"active":""} onClick={()=>{setPage(id);setSearch("");}}><span>{icon}</span>{label}{id==="companies"&&counts.pending_companies>0?<b>{counts.pending_companies}</b>:id==="jobs"&&counts.pending_jobs>0?<b>{counts.pending_jobs}</b>:id==="appeals"&&counts.open_appeals>0?<b>{counts.open_appeals}</b>:null}</button>)}</nav>
       <div className="ad-sidebar-bottom"><div className="ad-security-card"><span>◈</span><strong>Privileged workspace</strong><p>Admin actions are permission-checked and recorded.</p></div><div className="ad-admin-profile"><div>SA</div><span><b>{adminRole.replaceAll("_"," ")}</b><small>Internal staff access</small></span><i>●</i></div><button className="ad-sidebar-signout" type="button" onClick={onLogout}>↪ Sign out of admin</button></div>
     </aside>
@@ -812,7 +812,26 @@ function AdminConsole({ onLogout }) {
           </section>;
         })()}
         {page==="ai"&&<section className="ad-two-col"><div className="ad-panel"><div className="ad-panel-head"><div><h2>AI provider</h2><p>Current extraction provider configuration</p></div>{pill(data.ai?.status||"unknown")}</div><div className="ad-detail-list"><div><span>Provider</span><b>{data.ai?.provider||"—"}</b></div><div><span>Model</span><b>{data.ai?.model||"—"}</b></div><div><span>API configured</span><b>{data.ai?.configured?"Yes":"No"}</b></div><div><span>Fallback</span><b>{data.ai?.fallback||"—"}</b></div><div><span>Usage telemetry</span><b>{data.ai?.metrics_available?"Available":"Not instrumented"}</b></div></div></div><div className="ad-panel"><h2>Operations notes</h2><p>{data.ai?.note||"AI operations telemetry is not connected."}</p><div className="ad-info-banner">No AI-generated score or hiring decision is authorised. AI output must be validated and grounded in source data.</div></div></section>}
-        {page==="billing"&&<section className="ad-panel"><div className="ad-panel-head"><div><h2>Billing & financial operations</h2><p>Payment-provider reconciliation, invoices, credits and refunds.</p></div>{pill(data.billing?.enabled?"enabled":"not_enabled")}</div><div className="ad-empty ad-empty-large"><span>৳</span><h3>Billing is not connected yet</h3><p>{data.billing?.note||"No billing records are available."}</p><small>Plans: {data.billing?.plans?.length||0} · Invoices: {data.billing?.invoices?.length||0} · Refunds: {data.billing?.refunds?.length||0}</small></div></section>}
+        {page==="billing"&&<section className="ad-billing">
+          <div className="ad-billing-hero"><div><span className="ad-eyebrow">FINANCE OPERATIONS</span><h2>Billing & payments</h2><p>Manage plans, review payment records, refunds and retake credits.</p></div><div className="ad-billing-provider"><span className="ad-provider-mark">৳</span><div><b>{data.billing?.provider||"SSLCommerz"}</b><small>{data.billing?.live_enabled?"Live mode":data.billing?.provider_configured?"Credentials detected · live disabled":"Gateway not connected"}</small></div><span className={data.billing?.live_enabled?"ad-status-live":"ad-status-pending"}>{data.billing?.live_enabled?"LIVE":"NOT LIVE"}</span></div></div>
+          <div className="ad-billing-notice"><b>Checkout is safely disabled.</b><span>{data.billing?.note||"Merchant approval, credentials and verified callbacks are required before accepting payments."}</span></div>
+          <div className="ad-billing-metrics">
+            <article><small>Confirmed paid invoices</small><strong>{data.billing?.summary?.paid_invoices??0}</strong><span>Verified records only</span></article>
+            <article><small>Gross confirmed payments</small><strong>৳{((data.billing?.summary?.gross_paid_minor||0)/100).toLocaleString("en-BD",{minimumFractionDigits:2,maximumFractionDigits:2})}</strong><span>BDT minor units converted</span></article>
+            <article><small>Awaiting payment</small><strong>{data.billing?.summary?.pending_invoices??0}</strong><span>Not counted as revenue</span></article>
+            <article><small>Refund requests</small><strong>{data.billing?.summary?.refund_requests??0}</strong><span>Awaiting Finance review</span></article>
+          </div>
+          <div className="ad-panel">
+            <div className="ad-panel-head"><div><h3>Pricing plans</h3><p>New plans are saved inactive. Configure final pricing before launch.</p></div><span className="ad-count">{data.billing?.plans?.length||0} plans</span></div>
+            <div className="ad-table-wrap"><table className="ad-table"><thead><tr><th>Plan</th><th>Price</th><th>Billing cycle</th><th>Retake credits</th><th>Status</th></tr></thead><tbody>{(data.billing?.plans||[]).map(p=><tr key={p.id}><td><b>{p.name}</b><small>{p.description||"—"}</small></td><td>৳{(p.amount_minor/100).toLocaleString("en-BD",{minimumFractionDigits:2})}</td><td>{p.interval}</td><td>{p.retake_credits}</td><td>{pill(p.active?"active":"inactive")}</td></tr>)}</tbody></table></div>
+            {!(data.billing?.plans||[]).length&&<div className="ad-billing-empty">No pricing plans have been configured yet. Final prices remain intentionally unset.</div>}
+          </div>
+          <div className="ad-two-col ad-billing-lists">
+            <div className="ad-panel"><div className="ad-panel-head"><div><h3>Recent invoices</h3><p>Only verified successful payments count as paid.</p></div><span className="ad-count">{data.billing?.invoices?.length||0}</span></div>{(data.billing?.invoices||[]).length?<div className="ad-table-wrap"><table className="ad-table"><thead><tr><th>Invoice</th><th>Customer</th><th>Amount</th><th>Status</th></tr></thead><tbody>{data.billing.invoices.slice(0,8).map(x=><tr key={x.id}><td>{x.id.slice(0,10)}</td><td>{x.customer_email||"—"}</td><td>৳{(x.amount_minor/100).toFixed(2)}</td><td>{pill(x.status)}</td></tr>)}</tbody></table></div>:<div className="ad-billing-empty">No invoices recorded.</div>}</div>
+            <div className="ad-panel"><div className="ad-panel-head"><div><h3>Refund queue</h3><p>Approval is not a completed refund.</p></div><span className="ad-count">{data.billing?.refunds?.length||0}</span></div>{(data.billing?.refunds||[]).length?<div className="ad-table-wrap"><table className="ad-table"><thead><tr><th>Request</th><th>Customer</th><th>Amount</th><th>Status</th></tr></thead><tbody>{data.billing.refunds.slice(0,8).map(x=><tr key={x.id}><td>{x.id.slice(0,10)}</td><td>{x.customer_email||"—"}</td><td>৳{(x.amount_minor/100).toFixed(2)}</td><td>{pill(x.status)}</td></tr>)}</tbody></table></div>:<div className="ad-billing-empty">No refund requests.</div>}</div>
+          </div>
+          <div className="ad-panel"><div className="ad-panel-head"><div><h3>Retake credit ledger</h3><p>Append-only entries; balance changes are traceable to an actor and reason.</p></div><span className="ad-count">{data.billing?.ledger?.length||0} entries</span></div>{(data.billing?.ledger||[]).length?<div className="ad-table-wrap"><table className="ad-table"><thead><tr><th>Customer</th><th>Change</th><th>Entry</th><th>Reason</th><th>Date</th></tr></thead><tbody>{data.billing.ledger.slice(0,12).map(x=><tr key={x.id}><td>{x.customer_email||x.user_id}</td><td>{x.delta>0?"+":""}{x.delta}</td><td>{x.entry_type}</td><td>{x.reason}</td><td>{new Date(x.created*1000).toLocaleDateString()}</td></tr>)}</tbody></table></div>:<div className="ad-billing-empty">No credit adjustments recorded.</div>}</div>
+        </section>}
         {page==="privacy"&&<section className="ad-two-col"><div className="ad-panel"><h2>Privacy & data rights</h2><p>Available candidate rights capabilities and consent coverage.</p><div className="ad-metrics ad-metrics-compact">{metric("Consented users",data.privacy?.consented_users,"Distinct accounts","✓")}{metric("Consent records",data.privacy?.consent_records,"Versioned records","◈")}</div><div className="ad-health-row"><span>Candidate data export</span>{pill(data.privacy?.export_capability?"available":"unavailable")}</div><div className="ad-health-row"><span>Self-service deletion</span>{pill(data.privacy?.self_service_deletion?"available":"unavailable")}</div><div className="ad-health-row"><span>Scheduled retention jobs</span>{pill(data.privacy?.retention_jobs_configured?"configured":"not_configured")}</div></div><div className="ad-panel"><h2>Implementation notes</h2><p>{data.privacy?.note||"Privacy controls not available."}</p><div className="ad-info-banner">Admin access to sensitive candidate evidence must remain purpose-limited, reason-coded and audited. Raw media access is not provided by this console.</div></div></section>}
         {page==="quality"&&<section className="ad-panel"><div className="ad-panel-head"><div><h2>Fairness & quality signals</h2><p>Descriptive operational metrics; not candidate ranking or protected-trait profiling.</p></div></div><div className="ad-metrics">{metric("Completed attempts",data.quality?.completed_attempts,"Scored attempts","◎")}{metric("Appeals",data.quality?.appeals,"Candidate-raised","⚑")}{metric("Reviewed attempts",data.quality?.reviewed_attempts,"Human review records","✓")}{metric("Appeal overturns",data.quality?.appeal_overturns,"Outcomes","↺")}</div><div className="ad-health-row"><span>Appeal overturn rate</span><b>{data.quality?.appeal_overturn_rate==null?"Not enough data":(data.quality.appeal_overturn_rate*100).toFixed(1)+"%"}</b></div><div className="ad-info-banner">{data.quality?.note||"Quality metrics are limited by available data."} Protected demographic data is not collected for this analysis.</div></section>}
         {page==="audit"&&<section className="ad-panel"><div className="ad-panel-head"><div><h2>Audit event history</h2><p>Recent account, moderation and review events.</p></div><span className="ad-count">{rows("audit").length} events</span></div><div className="ad-toolbar"><input placeholder="Filter by action…" value={search} onChange={e=>setSearch(e.target.value)}/></div>{table(["TIME","ACTOR","ACTION","TARGET"],filtered(rows("audit"),["action","target","actor_name","actor_email"]).map(x=><tr><td>{stamp(x.ts)}</td><td><b>{x.actor_name||"System"}</b><small>{x.actor_email||("ID "+x.actor)}</small></td><td><code>{x.action}</code></td><td className="ad-audit-target">{x.target}</td></tr>),"No audit events found.")}</section>}
@@ -1027,7 +1046,7 @@ function Shell({ lang, setLang }) {
   return (
     <>
       {!modernCandidateShell && Head}
-      {!modernCandidateShell && <div className="mock" role="note">{t("mockBanner")}</div>}
+      
       {body}
     </>
   );
@@ -1041,7 +1060,7 @@ export default function App() {
   const m = hash.match(/^#\/p\/([\w-]+)/);
   return (
     <LangCtx.Provider value={lang}>
-      {m ? <><div className="mock" role="note"><PubBanner /></div><PublicPassport id={m[1]} /></> : <Shell lang={lang} setLang={setLang} />}
+      {m ? <PublicPassport id={m[1]} /> : <Shell lang={lang} setLang={setLang} />}
     </LangCtx.Provider>
   );
 }
