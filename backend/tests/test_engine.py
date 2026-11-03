@@ -44,14 +44,14 @@ def test_full_attempt_and_adaptivity():
     assert score(st2["answers"])["overall"] < 100
 
 def test_trust_never_fails():
-    lab, why = trust_label({"paste": 5, "blur": 9}, [])
+    lab = trust_label({"paste": 5, "blur": 9}, [])
     assert lab["label"] == "Needs review" and lab["points"] > 0
     assert lab["rule_version"] == "phase1-v1"
     assert trust_label({}, [])["label"] == "High trust"
 
 def test_trust_integrity_events_are_advisory_and_explainable():
     events = {"copy": 1, "cut": 1, "paste": 1, "tab_hidden": 2, "fullscreen_exit": 1, "screen_share_stopped": 1}
-    label, reasons = trust_label(events, [])
+    label = trust_label(events, [])
     assert label["label"] == "Needs review"
     assert label["points"] >= 7
     assert label["rule_version"] == "phase1-v1"
