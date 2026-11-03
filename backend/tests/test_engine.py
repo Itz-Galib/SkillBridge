@@ -44,9 +44,52 @@ def test_full_attempt_and_adaptivity():
     assert score(st2["answers"])["overall"] < 100
 
 def test_trust_never_fails():
-    lab, why = trust_label({"paste": 5, "blur": 9}, [])
-    assert lab == "Needs review" and why
-    assert trust_label({}, [])[0] == "High"
+    result = trust_label({"paste": 5, "blur": 9}, [])
+    assert result["label"] == "Needs review" and result["points"] > 0
+    assert result["rule_version"] == "phase1-v1"
+    assert trust_label({}, [])["label"] == "High trust"
+
+
+def test_integrity_incidents_are_grouped_and_advisory():
+    events = [
+        {"type": "tab_hidden", "server_ts": 100},
+        {"type": "blur", "server_ts": 101},
+        {"type": "fullscreen_exit", "server_ts": 102},
+        {"type": "tab_visible", "server_ts": 221},
+    ]
+    result = trust_label(events, [], {"rule_version": "test-v1", "normalize_per_30_minutes": False})
+    assert result["label"] == "Medium"
+    assert result["reasons"][0]["key"] == "leave_window"
+    assert result["reasons"][0]["duration_seconds"] == 121
+    assert not result["hard_flags"]
+
+
+def test_integrity_clipboard_events_are_capped():
+    events = [{"type": "paste", "server_ts": i} for i in range(10)]
+    result = trust_label(events, [], {"rule_version": "test-v1", "normalize_per_30_minutes": False,
+        "weights": {"external_clipboard": 2}, "caps": {"external_clipboard": 3}})
+    assert result["points"] == 6
+    assert result["reasons"] == [{"key": "external_clipboard", "n": 3, "points": 6}]
+
+
+def test_integrity_hard_flag_requires_human_review():
+    result = trust_label([{"type": "identity_mismatch", "server_ts": 1, "hard_flag": "identity_mismatch"}], [])
+    assert result["label"] == "Needs review"
+    assert result["hard_flags"] == ["identity_mismatch"]
+
+
+def test_integrity_fast_answer_fallback():
+    answer = {"qid": "q1", "type": "mcq", "correct": True, "difficulty": 2, "seconds": 2}
+    result = trust_label([], [answer], {"rule_version": "test-v1", "normalize_per_30_minutes": False})
+    assert result["points"] == 1
+    assert result["reasons"][0]["key"] == "fast"
+
+
+def test_technical_score_is_independent_of_integrity_events():
+    answers = [{"qid": "q", "topic": "sql", "difficulty": 2, "type": "mcq", "correct": True, "seconds": 1}]
+    before = score(answers)
+    trust_label([{"type": "paste", "server_ts": 1}], answers)
+    assert score(answers) == before
 
 def test_path_honest():
     p = build_path({"sql": {"score": 80}, "python": {"score": 20}, "statistics": {"score": 80}, "visualization": {"score": 80}})
