@@ -1339,7 +1339,7 @@ class BillingPlanInput(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     description: str = Field(default="", max_length=1000)
     amount_minor: int = Field(gt=0, le=100000000)
-    currency: str = Field(default="BDT", regex="^[A-Z]{3}$")
+    currency: str = Field(default="BDT", pattern="^[A-Z]{3}$")
     interval: str = Field(default="one_time")
     retake_credits: int = Field(default=0, ge=0, le=1000)
 
