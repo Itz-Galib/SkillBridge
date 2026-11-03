@@ -372,10 +372,16 @@ def save(att_id, st, **kw):
 
 
 def finalize(att, st):
-    ev = {r["type"]: r["n"] for r in allr("SELECT type, COUNT(*) n FROM events WHERE attempt_id=? GROUP BY type", (att["id"],))}
+    rows = allr("SELECT type, ts FROM events WHERE attempt_id=? ORDER BY ts, id", (att["id"],))
+    ev = [{"type": r["type"], "server_ts": r["ts"]} for r in rows]
     res = E.score(st["answers"])
-    label, reasons = E.trust_label(ev, st["answers"])
-    res.update({"trust": label, "trust_reasons": reasons, "percentile": None, "kind": att["kind"], "date": time.strftime("%Y-%m-%d")})
+    integrity = E.trust_label(ev, st["answers"], exam_seconds=E.TEST_SECONDS)
+    res.update({
+        "trust": integrity["label"], "trust_points": integrity["points"],
+        "trust_rule_version": integrity["rule_version"], "trust_reasons": integrity["reasons"],
+        "trust_hard_flags": integrity["hard_flags"], "percentile": None,
+        "kind": att["kind"], "date": time.strftime("%Y-%m-%d"),
+    })
     run("UPDATE attempts SET status='done', finished=?, result=?, state=? WHERE id=?", (time.time(), json.dumps(res), json.dumps(st), att["id"]))
     audit(att["user_id"], "attempt_done", att["id"])
 
