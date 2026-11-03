@@ -120,6 +120,32 @@ The relational question bank remains the source of truth. Meilisearch and Neo4j 
 
 The selector fails closed when a quota is missing. Admins must create/import questions, set the correct category and subcategory, difficulty, question type, answer key/reference answer, explanation/rubric and per-question time allocation, then mark reviewed questions **Active**. For SQL questions to be automatically graded, put a canonical SQL query in the Reference answer field; the SQL grader checks it against two generated datasets using the built-in customers/orders schema. Suggested subcategory labels include Python, Git, AI & Machine Learning, SQL, DSA, OOP, Networking and the other exact technology names found in CVs. Do not activate unreviewed questions. The Admin → Question Governance screen exposes GraphRAG readiness and a **Rebuild search + graph index** action.
 
+### Seed a synthetic GraphRAG assessment bank for testing
+
+The repository includes an explicit, repeatable seed script with **45 synthetic questions**:
+- 25 fundamental questions across DSA (5), OOP (4), Networking (4), Coding (5), Database (5) and Critical Thinking (2).
+- 5 questions each for Python, Git, AI & Machine Learning, and SQL.
+- Per-skill difficulty: 1 Easy, 2 Medium, 2 Hard.
+- Includes MCQ, coding, SQL, scenario and explanation formats, answer keys/reference solutions, rubrics and per-question time allocations.
+
+Run this only against a **development or staging database**. From the Render service Shell (or from the backend directory locally), execute:
+
+```bash
+cd /app
+python seed_graphrag_questions.py
+```
+
+The script is idempotent: it uses stable question IDs and `ON CONFLICT DO NOTHING`, so rerunning it will not duplicate or overwrite existing questions. It does not create candidate accounts or write candidate data. Existing question-bank records are preserved.
+
+After seeding:
+1. Sign in with an admin account that has Question Governance permission.
+2. Open **Admin → Question Governance** and check that the 25-question fundamental quota is ready.
+3. Select **Rebuild search + graph index**. If Meilisearch/Neo4j are not configured, the relational retrieval fallback remains available for testing.
+4. Upload or use a test CV that explicitly mentions Python, Git, machine learning and SQL, confirm those detected skills, and generate the assessment.
+5. Confirm the blueprint contains 45 questions, with 25 fundamental and five per confirmed skill. The seed's CI test validates this exact test scenario.
+
+Do not run this seed on a production database containing live assessment content unless you explicitly want these demo questions to become active and visible in its question bank.
+
 ### Configure external retrieval services
 
 Set these on the backend service (Render for the current deployment):

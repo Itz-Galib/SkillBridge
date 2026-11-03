@@ -1118,7 +1118,8 @@ QUESTION_CATEGORIES = [
     {"id":"CAT-06","name":"Scenario-Based","icon":"◇","description":"Practical workplace and technical situations","subcategories":["Troubleshooting","Decision Making","Production Issues","Team Collaboration","Case Study","Debugging Scenario"]},
     {"id":"CAT-07","name":"IQ & Aptitude","icon":"◎","description":"Logical, numerical and analytical reasoning","subcategories":["Logical Reasoning","Numerical Ability","Pattern Recognition","Verbal Reasoning","Data Interpretation"]},
     {"id":"CAT-08","name":"CS Fundamentals","icon":"▦","description":"Core computer science and engineering concepts","subcategories":["Operating Systems","Computer Networks","DBMS","OOP Concepts","Software Engineering","Computer Architecture","Compiler Basics"]},
-    {"id":"CAT-09","name":"System Design","icon":"⌘","description":"Architecture, APIs, scalability and reliability","subcategories":["Architecture","API Design","Scalability","Caching","Messaging","Database Design","Security & Reliability"]}
+    {"id":"CAT-09","name":"System Design","icon":"⌘","description":"Architecture, APIs, scalability and reliability","subcategories":["Architecture","API Design","Scalability","Caching","Messaging","Database Design","Security & Reliability"]},
+    {"id":"CAT-10","name":"CV Technology Skills","icon":"◇","description":"Technology-specific questions matched to explicitly confirmed CV skills","subcategories":["Python","Git","AI & Machine Learning","SQL","JavaScript","Java","Docker","Cloud","Other"]}
 ]
 QUESTION_CATEGORY_BY_ID = {x["id"]:x for x in QUESTION_CATEGORIES}
 QUESTION_CATEGORY_BY_NAME = {x["name"].lower():x["id"] for x in QUESTION_CATEGORIES}

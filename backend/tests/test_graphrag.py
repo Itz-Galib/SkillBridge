@@ -89,3 +89,50 @@ def test_question_page_limits_to_five_and_keeps_answers_private():
     assert len(page["questions"]) == 5
     assert "correct_answer" not in page["questions"][0]
     assert page["has_previous"] is True
+
+
+def test_synthetic_seed_builds_complete_45_question_assessment():
+    import seed_graphrag_questions as seed
+
+    rows = []
+    for index, item in enumerate(seed.FUNDAMENTALS, 1):
+        topic, category, difficulty, qtype, prompt, answer, options, explanation, reference, rubric, seconds = item
+        rows.append({
+            "id": f"demo-gr-f-{index:02d}", "category_id": category, "subcategory": topic,
+            "difficulty_level": difficulty, "question_type": qtype, "question_text": prompt,
+            "correct_answer": answer, "options": options, "explanation": explanation,
+            "reference_answer": reference, "grading_rubric": rubric, "marks": 1,
+            "time_allocation": seconds, "status": "active", "version": 1,
+        })
+    for index, item in enumerate(seed.CV_QUESTIONS, 1):
+        skill, difficulty, qtype, prompt, answer, options, explanation, reference, rubric, seconds = item
+        rows.append({
+            "id": f"demo-gr-cv-{index:02d}", "category_id": "CAT-10", "subcategory": skill,
+            "difficulty_level": difficulty, "question_type": qtype, "question_text": prompt,
+            "correct_answer": answer, "options": options, "explanation": explanation,
+            "reference_answer": reference, "grading_rubric": rubric, "marks": 1,
+            "time_allocation": seconds, "status": "active", "version": 1,
+        })
+
+    skills = [
+        CVSkill(skill_id="python", label="Python"),
+        CVSkill(skill_id="git", label="Git"),
+        CVSkill(skill_id="ai_ml", label="AI & Machine Learning"),
+        CVSkill(skill_id="sql", label="SQL"),
+    ]
+    result = build_assessment(rows, skills, retrieval=False)
+    assert result["status"] == "ready", result["shortages"]
+    assert result["fundamental_count"] == 25
+    assert result["cv_count"] == 20
+    assert result["total_questions"] == 45
+    assert len({q["id"] for q in result["questions"]}) == 45
+    assert result["fundamental_formats"] and {"scenario", "explanation", "sql", "coding"} <= set(result["fundamental_formats"])
+    assert set(result["cv_format_coverage"]) == {"python", "git", "ai_ml", "sql"}
+    for skill_id, formats in result["cv_format_coverage"].items():
+        assert {"coding", "sql"} & set(formats), (skill_id, formats)
+        assert {"scenario", "explanation"} & set(formats), (skill_id, formats)
+    for skill in skills:
+        skill_questions = [q for q in result["cv_based"] if q["skill_id"] == skill.skill_id]
+        assert len(skill_questions) == 5
+        assert [sum(q["difficulty_level"] == d for q in skill_questions) for d in ("Easy", "Medium", "Hard")] == [1, 2, 2]
+    assert result["estimated_duration_seconds"] == sum(q["time_allocation"] for q in rows)
