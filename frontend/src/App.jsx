@@ -953,7 +953,7 @@ function AdminConsole() {
   const metric=(label,value,sub,icon)=> <article className="ad-metric"><span>{icon}</span><div><small>{label}</small><strong>{value??"—"}</strong><em>{sub}</em></div></article>;
   const table=(heads,body,empty)=> <div className="ad-table-wrap"><table className="ad-table"><thead><tr>{heads.map(h=><th>{h}</th>)}</tr></thead><tbody>{body}</tbody></table>{!body.length&&<div className="ad-empty">{empty||"No records to display."}</div>}</div>;
   const section=(k)=>setPage(k);
-  const scopePages={super_admin:["overview","users","staff","companies","jobs","assessments","integrity","appeals","questions","ai","billing","privacy","quality","audit"],trust_safety_reviewer:["users","assessments","integrity","appeals","quality"],question_content_admin:["questions","assessments","integrity"],company_verification_admin:["companies","jobs","assessments","integrity"],support_agent:["users"],finance_admin:["billing"],compliance_officer:["ai","privacy","quality","audit"]};
+  const scopePages={super_admin:["overview","users","staff","companies","jobs","assessments","integrity","appeals","questions","ai","billing","privacy","quality","audit"],trust_safety_reviewer:["users","assessments","integrity","appeals","quality"],question_content_admin:["questions","assessments","integrity"],company_verification_admin:["companies","jobs","assessments","integrity"],support_agent:["users","integrity"],finance_admin:["billing","integrity"],compliance_officer:["ai","privacy","quality","audit","integrity"]};
   const visibleNav=nav.filter(([id])=>(scopePages[adminRole]||[]).includes(id));
   useEffect(()=>{if(visibleNav.length&&!visibleNav.some(x=>x[0]===page))setPage(visibleNav[0][0]);},[adminRole]);
   const current=nav.find(x=>x[0]===page);
