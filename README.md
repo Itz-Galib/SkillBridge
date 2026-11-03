@@ -227,3 +227,14 @@ The candidate experience now has a dedicated responsive workspace with:
 - Responsive desktop/mobile navigation and explicit MOCK labelling for synthetic jobs.
 
 Candidate profile fields are persisted through `/api/candidate/profile` and the `candidate_profiles` PostgreSQL table. This is still an implementation milestone: verify the full PostgreSQL runtime, authorization, browser accessibility and end-to-end flows before production use.
+
+
+## Exam integrity monitoring (Phase 1 — advisory)
+
+The candidate Verify flow requests browser screen sharing and full-screen mode before an assessment can start or resume. The candidate must approve the browser's native sharing picker; supported browsers may offer a screen, window or tab. If sharing stops or full-screen mode is exited, the candidate UI disables answer saving, question navigation, SQL execution and submission until the required state is restored.
+
+During an active attempt, the frontend blocks ordinary copy, cut, paste, clipboard keyboard shortcuts and the context menu, and records browser-reported clipboard, focus, visibility, full-screen and screen-sharing events. The backend stores event timestamps and calculates a versioned, explainable trust label separately from the technical score. The same integrity gate is applied to the standard adaptive assessment and the optional GraphRAG assessment routes. Administrators with the appropriate integrity-review permission can inspect attempt summaries, event timelines and available answer timing evidence.
+
+**Privacy and browser limits:** SkillBridge does not record, upload or store the screen stream, audio or camera. A browser page cannot reliably prevent screenshots, another device, OS-level shortcuts, developer tools, extensions or a determined user from bypassing client-side controls. Event telemetry is client-reported; a malicious client can forge requests. Browser screen sharing is not proof of full-desktop visibility. Trust labels are review signals only: they do not change technical marks or automatically fail candidates. Candidates can appeal.
+
+**Not yet implemented:** per-attempt session binding and single-session invalidation, signed event sequencing, server-side rate limiting, heartbeat collection/gap detection, event buffering with reliable sendBeacon delivery, strict full-monitor surface validation, clipboard-origin tracking for code editors, and a complete pre-exam system-check page. These controls are not a secure remote-proctoring system and must not be treated as proof of misconduct.

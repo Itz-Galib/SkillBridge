@@ -32,8 +32,8 @@ function Bar({ score, threshold, unverified }) {
 
 function TrustChip({ trust }) {
   const t = useT();
-  const cls = trust === "High" ? "chip-ok" : trust === "Medium" ? "chip-mid" : "chip-rev";
-  return <span className={"chip " + cls}>{t("trusts")[trust]}</span>;
+  const cls = trust === "High trust" || trust === "High" ? "chip-ok" : trust === "Medium" ? "chip-mid" : "chip-rev";
+  return <span className={"chip " + cls}>{t("trusts")[trust] || trust || "Not scored"}</span>;
 }
 
 /* ---------- landing + auth ---------- */
@@ -271,9 +271,54 @@ function Gap({ onStart, refreshKey }) {
   );
 }
 
+/* ---------- exam integrity monitor ---------- */
+function useExamIntegrity(aid, screenStream) {
+  const t = useT();
+  const [shareActive,setShareActive]=useState(Boolean(screenStream?.getVideoTracks().some(track=>track.readyState==="live")));
+  const [fullscreenActive,setFullscreenActive]=useState(Boolean(document.fullscreenElement));
+  const [notice,setNotice]=useState("");
+  const [shareError,setShareError]=useState("");
+  const report=useCallback(type=>{api("/attempts/"+aid+"/event",{method:"POST",body:{type}}).catch(()=>{});},[aid]);
+  useEffect(()=>{
+    const clipboard=e=>{e.preventDefault();report(e.type);setNotice(t("clipboardBlocked"));};
+    const keydown=e=>{const key=String(e.key||"").toLowerCase();if((e.ctrlKey||e.metaKey)&&["c","v","x"].includes(key)){e.preventDefault();report(key==="c"?"copy":key==="x"?"cut":"paste");setNotice(t("clipboardBlocked"));}if(e.shiftKey&&key==="insert"){e.preventDefault();report("paste");setNotice(t("clipboardBlocked"));}};
+    const context=e=>e.preventDefault();
+    const blur=()=>report("blur");
+    const visibility=()=>report(document.visibilityState==="hidden"?"tab_hidden":"tab_visible");
+    const fullscreen=()=>{const active=Boolean(document.fullscreenElement);setFullscreenActive(active);if(!active){report("fullscreen_exit");setNotice(t("fullscreenWarning"));}};
+    document.addEventListener("copy",clipboard,true);document.addEventListener("cut",clipboard,true);document.addEventListener("paste",clipboard,true);
+    document.addEventListener("keydown",keydown,true);document.addEventListener("contextmenu",context,true);
+    document.addEventListener("visibilitychange",visibility);document.addEventListener("fullscreenchange",fullscreen);window.addEventListener("blur",blur);
+    return()=>{document.removeEventListener("copy",clipboard,true);document.removeEventListener("cut",clipboard,true);document.removeEventListener("paste",clipboard,true);document.removeEventListener("keydown",keydown,true);document.removeEventListener("contextmenu",context,true);document.removeEventListener("visibilitychange",visibility);document.removeEventListener("fullscreenchange",fullscreen);window.removeEventListener("blur",blur);};
+  },[report,t]);
+  useEffect(()=>{
+    const track=screenStream?.getVideoTracks()[0];
+    if(!track){setShareActive(false);return;}
+    const sync=()=>setShareActive(track.readyState==="live");
+    const ended=()=>{setShareActive(false);setShareError(t("shareStopped"));report("screen_share_stopped");};
+    sync();track.addEventListener("ended",ended);
+    return()=>track.removeEventListener("ended",ended);
+  },[screenStream,report,t]);
+  const restartFullscreen=async()=>{
+    try{if(!document.documentElement.requestFullscreen)throw new Error(t("fullscreenUnsupported"));await document.documentElement.requestFullscreen();setFullscreenActive(Boolean(document.fullscreenElement));}
+    catch(e){setShareError(e.message||t("fullscreenRequired"));}
+  };
+  return {shareActive,fullscreenActive,notice,shareError,setNotice,restartShare,restartFullscreen,report};
+}
+function ExamIntegrityBanner({integrity,onRestartShare}) {
+  const t=useT();
+  return <><div className={"exam-integrity-banner"+(integrity.shareActive&&integrity.fullscreenActive?" active":" warning")} role="status">
+    <strong>{integrity.shareActive?t("shareActive"):t("shareStopped")}</strong><span>{t("sharePrivacy")}</span>
+    {!integrity.shareActive&&<button type="button" className="btn sm" onClick={async()=>{const stream=await onRestartShare?.();if(!stream)integrity.setNotice(t("shareRequired"));}}>{t("restartShare")}</button>}
+    <strong>{integrity.fullscreenActive?t("fullscreenActive"):t("fullscreenWarning")}</strong>
+    {!integrity.fullscreenActive&&<button type="button" className="btn sm" onClick={integrity.restartFullscreen}>{t("restartFullscreen")}</button>}
+  </div>{integrity.notice&&<p className="exam-integrity-notice" role="status">{integrity.notice}</p>}{integrity.shareError&&<p className="err" role="alert">{integrity.shareError}</p>}</>;
+}
+
 /* ---------- exam ---------- */
-function ExamRun({ initial, onFinished }) {
-  if (initial.graphrag) return <GraphRAGExamRun initial={initial} onFinished={onFinished} />;
+function ExamRun({ initial, onFinished, screenStream, onRestartShare }) {
+  const integrity=useExamIntegrity(initial.attempt_id,screenStream);
+  if (initial.graphrag) return <GraphRAGExamRun initial={initial} onFinished={onFinished} integrity={integrity} onRestartShare={onRestartShare} />;
   const t = useT();
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState("");
@@ -285,14 +330,9 @@ function ExamRun({ initial, onFinished }) {
 
   useEffect(() => { const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000); return () => clearInterval(i); }, []);
   useEffect(() => { setAns(""); setOut(null); }, [v.question?.id]);
-  useEffect(() => {
-    const onBlur = () => api(`/attempts/${aid}/event`, { method: "POST", body: { type: "blur" } }).catch(() => {});
-    window.addEventListener("blur", onBlur);
-    return () => window.removeEventListener("blur", onBlur);
-  }, [aid]);
-
   const q = v.question;
   const submit = async () => {
+    if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error(!integrity.shareActive?t("shareRequired"):t("fullscreenRequired")));return;}
     setBusy(true); setErr(null);
     try {
       const r = await api(`/attempts/${aid}/answer`, { method: "POST", body: { question_id: q.id, answer: String(ans) } });
@@ -300,8 +340,7 @@ function ExamRun({ initial, onFinished }) {
       if (r.status === "done") onFinished(aid);
     } catch (e) { setErr(e); } finally { setBusy(false); }
   };
-  const runSql = async () => { try { setOut(await api(`/attempts/${aid}/sql-run`, { method: "POST", body: { sql: ans } })); } catch (e) { setErr(e); } };
-  const onPaste = () => api(`/attempts/${aid}/event`, { method: "POST", body: { type: "paste" } }).catch(() => {});
+  const runSql = async () => { if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error(t("shareRequired")));return;} try { setOut(await api(`/attempts/${aid}/sql-run`, { method: "POST", body: { sql: ans } })); } catch (e) { setErr(e); } };
 
   if (!q) return <p>{t("loading")}</p>;
   return (
@@ -311,32 +350,33 @@ function ExamRun({ initial, onFinished }) {
         <progress value={q.index} max={q.total} />
         <span className={"timer" + (left < 120 ? " low" : "")}>{t("timeLeft")}: {fmt(left)}</span>
       </div>
-      <h3 className="qtext">{q.prompt}</h3>
+      <ExamIntegrityBanner integrity={integrity} onRestartShare={onRestartShare} />
+      <h3 className="qtext exam-copy-locked">{q.prompt}</h3>
       {q.type === "mcq" ? (
         <fieldset className="opts">
           {q.options.map((o, i) => (
-            <label key={i} className={"opt" + (String(ans) === String(i) ? " on" : "")}>
+            <label key={i} className={"opt exam-copy-locked" + (String(ans) === String(i) ? " on" : "")}>
               <input type="radio" name="opt" checked={String(ans) === String(i)} onChange={() => setAns(String(i))} /> {o}
             </label>
           ))}
         </fieldset>
       ) : (
         <>
-          <details open><summary>{t("schema")}</summary><pre className="pre">{q.schema}</pre></details>
+          <details open><summary>{t("schema")}</summary><pre className="pre exam-copy-locked">{q.schema}</pre></details>
           <p className="note">{t("sqlHelp")}</p>
-          <textarea className="code" rows={6} spellCheck={false} value={ans} onChange={(e) => setAns(e.target.value)} onPaste={onPaste} placeholder="Write your answer..." />
+          <textarea className="code" rows={6} spellCheck={false} value={ans} onChange={(e) => setAns(e.target.value)} placeholder="Write your answer..." />
           <p className="muted">{t("pasteNote")}</p>
-          {String(q.type).toLowerCase().includes("sql") && <button className="btn ghost" onClick={runSql} disabled={!ans.trim()}>{t("run")}</button>}
+          {String(q.type).toLowerCase().includes("sql") && <button className="btn ghost" onClick={runSql} disabled={!ans.trim()||!integrity.shareActive||!integrity.fullscreenActive}>{t("run")}</button>}
           {out && <pre className="pre">{JSON.stringify(out, null, 2)}</pre>}
         </>
       )}
       <Err e={err} />
-      <button className="btn" onClick={submit} disabled={busy || String(ans).trim() === ""}>{busy ? t("saving") : t("submit")}</button>
+      <button className="btn" onClick={submit} disabled={busy || !integrity.shareActive || !integrity.fullscreenActive || String(ans).trim() === ""}>{busy ? t("saving") : t("submit")}</button>
     </section>
   );
 }
 
-function GraphRAGExamRun({ initial, onFinished }) {
+function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState(initial.page?.answers?.[initial.question?.id] || "");
   const [err, setErr] = useState(null);
@@ -349,13 +389,8 @@ function GraphRAGExamRun({ initial, onFinished }) {
 
   useEffect(() => { const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000); return () => clearInterval(i); }, []);
   useEffect(() => { setAns(page.answers?.[q?.id] || ""); setSqlOut(null); }, [q?.id, v.question_index]);
-  useEffect(() => {
-    const onBlur = () => api(`/attempts/${aid}/event`, {method:"POST",body:{type:"blur"}}).catch(()=>{});
-    window.addEventListener("blur", onBlur);
-    return () => window.removeEventListener("blur", onBlur);
-  }, [aid]);
-
   const saveAnswer = async () => {
+    if(!integrity.shareActive||!integrity.fullscreenActive)throw new Error(!integrity.shareActive?"screen_share_required":"fullscreen_required");
     if (!q || !String(ans).trim()) return v;
     const next = await api(`/attempts/${aid}/answer`, {method:"POST",body:{question_id:q.id,answer:String(ans)}});
     setV(next);
@@ -363,6 +398,7 @@ function GraphRAGExamRun({ initial, onFinished }) {
   };
   const goTo = async (index) => {
     if (busy) return;
+    if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error(!integrity.shareActive?"screen_share_required":"fullscreen_required"));return;}
     setBusy(true); setErr(null);
     try {
       await saveAnswer();
@@ -375,9 +411,11 @@ function GraphRAGExamRun({ initial, onFinished }) {
     try { await saveAnswer(); } catch(e) { setErr(e); } finally { setBusy(false); }
   };
   const runSql = async () => {
+    if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error("screen_share_required"));return;}
     try { setSqlOut(await api(`/attempts/${aid}/sql-run`,{method:"POST",body:{sql:ans}})); } catch(e) { setErr(e); }
   };
   const submit = async () => {
+    if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error("screen_share_required"));return;}
     setBusy(true); setErr(null);
     try {
       await saveAnswer();
@@ -397,6 +435,7 @@ function GraphRAGExamRun({ initial, onFinished }) {
         <progress value={v.answered} max={v.total} />
         <span className={"timer" + (left < 120 ? " low" : "")}>Time left: {fmt(left)}</span>
       </div>
+      <ExamIntegrityBanner integrity={integrity} onRestartShare={onRestartShare} />
       <div className="gr-exam-meta">
         <span>{v.total} questions · {Math.ceil(v.duration_seconds / 60)} minutes allocated</span>
         <span>Fundamental + CV skills</span>
@@ -443,8 +482,8 @@ function GraphRAGExamRun({ initial, onFinished }) {
         <button className="btn ghost" onClick={()=>goTo(previousIndex)} disabled={page.page===0 || busy}>Previous 5</button>
         <span>Page {page.page+1} of {page.page_count}</span>
         <button className="btn ghost" onClick={()=>goTo(nextIndex)} disabled={!page.has_next || busy}>Next 5</button>
-        <button className="btn ghost" onClick={save} disabled={busy || !String(ans).trim()}>Save answer</button>
-        <button className="btn" onClick={submit} disabled={busy || v.answered + (answered ? 0 : (String(ans).trim() ? 1 : 0)) < v.total}>
+        <button className="btn ghost" onClick={save} disabled={busy || !integrity.shareActive || !integrity.fullscreenActive || !String(ans).trim()}>Save answer</button>
+        <button className="btn" onClick={submit} disabled={busy || !integrity.shareActive || !integrity.fullscreenActive || v.answered + (answered ? 0 : (String(ans).trim() ? 1 : 0)) < v.total}>
           {busy ? "Saving…" : "Submit assessment"}
         </button>
       </div>
@@ -537,40 +576,77 @@ function Uplift() {
 
 function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const t = useT();
-  const [active, setActive] = useState(null);
-  const [err, setErr] = useState(null);
-  const done = st.attempts.filter((a) => a.status === "done");
-  const mine = kind === "pre" ? done[0] : done.length > 1 ? done[done.length - 1] : null;
-  const act = st.attempts.find((a) => a.status === "active");
-  const start = useCallback(async () => {
+  const [active,setActive]=useState(null),[err,setErr]=useState(null);
+  const [screenStream,setScreenStream]=useState(null),[shareReady,setShareReady]=useState(false),[fullscreenReady,setFullscreenReady]=useState(Boolean(document.fullscreenElement)),[setupBusy,setSetupBusy]=useState(false);
+  const done=st.attempts.filter(a=>a.status==="done");
+  const mine=kind==="pre"?done[0]:done.length>1?done[done.length-1]:null;
+  const act=st.attempts.find(a=>a.status==="active");
+  useEffect(()=>{
+    const track=screenStream?.getVideoTracks()[0];
+    if(!track){setShareReady(false);return;}
+    const sync=()=>setShareReady(track.readyState==="live");
+    sync();track.addEventListener("ended",sync);return()=>track.removeEventListener("ended",sync);
+  },[screenStream]);
+  useEffect(()=>{
+    const sync=()=>setFullscreenReady(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange",sync);return()=>document.removeEventListener("fullscreenchange",sync);
+  },[]);
+  useEffect(()=>()=>{screenStream?.getTracks().forEach(track=>track.stop());},[screenStream]);
+  const enableScreenShare=async()=>{
     setErr(null);
-    try {
-      // The candidate assessment uses the existing 10-question adaptive engine.
-      // GraphRAG question-bank readiness is optional and must not block this flow.
-      const v = await api("/attempts", {method:"POST"});
-      if (v.status === "active") setActive(v); else refresh();
-    } catch (e) { setErr(e); }
-  }, [refresh]);
-  const finished = async () => { setActive(null); await refresh(); };
-
-  if (active) return <ExamRun initial={active} onFinished={finished} />;
-  if (act && (act.kind === kind)) return <section className="card narrow"><button className="btn" onClick={start}>{t("resume")}</button><Err e={err} /></section>;
-  if (mine) return (
-    <>
-      <Result aid={mine.id} next={afterResult} nextLabel={afterLabel} />
-      {kind === "post" && <Uplift />}
-    </>
-  );
-  if (kind === "post" && done.length === 0) return <p className="note">{t("needPre")}</p>;
-  return (
-    <section className="card narrow">
-      <h2>{kind === "pre" ? t("startTest") : t("steps").retest}</h2>
-      <p>{kind === "pre" ? t("testIntro") : t("retestIntro")}</p>
-      <p className="muted">This assessment contains 10 adaptive questions and lasts up to 20 minutes. The difficulty adjusts to your answers. Correct answers are never shown during the test. You do not need to analyse your CV or complete GraphRAG question-bank setup to start.</p>
-      <Err e={err} />
-      <button className="btn" onClick={start}>{t("startTest")}</button>
-    </section>
-  );
+    try{
+      if(!navigator.mediaDevices?.getDisplayMedia)throw new Error(t("shareUnsupported"));
+      const stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:5},audio:false});
+      setScreenStream(stream);setShareReady(stream.getVideoTracks().some(track=>track.readyState==="live"));
+    }catch(e){setShareReady(false);setErr(new Error(e?.name==="NotAllowedError"?t("shareRequired"):e.message||t("shareRequired")));}
+  };
+  const enableFullscreen=async()=>{
+    setErr(null);
+    try{
+      if(!document.documentElement.requestFullscreen)throw new Error(t("fullscreenUnsupported"));
+      await document.documentElement.requestFullscreen();setFullscreenReady(Boolean(document.fullscreenElement));
+      if(!document.fullscreenElement)throw new Error(t("fullscreenRequired"));
+    }catch(e){setFullscreenReady(Boolean(document.fullscreenElement));setErr(new Error(e?.name==="NotAllowedError"?t("fullscreenClickAgain"):e.message||t("fullscreenUnsupported")));}
+  };
+  const restartShare=async()=>{
+    try{
+      if(!navigator.mediaDevices?.getDisplayMedia)throw new Error(t("shareUnsupported"));
+      const stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:5},audio:false});
+      const aid=active?.attempt_id||act?.id;
+      if(aid)await api("/attempts/"+aid+"/event",{method:"POST",body:{type:"screen_share_started"}});
+      setScreenStream(stream);setShareReady(true);setErr(null);return stream;
+    }catch(e){setErr(new Error(e.message||t("shareRequired")));return null;}
+  };
+  const start=useCallback(async()=>{
+    setErr(null);
+    const sharing=Boolean(screenStream?.getVideoTracks().some(track=>track.readyState==="live"));
+    const fullscreen=Boolean(document.fullscreenElement);
+    setShareReady(sharing);setFullscreenReady(fullscreen);
+    if(!sharing||!fullscreen){setErr(new Error(!sharing?t("shareRequired"):t("fullscreenRequired")));return;}
+    setSetupBusy(true);
+    try{
+      const v=await api("/attempts",{method:"POST"});
+      if(v.status==="active"){
+        await api("/attempts/"+v.attempt_id+"/event",{method:"POST",body:{type:"screen_share_started"}});
+        setActive(v);
+      }else{screenStream?.getTracks().forEach(track=>track.stop());setScreenStream(null);await refresh();}
+    }catch(e){setErr(e);}finally{setSetupBusy(false);}
+  },[refresh,screenStream,t]);
+  const finished=async()=>{screenStream?.getTracks().forEach(track=>track.stop());setScreenStream(null);setActive(null);if(document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen().catch(()=>{});await refresh();};
+  if(active)return <ExamRun initial={active} onFinished={finished} screenStream={screenStream} onRestartShare={restartShare}/>;
+  if(mine)return <><Result aid={mine.id} next={afterResult} nextLabel={afterLabel}/>{kind==="post"&&<Uplift/>}</>;
+  if(kind==="post"&&done.length===0)return <p className="note">{t("needPre")}</p>;
+  return <section className="card narrow exam-setup">
+    <h2>{kind==="pre"?t("startTest"):t("steps").retest}</h2>
+    <p>{kind==="pre"?t("testIntro"):t("retestIntro")}</p>
+    <p className="muted">Before starting or resuming, enable screen sharing and full-screen mode. The browser will ask for permission separately. SkillBridge does not record or upload the shared screen stream.</p>
+    <div className="exam-setup-steps">
+      <div className={shareReady?"ready":""}><span>{shareReady?"✓":"1"}</span><div><b>{t("shareSetupStep")}</b><small>{shareReady?t("shareActive"):t("shareRequired")}</small></div><button type="button" className="btn ghost" onClick={enableScreenShare}>{shareReady?t("shareActive"):t("restartShare")}</button></div>
+      <div className={fullscreenReady?"ready":""}><span>{fullscreenReady?"✓":"2"}</span><div><b>{t("fullscreenSetupStep")}</b><small>{fullscreenReady?t("fullscreenActive"):t("fullscreenRequired")}</small></div><button type="button" className="btn ghost" onClick={enableFullscreen}>{fullscreenReady?t("fullscreenActive"):t("restartFullscreen")}</button></div>
+    </div>
+    <Err e={err}/>
+    <button className="btn" onClick={start} disabled={setupBusy||!shareReady||!fullscreenReady}>{setupBusy?t("saving"):act&&act.kind===kind?t("resume"):t("startTest")}</button>
+  </section>;
 }
 
 /* ---------- learning path ---------- */
@@ -781,6 +857,8 @@ function AdminConsole({ onLogout }) {
   const [saving,setSaving]=useState(false);
   const [adminDraft,setAdminDraft]=useState({name:"",email:"",password:"",admin_role:"support_agent"});
   const [creatingAdmin,setCreatingAdmin]=useState(false);
+  const [integrityDetail,setIntegrityDetail]=useState(null),[integrityLoading,setIntegrityLoading]=useState(false);
+  const [integrityStatus,setIntegrityStatus]=useState("all"),[integrityKind,setIntegrityKind]=useState("all"),[integrityTrust,setIntegrityTrust]=useState("all");
   const [selectedReport,setSelectedReport]=useState(null);
   const [questionCategory,setQuestionCategory]=useState("all"),[questionQuery,setQuestionQuery]=useState(""),[questionStatus,setQuestionStatus]=useState("all");
   const [questionModal,setQuestionModal]=useState(false),[questionEditing,setQuestionEditing]=useState(null),[questionSaving,setQuestionSaving]=useState(false);
@@ -788,7 +866,7 @@ function AdminConsole({ onLogout }) {
   const [importFile,setImportFile]=useState(null),[importCategory,setImportCategory]=useState("CAT-01"),[importPreview,setImportPreview]=useState(null),[importBusy,setImportBusy]=useState(false);
   const nav=[
     ["overview","Overview","⌂"],["users","Users & accounts","♙"],["staff","Admin staff & roles","♜"],["companies","Company verification","▣"],
-    ["jobs","Job moderation","▤"],["assessments","Assessment reviews","◎"],["appeals","Candidate appeals","⚑"],
+    ["jobs","Job moderation","▤"],["assessments","Assessment reviews","◎"],["integrity","Exam integrity","◈"],["appeals","Candidate appeals","⚑"],
     ["questions","Question governance","◇"],["learning","Learning & retakes","↗"],["ai","AI operations","✳"],["billing","Billing","৳"],
     ["privacy","Privacy & compliance","◈"],["quality","Fairness & quality","▥"],["audit","Audit trail","≋"]
   ];
@@ -797,7 +875,7 @@ function AdminConsole({ onLogout }) {
     try { const me=await api("/admin/console/me"); setAdminRole(me.admin_role||"super_admin"); } catch(x) { setError(x.message||"Admin identity unavailable"); setBusy(false); return; }
     const endpoints={
       overview:"/admin/console/overview",users:"/admin/console/users",staff:"/admin/console/staff",companies:"/admin/console/company-verifications",
-      jobs:"/admin/console/job-review-queue",assessments:"/admin/assessment-reviews",appeals:"/admin/appeals",
+      jobs:"/admin/console/job-review-queue",assessments:"/admin/assessment-reviews",integrity:"/admin/integrity/attempts",appeals:"/admin/appeals",
       questions:"/admin/questions",graphrag:"/admin/assessment/graphrag/status",learning:"/admin/learning",ai:"/admin/ai-operations",billing:"/admin/billing",privacy:"/admin/privacy",
       quality:"/admin/quality",audit:"/admin/audit-logs",phaseTwo:"/admin/phase-two-requests"
     };
@@ -824,6 +902,7 @@ function AdminConsole({ onLogout }) {
     finally{setCreatingAdmin(false);}
   };
   const openAction=(kind,id,decision)=>{setAction({kind,id,decision});setReason("");};
+  const openIntegrityDetail=async(id)=>{setIntegrityLoading(true);setIntegrityDetail(null);try{setIntegrityDetail(await api("/admin/integrity/attempts/"+encodeURIComponent(id)));}catch(x){setError(x.message||"Could not load attempt details.");}finally{setIntegrityLoading(false);}};
   const submitAction=async(e)=>{
     e.preventDefault();if(!action||reason.trim().length<3)return;setSaving(true);
     try{
@@ -880,7 +959,7 @@ function AdminConsole({ onLogout }) {
   const metric=(label,value,sub,icon)=> <article className="ad-metric"><span>{icon}</span><div><small>{label}</small><strong>{value??"—"}</strong><em>{sub}</em></div></article>;
   const table=(heads,body,empty)=> <div className="ad-table-wrap"><table className="ad-table"><thead><tr>{heads.map(h=><th>{h}</th>)}</tr></thead><tbody>{body}</tbody></table>{!body.length&&<div className="ad-empty">{empty||"No records to display."}</div>}</div>;
   const section=(k)=>setPage(k);
-  const scopePages={super_admin:["overview","users","staff","companies","jobs","assessments","appeals","questions","learning","ai","billing","privacy","quality","audit"],trust_safety_reviewer:["users","assessments","appeals","quality"],question_content_admin:["questions","learning","assessments"],company_verification_admin:["companies","jobs","assessments"],support_agent:["users"],finance_admin:["billing","learning"],compliance_officer:["ai","privacy","quality","audit"]};
+  const scopePages={super_admin:["overview","users","staff","companies","jobs","assessments","integrity","appeals","questions","learning","ai","billing","privacy","quality","audit"],trust_safety_reviewer:["users","assessments","integrity","appeals","quality"],question_content_admin:["questions","learning","assessments","integrity"],company_verification_admin:["companies","jobs","assessments","integrity"],support_agent:["users"],finance_admin:["billing","learning"],compliance_officer:["ai","privacy","quality","audit"]};
   const visibleNav=nav.filter(([id])=>(scopePages[adminRole]||[]).includes(id));
   useEffect(()=>{if(visibleNav.length&&!visibleNav.some(x=>x[0]===page))setPage(visibleNav[0][0]);},[adminRole]);
   const current=nav.find(x=>x[0]===page);
@@ -911,6 +990,10 @@ function AdminConsole({ onLogout }) {
         {page==="companies"&&<section className="ad-panel"><div className="ad-panel-head"><div><h2>Organisation verification queue</h2><p>Review legal identity details and evidence notes.</p></div><span className="ad-count">{rows("companies").length} requests</span></div><div className="ad-toolbar"><input placeholder="Search company or legal name…" value={search} onChange={e=>setSearch(e.target.value)}/><select value={filter} onChange={e=>setFilter(e.target.value)}><option value="all">All statuses</option><option value="pending_review">Pending</option><option value="verified">Verified</option><option value="needs_information">Needs information</option><option value="rejected">Rejected</option></select></div>{table(["ORGANISATION","LEGAL DETAILS","SUBMITTED","STATUS","DECISION"],filtered(rows("companies").filter(x=>filter==="all"||x.status===filter),["company_name","legal_name","country"]).map(x=><tr><td><b>{x.company_name}</b><small>{x.website||"Website not provided"}</small></td><td><b>{x.legal_name}</b><small>{x.country} · {x.business_id||"No registration ID"}</small><small>{x.evidence_note}</small></td><td>{stamp(x.submitted_at)}</td><td>{pill(x.status)}</td><td><div className="ad-row-actions">{x.status==="pending_review"&&<><button className="ad-mini-primary" onClick={()=>openAction("company",x.company_id,"verified")}>Verify</button><button onClick={()=>openAction("company",x.company_id,"needs_information")}>Request info</button><button className="ad-danger-link" onClick={()=>openAction("company",x.company_id,"rejected")}>Reject</button></>}</div></td></tr>),"No verification requests found.")}</section>}
         {page==="jobs"&&<section className="ad-panel"><div className="ad-panel-head"><div><h2>Job moderation</h2><p>Approve compliant listings or return them with a clear reason.</p></div><span className="ad-count">{rows("jobs").length} records</span></div><div className="ad-toolbar"><input placeholder="Search job title or company…" value={search} onChange={e=>setSearch(e.target.value)}/></div>{table(["JOB / COMPANY","LOCATION","SUBMITTED","STATUS","MODERATION"],filtered(rows("jobs"),["title","company_name","description"]).map(x=><tr><td><b>{x.title}</b><small>{x.company_name}</small><small>{x.description?.slice(0,130)}{x.description?.length>130?"…":""}</small></td><td>{x.location}<small>{x.employment_type}</small></td><td>{stamp(x.created)}</td><td>{pill(x.status)}</td><td><div className="ad-row-actions">{x.status==="pending_review"&&<><button className="ad-mini-primary" disabled={!x.verified} onClick={()=>openAction("job",x.id,"published")}>Approve</button><button onClick={()=>openAction("job",x.id,"needs_changes")}>Request changes</button><button className="ad-danger-link" onClick={()=>openAction("job",x.id,"rejected")}>Reject</button></>}</div></td></tr>),"No jobs are awaiting moderation.")}</section>}
         {page==="assessments"&&<section className="ad-panel"><div className="ad-panel-head"><div><h2>Assessment review</h2><p>Review the automated score alongside every question and the candidate's submitted response before recording a human decision.</p></div><span className="ad-count">{rows("assessments").length} attempts</span></div><div className="ad-info-banner">The current assessment engine uses deterministic answer-key / SQL grading. This report shows that automated evaluation and source evidence; it does not claim an LLM-generated judgement. Older attempts may not contain saved raw answers.</div><div className="ad-toolbar"><input placeholder="Search candidate or email…" value={search} onChange={e=>setSearch(e.target.value)}/></div>{table(["CANDIDATE","ASSESSMENT","SCORE","REVIEW STATUS","REPORT / ACTION"],filtered(rows("assessments"),["candidate_name","email","kind"]).map(x=><tr><td><b>{x.candidate_name}</b><small>{x.email}</small></td><td>{x.kind}<small>{stamp(x.finished)}</small></td><td><strong>{x.result?.overall??"—"}<small>/ 100</small></strong></td><td>{pill(x.review_decision||"pending_review")}</td><td><div className="ad-row-actions"><button onClick={()=>setSelectedReport(x)}>View report</button><button className="ad-mini-primary" onClick={()=>openAction("assessment",x.id,"approved")}>Confirm valid</button><button onClick={()=>openAction("assessment",x.id,"needs_more_info")}>More info</button><button className="ad-danger-link" onClick={()=>openAction("assessment",x.id,"invalidated")}>Invalid</button></div></td></tr>),"No completed assessments in the review list.")}<div className="ad-panel-head ad-subhead"><div><h2>Company assessment requests</h2><p>Company-authored phase-two requests require platform approval.</p></div></div>{table(["REQUEST","COMPANY / CANDIDATE","STATUS","REVIEW"],rows("phaseTwo").map(x=><tr><td><b>{x.title}</b><small>{x.requirements}</small></td><td>{x.company_name}<small>{x.candidate_name} · {x.job_title}</small></td><td>{pill(x.status)}</td><td>{x.status==="pending_platform_review"&&<div className="ad-row-actions"><button className="ad-mini-primary" onClick={()=>openAction("phase",x.id,"approved")}>Approve</button><button onClick={()=>openAction("phase",x.id,"needs_changes")}>Request changes</button><button className="ad-danger-link" onClick={()=>openAction("phase",x.id,"rejected")}>Reject</button></div>}</td></tr>),"No company assessment requests.")}</section>}
+        {page==="integrity"&&<section className="ad-panel">
+          <div className="ad-panel-head"><div><h2>Exam integrity monitoring</h2><p>All recorded attempts, including active attempts. Open a row to inspect event evidence and the explainable trust assessment.</p></div><span className="ad-count">{rows("integrity").length} attempts</span></div>
+          <div className="ad-toolbar"><input placeholder="Search candidate, email or attempt ID…" value={search} onChange={e=>setSearch(e.target.value)}/><select value={integrityStatus} onChange={e=>setIntegrityStatus(e.target.value)}><option value="all">All statuses</option><option value="active">In progress</option><option value="done">Completed</option></select><select value={integrityKind} onChange={e=>setIntegrityKind(e.target.value)}><option value="all">All assessment types</option><option value="pre">Initial</option><option value="post">Retest</option></select><select value={integrityTrust} onChange={e=>setIntegrityTrust(e.target.value)}><option value="all">All trust labels</option><option value="High trust">High trust</option><option value="Medium">Medium</option><option value="Needs review">Needs review</option><option value="Not scored">Not scored</option></select></div>
+          {table(["CANDIDATE","ATTEMPT","STATUS","SCORE","TRUST","EVENTS","REVIEW","DETAILS"],rows("integrity").filter(x=>(integrityStatus==="all"||x.status===integrityStatus)&&(integrityKind==="all"||x.kind===integrityKind)&&(integrityTrust==="all"||x.trust===integrityTrust)).filter(x=>[x.candidate_name,x.email,x.id].some(v=>String(v||"").toLowerCase().includes(search.toLowerCase()))).map(x=><tr><td><b>{x.candidate_name}</b><small>{x.email}</small></td><td><code>{x.id}</code><small>{stamp(x.finished||x.started)}</small></td><td>{pill(x.status)}</td><td>{x.result?.overall??"—"}{x.result&&<small>/ 100</small>}</td><td>{pill(x.trust||"Not scored")}<small>{x.result?.trust_points??"—"} points</small></td><td>{x.event_count??0}</td><td>{pill(x.review_decision||"not_reviewed")}</td><td><button className="ad-action-btn" onClick={()=>openIntegrityDetail(x.id)}>Inspect →</button></td></tr>),"No exam attempts match these filters.")}</section>}
         {page==="appeals"&&<section className="ad-panel"><div className="ad-panel-head"><div><h2>Candidate appeals</h2><p>Appeals should be reviewed independently where staffing permits.</p></div><span className="ad-count">{rows("appeals").length} appeals</span></div>{table(["CANDIDATE","ATTEMPT","APPEAL NOTE","STATUS","OUTCOME"],rows("appeals").map(x=><tr><td><b>{x.candidate_name}</b><small>{x.email}</small></td><td><code>{x.attempt_id}</code><small>{stamp(x.finished)}</small></td><td>{x.appeal}</td><td>{pill(x.decision||"open")}</td><td>{!x.decision&&<div className="ad-row-actions"><button className="ad-mini-primary" onClick={()=>openAction("appeal",x.attempt_id,"upheld")}>Uphold</button><button onClick={()=>openAction("appeal",x.attempt_id,"overturned")}>Overturn</button><button onClick={()=>openAction("appeal",x.attempt_id,"needs_more_info")}>More info</button></div>}</td></tr>),"No candidate appeals have been submitted.")}</section>}
         {page==="questions"&&(()=>{
           const qdata=data.questions||{},cats=qdata.categories||[],allQuestions=qdata.items||[];
@@ -985,6 +1068,7 @@ function AdminConsole({ onLogout }) {
       <label className="ad-q-full">Explanation<textarea rows="2" value={questionDraft.explanation} onChange={e=>setQuestionDraft(v=>({...v,explanation:e.target.value}))}/></label><label className="ad-q-full">Reference answer<textarea rows="2" value={questionDraft.reference_answer} onChange={e=>setQuestionDraft(v=>({...v,reference_answer:e.target.value}))} placeholder={questionDraft.question_type==="SQL"?"Canonical SQL query used for automatic grading against hidden datasets.":"Expected answer, reference implementation or guidance for human review."}/></label><label className="ad-q-full">Grading rubric<textarea rows="2" value={questionDraft.grading_rubric} onChange={e=>setQuestionDraft(v=>({...v,grading_rubric:e.target.value}))}/></label>
     </div><div className="ad-q-system-meta"><span>Created by: {questionEditing?.created_by||"Current admin"}</span><span>Version: {questionEditing?"v"+questionEditing.version+" → v"+(Number(questionEditing.version)+1):"v1 on save"}</span><span>Created date: {questionEditing?stamp(questionEditing.created_date):"Generated on save"}</span></div><footer><button type="button" onClick={()=>setQuestionModal(false)} disabled={questionSaving}>Cancel</button><button className="ad-q-add-btn" disabled={questionSaving}>{questionSaving?"Saving…":questionEditing?"Save new version":"Create question"}</button></footer></form></div>}
     {selectedReport&&<div className="ad-modal-backdrop" onClick={()=>setSelectedReport(null)}><section className="ad-report-modal" onClick={e=>e.stopPropagation()}><header><div><div className="ad-eyebrow">CANDIDATE EVIDENCE · MANUAL REVIEW</div><h2>Assessment evaluation report</h2><p>{selectedReport.candidate_name} · {selectedReport.email} · {selectedReport.kind} assessment</p></div><button type="button" onClick={()=>setSelectedReport(null)}>×</button></header><div className="ad-report-summary"><div><small>Overall score</small><strong>{selectedReport.result?.overall??"—"}<small>/100</small></strong></div><div><small>Level</small><strong>{selectedReport.result?.level??"—"}</strong></div><div><small>Integrity signal</small><strong>{selectedReport.result?.trust??"—"}</strong></div></div><div className="ad-info-banner">{selectedReport.evaluation_method||"Automated evaluation method unavailable."} This is a deterministic grading summary, not a generative AI judgement. Use your own judgement for the final manual review.</div>{!selectedReport.answer_evidence_complete&&<div className="ad-warning-banner">Some or all candidate responses were not captured for this older attempt. The original question list may be visible, but missing answers cannot be reconstructed.</div>}<h3>Topic performance</h3><div className="ad-report-topics">{Object.entries(selectedReport.result?.topics||{}).map(([topic,v])=><div><b>{topic}</b><span>{v.score}% · {v.level} · {v.n} questions</span></div>)}</div><h3>Questions and candidate answers ({selectedReport.answer_evidence?.length||0})</h3><div className="ad-report-questions">{(selectedReport.answer_evidence||[]).map(q=><article><div className="ad-report-qmeta">Q{q.number} · {q.topic} · {q.type} · Difficulty {q.difficulty}</div><h4>{q.question}</h4>{q.options?.length>0&&<ol>{q.options.map(o=><li>{o}</li>)}</ol>}<div className="ad-report-answer"><b>Candidate answer</b><pre>{q.selected_option??q.candidate_answer??"Not captured in this attempt"}</pre></div>{q.expected_answer&&<div className="ad-report-answer"><b>Expected / reference answer</b><pre>{q.expected_answer}</pre></div>}{q.explanation&&<p className="ad-report-qmeta">Explanation: {q.explanation}</p>}{q.grading_rubric&&<p className="ad-report-qmeta">Rubric: {q.grading_rubric}</p>}<div className="ad-report-qmeta">Evaluation: {q.review_status|| (q.automated_correct===true?"Correct":q.automated_correct===false?"Incorrect":"Unavailable")} · Response time: {q.time_seconds??"—"} sec</div></article>)}</div><footer><span>Use browser print dialog and choose “Save as PDF” for a downloadable report.</span><button className="ad-mini-primary" onClick={()=>printAssessmentReport(selectedReport)}>Print / Save PDF</button><button onClick={()=>setSelectedReport(null)}>Close</button></footer></section></div>}
+    {(integrityDetail||integrityLoading)&&<div className="ad-modal-backdrop" onClick={()=>setIntegrityDetail(null)}><section className="ad-modal" style={{width:"min(920px,96vw)",maxHeight:"88vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}><button type="button" className="ad-modal-close" onClick={()=>setIntegrityDetail(null)}>×</button>{integrityLoading?<p>Loading attempt evidence…</p>:<><div className="ad-eyebrow">EXAM INTEGRITY REPORT</div><h2>{integrityDetail.candidate_name}</h2><p>{integrityDetail.email} · {integrityDetail.kind} · {integrityDetail.id}</p><div className="ad-info-banner">Recorded browser events are client-reported telemetry, not proof of misconduct. Screen video, camera, microphone, device identity and full desktop activity are not collected by this feature.</div><div className="ad-detail-list"><div><span>Attempt status</span><b>{integrityDetail.status}</b></div><div><span>Started</span><b>{stamp(integrityDetail.started)}</b></div><div><span>Finished</span><b>{stamp(integrityDetail.finished)}</b></div><div><span>Technical score</span><b>{integrityDetail.integrity?.overall??"Not scored"}</b></div><div><span>Trust label</span><b>{integrityDetail.integrity?.trust||"Not scored"}</b></div><div><span>Trust points</span><b>{integrityDetail.integrity?.trust_points??"—"}</b></div><div><span>Rule version</span><b>{integrityDetail.integrity?.trust_rule_version||"Not available"}</b></div><div><span>Review decision</span><b>{integrityDetail.review_decision||"Not reviewed"}</b></div></div><h3>Trust reasons</h3>{integrityDetail.integrity?.trust_reasons?.length?<ul>{integrityDetail.integrity.trust_reasons.map((r,i)=><li key={i}>{r.key}: {r.n??0} event(s), {r.points??0} point(s){r.duration_seconds!=null?", "+r.duration_seconds+"s":""}</li>)}</ul>:<p>No trust reasons recorded.</p>}<h3>Hard flags</h3><p>{integrityDetail.integrity?.trust_hard_flags?.join(", ")||"None recorded"}</p><h3>Event timeline ({integrityDetail.events?.length||0})</h3>{integrityDetail.events?.length?<div className="ad-table-wrap"><table className="ad-table"><thead><tr><th>TIME</th><th>EVENT</th><th>SOURCE</th></tr></thead><tbody>{integrityDetail.events.map(e=><tr key={e.id}><td>{stamp(e.server_ts)}</td><td>{e.type}</td><td>Browser-reported event</td></tr>)}</tbody></table></div>:<p>No event records for this attempt.</p>}<h3>Answer timing</h3>{integrityDetail.answers?.length?<div className="ad-table-wrap"><table className="ad-table"><thead><tr><th>QUESTION</th><th>TOPIC</th><th>TYPE</th><th>SECONDS</th></tr></thead><tbody>{integrityDetail.answers.map((a,i)=><tr key={i}><td>{a.question_id||"—"}</td><td>{a.topic||"—"}</td><td>{a.type||"—"}</td><td>{a.seconds??"—"}</td></tr>)}</tbody></table></div>:<p>No answer timing records.</p>}<h3>Candidate appeal</h3><p>{integrityDetail.appeal||"No appeal submitted."}</p><h3>Human review</h3><p>{integrityDetail.review_decision||"Not reviewed"} · {integrityDetail.review_reason||"No review note"}</p><p className="ad-footnote">Answer records and technical score remain unchanged by integrity review.</p></>}</section></div>}
     {action&&<div className="ad-modal-backdrop" onClick={()=>!saving&&setAction(null)}><form className="ad-modal" onSubmit={submitAction} onClick={e=>e.stopPropagation()}><button type="button" className="ad-modal-close" onClick={()=>setAction(null)}>×</button><div className="ad-eyebrow">REASON-CODED ADMIN ACTION</div><h2>Confirm {action.decision.replaceAll("_"," ")}</h2><p>This decision will be recorded with your administrator identity and timestamp. Add a clear reason for the audit trail.</p><label>Decision reason<textarea required minLength={action.kind==="learning-resource"?8:3} rows="4" value={reason} onChange={e=>setReason(e.target.value)} placeholder="Explain the evidence reviewed and why this action is appropriate…"/></label><div className="ad-modal-actions"><button type="button" onClick={()=>setAction(null)} disabled={saving}>Cancel</button><button className="ad-modal-confirm" disabled={saving||reason.trim().length<(action.kind==="learning-resource"?8:3)}>{saving?"Saving…":"Confirm decision"}</button></div></form></div>}
   </div>;
 }
