@@ -823,7 +823,7 @@ ADMIN_SCOPE_ROLES = {
     "overview": {"super_admin"}, "users_read": {"super_admin", "support_agent", "trust_safety_reviewer"},
     "users_write": {"super_admin", "trust_safety_reviewer"}, "company_verification": {"super_admin", "company_verification_admin"},
     "job_moderation": {"super_admin", "company_verification_admin"}, "assessment_review": {"super_admin", "trust_safety_reviewer"},
-    "integrity_review": {"super_admin", "trust_safety_reviewer", "question_content_admin", "company_verification_admin", "support_agent", "finance_admin", "compliance_officer"},
+    "integrity_review": {"super_admin", "trust_safety_reviewer"},
     "appeals": {"super_admin", "trust_safety_reviewer"}, "phase_two": {"super_admin", "question_content_admin", "company_verification_admin"},
     "questions": {"super_admin", "question_content_admin"}, "ai": {"super_admin", "compliance_officer"},
     "billing": {"super_admin", "finance_admin"}, "privacy": {"super_admin", "compliance_officer"},
