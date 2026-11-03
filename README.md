@@ -99,7 +99,7 @@ The assessment engine now has a GraphRAG retrieval path built around the existin
 - **Question formats:** the approved bank must cover scenario-based, explanation, SQL and coding questions in the fundamental section. Each CV skill must have practical (coding/SQL) and scenario/explanation coverage.
 - **Duration:** the server calculates the assessment duration by summing each selected question's configured `time_allocation`; it is not a fixed exam duration.
 - **Candidate experience:** five questions are shown per page in a table, with previous/next page navigation, per-question answer saving, a server-side timer and post-submit answer review. Correct answers are not exposed during the exam.
-- **Auditability:** each generated blueprint stores the selected question IDs, CV skill evidence, retrieval trace, provider status, quota gaps and retrieval latency. Attempt answers and submission results are stored in the existing attempt record. Subjective, scenario, coding and SQL answers are marked for human review; only MCQs are automatically graded in this first slice.
+- **Auditability:** each generated blueprint stores the selected question IDs, CV skill evidence, retrieval trace, provider status, quota gaps and retrieval latency. Attempt answers and submission results are stored in the existing attempt record. MCQs and SQL questions with a canonical reference query are automatically graded; SQL questions without a reference query, coding, scenario and explanation responses are flagged for human review.
 
 ### Retrieval architecture
 
@@ -118,7 +118,7 @@ The relational question bank remains the source of truth. Meilisearch and Neo4j 
 
 ### Required question-bank preparation
 
-The selector fails closed when a quota is missing. Admins must create/import questions, set the correct category and subcategory, difficulty, question type, answer key/reference answer, explanation/rubric and per-question time allocation, then mark reviewed questions **Active**. Suggested subcategory labels include Python, Git, AI & Machine Learning, SQL, DSA, OOP, Networking and the other exact technology names found in CVs. Do not activate unreviewed questions. The Admin → Question Governance screen exposes GraphRAG readiness and a **Rebuild search + graph index** action.
+The selector fails closed when a quota is missing. Admins must create/import questions, set the correct category and subcategory, difficulty, question type, answer key/reference answer, explanation/rubric and per-question time allocation, then mark reviewed questions **Active**. For SQL questions to be automatically graded, put a canonical SQL query in the Reference answer field; the SQL grader checks it against two generated datasets using the built-in customers/orders schema. Suggested subcategory labels include Python, Git, AI & Machine Learning, SQL, DSA, OOP, Networking and the other exact technology names found in CVs. Do not activate unreviewed questions. The Admin → Question Governance screen exposes GraphRAG readiness and a **Rebuild search + graph index** action.
 
 ### Configure external retrieval services
 
