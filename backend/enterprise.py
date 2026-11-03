@@ -3,7 +3,9 @@ import json, time, uuid, os, re, secrets, csv, io
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
-from main import current_user, one, allr, run, audit, QBYID
+from main import current_user, one, allr, run, audit, QBYID, db, DATABASE_URL, COOLDOWN_HOURS, MAX_ATTEMPTS_90D
+from content import RESOURCES, JOB
+from urllib.parse import urlparse
 
 router = APIRouter(tags=["hiring"])
 
@@ -833,7 +835,7 @@ ADMIN_SCOPE_ROLES = {
     "job_moderation": {"super_admin", "company_verification_admin"}, "assessment_review": {"super_admin", "trust_safety_reviewer"},
     "appeals": {"super_admin", "trust_safety_reviewer"}, "phase_two": {"super_admin", "question_content_admin", "company_verification_admin"},
     "questions": {"super_admin", "question_content_admin"}, "ai": {"super_admin", "compliance_officer"},
-    "billing": {"super_admin", "finance_admin"}, "privacy": {"super_admin", "compliance_officer"},
+    "billing": {"super_admin", "finance_admin"}, "learning": {"super_admin", "question_content_admin", "finance_admin"}, "privacy": {"super_admin", "compliance_officer"},
     "quality": {"super_admin", "compliance_officer", "trust_safety_reviewer"}, "audit": {"super_admin", "compliance_officer"},
     "staff": {"super_admin"},
 }
@@ -1566,3 +1568,268 @@ def admin_console_me(user=Depends(current_user)):
     staff_role=row["admin_role"] if row else "super_admin"
     scopes=sorted([scope for scope,roles in ADMIN_SCOPE_ROLES.items() if staff_role in roles])
     return {"user_id":user["id"],"admin_role":staff_role,"scopes":scopes}
+
+
+# ---------------------------------------------------------------------------
+# Learning resource governance, candidate progress and retake entitlements.
+# Resources enter the catalogue as pending_review; only a human-reviewed,
+# verified resource can appear in a candidate's learning path.
+def ensure_learning_schema():
+    statements = [
+        """CREATE TABLE IF NOT EXISTS learning_resources (
+            id TEXT PRIMARY KEY, topic TEXT NOT NULL, title TEXT NOT NULL, provider TEXT NOT NULL,
+            url TEXT NOT NULL, language TEXT NOT NULL DEFAULT 'en', level INTEGER NOT NULL DEFAULT 1,
+            licence TEXT NOT NULL DEFAULT '', estimated_minutes INTEGER NOT NULL DEFAULT 30,
+            verification_status TEXT NOT NULL DEFAULT 'pending_review', last_checked_at REAL,
+            reviewed_by INTEGER, reviewed_at REAL, review_note TEXT NOT NULL DEFAULT '',
+            created_by INTEGER NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS learning_progress (
+            user_id INTEGER NOT NULL, resource_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'not_started',
+            started_at REAL, completed_at REAL, updated_at REAL NOT NULL,
+            PRIMARY KEY(user_id, resource_id))""",
+        """CREATE TABLE IF NOT EXISTS learning_feedback (
+            id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, resource_id TEXT NOT NULL,
+            helpful INTEGER NOT NULL, comment TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
+            UNIQUE(user_id, resource_id))""",
+        """CREATE TABLE IF NOT EXISTS learning_retake_policy (
+            id INTEGER PRIMARY KEY, cooldown_hours INTEGER NOT NULL DEFAULT 24,
+            max_attempts_90d INTEGER NOT NULL DEFAULT 3, credits_per_attempt INTEGER NOT NULL DEFAULT 1,
+            updated_by INTEGER, updated_at REAL NOT NULL)"""
+    ]
+    for statement in statements:
+        run(statement)
+    now = time.time()
+    run("""INSERT INTO learning_retake_policy(id,cooldown_hours,max_attempts_90d,credits_per_attempt,updated_at)
+           VALUES (1,?,?,?,?) ON CONFLICT(id) DO NOTHING""",
+        (max(0, int(COOLDOWN_HOURS)), max(1, int(MAX_ATTEMPTS_90D)), 1, now))
+    for item in RESOURCES:
+        rid = str(item["id"])
+        run("""INSERT INTO learning_resources(id,topic,title,provider,url,language,level,licence,estimated_minutes,
+               verification_status,created_by,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,'pending_review',0,?,?) ON CONFLICT(id) DO NOTHING""",
+            (rid, item["topic"], item["title"], item["source"], item["url"], item.get("lang","en"),
+             int(item.get("level",1)), item.get("licence",""), int(item.get("minutes",30)), now, now))
+
+
+ensure_learning_schema()
+
+
+def _learning_balance(user_id):
+    row = one("SELECT COALESCE(SUM(delta),0) AS balance FROM billing_credit_ledger WHERE user_id=?", (user_id,))
+    return max(0, int(row["balance"] or 0))
+
+
+def _retake_policy():
+    row = one("SELECT * FROM learning_retake_policy WHERE id=1")
+    if not row:
+        return {"cooldown_hours": int(COOLDOWN_HOURS), "max_attempts_90d": int(MAX_ATTEMPTS_90D), "credits_per_attempt": 1}
+    return dict(row)
+
+
+def _valid_resource_url(value):
+    parsed = urlparse((value or "").strip())
+    return parsed.scheme == "https" and bool(parsed.hostname) and not parsed.username and not parsed.password
+
+
+class LearningResourceInput(BaseModel):
+    topic: str = Field(min_length=2, max_length=80)
+    title: str = Field(min_length=4, max_length=220)
+    provider: str = Field(min_length=2, max_length=120)
+    url: str = Field(min_length=12, max_length=1000)
+    language: str = Field(default="en", min_length=2, max_length=12)
+    level: int = Field(default=1, ge=1, le=5)
+    licence: str = Field(default="", max_length=240)
+    estimated_minutes: int = Field(default=30, ge=1, le=10000)
+
+
+@router.get("/api/learning/dashboard")
+def candidate_learning_dashboard(user=Depends(current_user)):
+    require_role(user, "candidate")
+    latest = one("SELECT id,result,finished FROM attempts WHERE user_id=? AND status='done' ORDER BY finished DESC LIMIT 1", (user["id"],))
+    topics = json.loads(latest["result"]).get("topics", {}) if latest and latest["result"] else {}
+    gaps = [r["skill"] for r in JOB["required"]
+            if not topics.get(r["skill"]) or float(topics[r["skill"]].get("score", 0)) < float(r["threshold"])]
+    if not latest:
+        gaps = [r["skill"] for r in JOB["required"]]
+    resources = allr("""SELECT r.*,p.status AS progress_status,p.started_at,p.completed_at
+                        FROM learning_resources r LEFT JOIN learning_progress p
+                        ON p.resource_id=r.id AND p.user_id=?
+                        WHERE r.verification_status='verified' AND r.topic IN (%s)
+                        ORDER BY r.topic,r.level,r.title""" % (",".join("?" for _ in gaps) if gaps else "''"), (user["id"], *gaps))
+    attempts = allr("SELECT id,kind,status,started,finished,result FROM attempts WHERE user_id=? ORDER BY started DESC LIMIT 30", (user["id"],))
+    policy = _retake_policy()
+    recent = [a for a in attempts if a["status"] == "done" and a["finished"] and a["finished"] > time.time()-90*86400]
+    last = next((a for a in attempts if a["status"] == "done"), None)
+    cooldown_until = (last["finished"] + int(policy["cooldown_hours"])*3600) if last else None
+    balance = _learning_balance(user["id"])
+    cost = int(policy["credits_per_attempt"])
+    active = one("SELECT id FROM attempts WHERE user_id=? AND status='active'", (user["id"],))
+    can_retry = bool(last and len(recent) < int(policy["max_attempts_90d"]) and
+                     (not cooldown_until or time.time() >= cooldown_until) and balance >= cost and not active)
+    progress = allr("SELECT status,COUNT(*) AS count FROM learning_progress WHERE user_id=? GROUP BY status", (user["id"],))
+    progress_counts = {r["status"]: r["count"] for r in progress}
+    history = []
+    for a in attempts:
+        result = json.loads(a["result"]) if a["result"] else {}
+        ledger = one("SELECT delta,created FROM billing_credit_ledger WHERE user_id=? AND source_ref=? AND entry_type='retake_consumption' LIMIT 1", (user["id"], a["id"]))
+        history.append({"id":a["id"],"kind":a["kind"],"status":a["status"],"started":a["started"],"finished":a["finished"],
+                        "score":result.get("overall"),"credit_consumed":abs(int(ledger["delta"])) if ledger else 0,
+                        "credit_consumed_at":ledger["created"] if ledger else None})
+    return {"based_on":latest["id"] if latest else None,"gaps":gaps,"resources":[dict(r) for r in resources],
+            "progress":{"started":progress_counts.get("started",0),"completed":progress_counts.get("completed",0)},
+            "retake":{"balance":balance,"credit_cost":cost,"cooldown_hours":int(policy["cooldown_hours"]),
+                      "max_attempts_90d":int(policy["max_attempts_90d"]),"attempts_used_90d":len(recent),
+                      "cooldown_until":cooldown_until,"eligible":can_retry,"active_attempt":bool(active),
+                      "has_result":bool(last)},
+            "attempt_history":history,
+            "note":"Only admin-verified resources are shown. Retake credits are consumed when an official retake attempt is created, not when the candidate opens this page."}
+
+
+class LearningProgressInput(BaseModel):
+    status: str
+    helpful: Optional[bool] = None
+    comment: str = Field(default="", max_length=1000)
+
+class LearningFeedbackInput(BaseModel):
+    helpful: bool
+    comment: str = Field(default="", max_length=1000)
+
+
+@router.patch("/api/learning/resources/{resource_id}/progress")
+def update_learning_progress(resource_id: str, body: LearningProgressInput, user=Depends(current_user)):
+    require_role(user, "candidate")
+    if body.status not in ("started","completed"):
+        raise HTTPException(422,"Progress status must be started or completed")
+    if not one("SELECT id FROM learning_resources WHERE id=? AND verification_status='verified'", (resource_id,)):
+        raise HTTPException(404,"Verified learning resource not found")
+    now=time.time()
+    current=one("SELECT * FROM learning_progress WHERE user_id=? AND resource_id=?", (user["id"],resource_id))
+    started=current["started_at"] if current and current["started_at"] else now
+    completed=(current["completed_at"] if current else None) or (now if body.status=="completed" else None)
+    status="completed" if completed else "started"
+    run("""INSERT INTO learning_progress(user_id,resource_id,status,started_at,completed_at,updated_at)
+           VALUES (?,?,?,?,?,?) ON CONFLICT(user_id,resource_id) DO UPDATE SET status=excluded.status,
+           started_at=excluded.started_at,completed_at=excluded.completed_at,updated_at=excluded.updated_at""",
+        (user["id"],resource_id,status,started,completed,now))
+    audit(user["id"],"learning_progress_"+status,resource_id)
+    return {"resource_id":resource_id,"status":status,"started_at":started,"completed_at":completed}
+
+
+@router.post("/api/learning/resources/{resource_id}/feedback")
+def learning_resource_feedback(resource_id: str, body: LearningFeedbackInput, user=Depends(current_user)):
+    require_role(user,"candidate")
+    if body.helpful is None: raise HTTPException(422,"Feedback helpful value is required")
+    if not one("SELECT id FROM learning_resources WHERE id=? AND verification_status='verified'",(resource_id,)):
+        raise HTTPException(404,"Verified learning resource not found")
+    run("""INSERT INTO learning_feedback(id,user_id,resource_id,helpful,comment,created_at)
+           VALUES (?,?,?,?,?,?) ON CONFLICT(user_id,resource_id) DO UPDATE SET helpful=excluded.helpful,
+           comment=excluded.comment,created_at=excluded.created_at""",
+        (uuid.uuid4().hex,user["id"],resource_id,1 if body.helpful else 0,body.comment.strip(),time.time()))
+    audit(user["id"],"learning_feedback_submitted",resource_id)
+    return {"ok":True}
+
+
+@router.get("/api/retake/status")
+def candidate_retake_status(user=Depends(current_user)):
+    require_role(user,"candidate")
+    # Reuse the complete dashboard eligibility calculation for one source of truth.
+    return candidate_learning_dashboard(user)["retake"]
+
+
+@router.get("/api/admin/learning")
+def admin_learning_workspace(user=Depends(current_user)):
+    admin_only(user,"learning")
+    resources=allr("""SELECT r.*,u.name AS reviewer_name FROM learning_resources r
+                      LEFT JOIN users u ON u.id=r.reviewed_by ORDER BY r.updated_at DESC""")
+    progress=allr("""SELECT p.user_id,u.name AS candidate_name,u.email AS candidate_email,
+                     r.title AS resource_title,r.topic,p.status,p.started_at,p.completed_at,p.updated_at
+                     FROM learning_progress p JOIN users u ON u.id=p.user_id
+                     JOIN learning_resources r ON r.id=p.resource_id ORDER BY p.updated_at DESC LIMIT 250""")
+    ledger=allr("""SELECT l.*,u.name AS candidate_name,u.email AS candidate_email
+                   FROM billing_credit_ledger l LEFT JOIN users u ON u.id=l.user_id
+                   WHERE l.entry_type IN ('admin_grant','admin_revoke','retake_consumption')
+                   ORDER BY l.created DESC LIMIT 250""")
+    summary={"resources":len(resources),"verified":sum(1 for r in resources if r["verification_status"]=="verified"),
+             "pending":sum(1 for r in resources if r["verification_status"]=="pending_review"),
+             "quarantined":sum(1 for r in resources if r["verification_status"]=="quarantined"),
+             "learners":one("SELECT COUNT(DISTINCT user_id) AS n FROM learning_progress")["n"],
+             "completed":one("SELECT COUNT(*) AS n FROM learning_progress WHERE status='completed'")["n"],
+             "retakes_consumed":one("SELECT COUNT(*) AS n FROM billing_credit_ledger WHERE entry_type='retake_consumption'")["n"]}
+    return {"summary":summary,"resources":[dict(r) for r in resources],"progress":[dict(r) for r in progress],
+            "ledger":[dict(r) for r in ledger],"policy":_retake_policy()}
+
+
+@router.post("/api/admin/learning/resources")
+def admin_create_learning_resource(body: LearningResourceInput,user=Depends(current_user)):
+    admin_only(user,"questions")
+    if not _valid_resource_url(body.url): raise HTTPException(422,"Resource URL must be a valid HTTPS URL.")
+    rid=uuid.uuid4().hex
+    now=time.time()
+    run("""INSERT INTO learning_resources(id,topic,title,provider,url,language,level,licence,estimated_minutes,
+           verification_status,created_by,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,'pending_review',?,?,?)""",
+        (rid,body.topic.strip().lower(),body.title.strip(),body.provider.strip(),body.url.strip(),body.language.strip().lower(),
+         body.level,body.licence.strip(),body.estimated_minutes,user["id"],now,now))
+    audit(user["id"],"learning_resource_created",rid)
+    return {"id":rid,"verification_status":"pending_review"}
+
+
+class LearningResourceDecision(BaseModel):
+    status: str
+    reason: str = Field(min_length=8,max_length=1000)
+
+
+@router.patch("/api/admin/learning/resources/{resource_id}")
+def admin_review_learning_resource(resource_id: str,body: LearningResourceDecision,user=Depends(current_user)):
+    admin_only(user,"questions")
+    if body.status not in ("verified","quarantined","retired","pending_review"):
+        raise HTTPException(422,"Unsupported resource status")
+    row=one("SELECT id FROM learning_resources WHERE id=?",(resource_id,))
+    if not row: raise HTTPException(404,"Learning resource not found")
+    current=one("SELECT url FROM learning_resources WHERE id=?",(resource_id,))
+    if body.status=="verified" and not _valid_resource_url(current["url"]):
+        raise HTTPException(422,"Only valid HTTPS resource links can be verified.")
+    now=time.time()
+    run("""UPDATE learning_resources SET verification_status=?,last_checked_at=?,reviewed_by=?,reviewed_at=?,
+           review_note=?,updated_at=? WHERE id=?""",
+        (body.status,now,user["id"],now,body.reason.strip(),now,resource_id))
+    audit(user["id"],"learning_resource_"+body.status,resource_id+":"+body.reason.strip())
+    return {"id":resource_id,"verification_status":body.status,"last_checked_at":now}
+
+
+class LearningRetakePolicyInput(BaseModel):
+    cooldown_hours: int = Field(ge=0,le=2160)
+    max_attempts_90d: int = Field(ge=1,le=20)
+    credits_per_attempt: int = Field(ge=1,le=20)
+
+
+@router.put("/api/admin/learning/policy")
+def admin_update_learning_policy(body: LearningRetakePolicyInput,user=Depends(current_user)):
+    admin_only(user,"billing")
+    now=time.time()
+    run("""UPDATE learning_retake_policy SET cooldown_hours=?,max_attempts_90d=?,credits_per_attempt=?,
+           updated_by=?,updated_at=? WHERE id=1""",
+        (body.cooldown_hours,body.max_attempts_90d,body.credits_per_attempt,user["id"],now))
+    audit(user["id"],"learning_retake_policy_updated",json.dumps(body.model_dump()))
+    return {"ok":True,"policy":_retake_policy()}
+
+
+class LearningCreditGrant(BaseModel):
+    user_id: int = Field(gt=0)
+    delta: int = Field(gt=0,le=100)
+    reason: str = Field(min_length=8,max_length=1000)
+
+
+@router.post("/api/admin/learning/credits")
+def admin_adjust_learning_credits(body: LearningCreditGrant,user=Depends(current_user)):
+    admin_only(user,"billing")
+    target=one("SELECT u.id,COALESCE(r.role,'candidate') AS role FROM users u LEFT JOIN user_roles r ON r.user_id=u.id WHERE u.id=?",(body.user_id,))
+    if not target or target["role"]!="candidate":
+        raise HTTPException(404,"Candidate account not found")
+    now=time.time()
+    run("""INSERT INTO billing_credit_ledger(id,user_id,delta,entry_type,source_ref,reason,actor_id,created)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (uuid.uuid4().hex,body.user_id,body.delta,"admin_grant","learning-admin:"+uuid.uuid4().hex,
+         body.reason.strip(),user["id"],now))
+    audit(user["id"],"retake_credits_granted",str(body.user_id)+":"+str(body.delta)+":"+body.reason.strip())
+    return {"user_id":body.user_id,"granted":body.delta,"balance":_learning_balance(body.user_id)}
