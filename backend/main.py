@@ -476,7 +476,7 @@ class Ev(BaseModel):
 def event(aid: str, b: Ev, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     if att["status"] == "active" and b.type in {
-        "copy", "cut", "paste", "blur", "tab_hidden", "fullscreen_exit",
+        "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
         "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
     }:
         run("INSERT INTO events(attempt_id,type,ts) VALUES (?,?,?)", (aid, b.type, time.time()))
