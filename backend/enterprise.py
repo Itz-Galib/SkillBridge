@@ -3,7 +3,7 @@ import json, time, uuid, os, re, secrets
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from main import current_user, one, allr, run, audit
+from main import current_user, one, allr, run, audit, QBYID
 
 router = APIRouter(tags=["hiring"])
 
@@ -953,6 +953,41 @@ def admin_assessment_reviews(user=Depends(current_user)):
         item=dict(row)
         try: item["result"]=json.loads(item["result"]) if item["result"] else None
         except Exception: item["result"]=None
+        # The state is admin-only here. Preserve the original response for manual review;
+        # legacy attempts created before response capture are explicitly marked unavailable.
+        attempt_state = one("SELECT state FROM attempts WHERE id=?", (item["id"],))
+        try:
+            state = json.loads(attempt_state["state"]) if attempt_state and attempt_state["state"] else {}
+        except Exception:
+            state = {}
+        evidence = []
+        for index, saved in enumerate(state.get("answers", []), start=1):
+            question = QBYID.get(saved.get("qid"), {})
+            raw_answer = saved.get("answer")
+            options = question.get("options") or []
+            selected_option = None
+            if saved.get("type") == "mcq" and raw_answer not in (None, ""):
+                try:
+                    selected_option = options[int(raw_answer)]
+                except (ValueError, TypeError, IndexError):
+                    selected_option = str(raw_answer)
+            evidence.append({
+                "number": index,
+                "question_id": saved.get("qid"),
+                "topic": saved.get("topic") or question.get("topic"),
+                "type": saved.get("type") or question.get("type"),
+                "difficulty": saved.get("difficulty") or question.get("difficulty"),
+                "question": question.get("prompt") or "Question text unavailable",
+                "options": options,
+                "candidate_answer": raw_answer,
+                "selected_option": selected_option,
+                "answer_available": raw_answer is not None,
+                "automated_correct": saved.get("correct"),
+                "time_seconds": saved.get("seconds")
+            })
+        item["answer_evidence"] = evidence
+        item["answer_evidence_complete"] = bool(evidence) and all(x["answer_available"] for x in evidence)
+        item["evaluation_method"] = "Deterministic answer-key / SQL grader; no generative AI score was produced."
         items.append(item)
     return {"items":items}
 

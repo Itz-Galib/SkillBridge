@@ -136,7 +136,7 @@ def record_answer(state, q, answer, seconds):
         except (TypeError, ValueError): correct = False
     else:
         correct = grade_sql(state["seed"], q, str(answer or ""))
-    state["answers"].append({"qid": q["id"], "topic": q["topic"], "difficulty": q["difficulty"], "type": q["type"], "correct": correct, "seconds": round(seconds, 1)})
+    state["answers"].append({"qid": q["id"], "topic": q["topic"], "difficulty": q["difficulty"], "type": q["type"], "answer": str(answer or ""), "correct": correct, "seconds": round(seconds, 1)})
     state["used"].append(q["id"])
     if q["topic"] == "sql": state["sql_taken"] += 1
     state["level"] = max(1, min(3, state["level"] + (1 if correct else -1)))
