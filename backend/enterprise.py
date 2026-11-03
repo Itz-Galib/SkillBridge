@@ -823,6 +823,7 @@ ADMIN_SCOPE_ROLES = {
     "overview": {"super_admin"}, "users_read": {"super_admin", "support_agent", "trust_safety_reviewer"},
     "users_write": {"super_admin", "trust_safety_reviewer"}, "company_verification": {"super_admin", "company_verification_admin"},
     "job_moderation": {"super_admin", "company_verification_admin"}, "assessment_review": {"super_admin", "trust_safety_reviewer"},
+    "integrity_review": {"super_admin", "trust_safety_reviewer", "question_content_admin", "company_verification_admin", "support_agent", "finance_admin", "compliance_officer"},
     "appeals": {"super_admin", "trust_safety_reviewer"}, "phase_two": {"super_admin", "question_content_admin", "company_verification_admin"},
     "questions": {"super_admin", "question_content_admin"}, "ai": {"super_admin", "compliance_officer"},
     "billing": {"super_admin", "finance_admin"}, "privacy": {"super_admin", "compliance_officer"},
@@ -939,7 +940,7 @@ def admin_job_review_queue_v2(user=Depends(current_user)):
 
 @router.get("/api/admin/integrity/attempts")
 def admin_integrity_attempts(user=Depends(current_user), q: str = "", status: str = "all", kind: str = "all", trust: str = "all", limit: int = 300):
-    admin_only(user, "assessment_review")
+    admin_only(user, "integrity_review")
     limit = max(1, min(limit, 500))
     query = """SELECT a.id,a.user_id,a.kind,a.status,a.started,a.finished,a.result,a.appeal,
                u.name AS candidate_name,u.email,
