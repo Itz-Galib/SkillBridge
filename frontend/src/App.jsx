@@ -271,9 +271,61 @@ function Gap({ onStart, refreshKey }) {
   );
 }
 
+/* ---------- exam integrity monitor ---------- */
+function useExamIntegrity(aid, screenStream) {
+  const t = useT();
+  const [shareActive,setShareActive]=useState(Boolean(screenStream?.getVideoTracks().some(track=>track.readyState==="live")));
+  const [fullscreenActive,setFullscreenActive]=useState(Boolean(document.fullscreenElement));
+  const [notice,setNotice]=useState("");
+  const [shareError,setShareError]=useState("");
+  const report=useCallback(type=>{api("/attempts/"+aid+"/event",{method:"POST",body:{type}}).catch(()=>{});},[aid]);
+  useEffect(()=>{
+    const clipboard=e=>{e.preventDefault();report(e.type);setNotice(t("clipboardBlocked"));};
+    const keydown=e=>{const key=String(e.key||"").toLowerCase();if((e.ctrlKey||e.metaKey)&&["c","v","x"].includes(key)){e.preventDefault();report(key==="c"?"copy":key==="x"?"cut":"paste");setNotice(t("clipboardBlocked"));}if(e.shiftKey&&key==="insert"){e.preventDefault();report("paste");setNotice(t("clipboardBlocked"));}};
+    const context=e=>e.preventDefault();
+    const blur=()=>report("blur");
+    const visibility=()=>report(document.visibilityState==="hidden"?"tab_hidden":"tab_visible");
+    const fullscreen=()=>{const active=Boolean(document.fullscreenElement);setFullscreenActive(active);if(!active){report("fullscreen_exit");setNotice(t("fullscreenWarning"));}};
+    document.addEventListener("copy",clipboard,true);document.addEventListener("cut",clipboard,true);document.addEventListener("paste",clipboard,true);
+    document.addEventListener("keydown",keydown,true);document.addEventListener("contextmenu",context,true);
+    document.addEventListener("visibilitychange",visibility);document.addEventListener("fullscreenchange",fullscreen);window.addEventListener("blur",blur);
+    return()=>{document.removeEventListener("copy",clipboard,true);document.removeEventListener("cut",clipboard,true);document.removeEventListener("paste",clipboard,true);document.removeEventListener("keydown",keydown,true);document.removeEventListener("contextmenu",context,true);document.removeEventListener("visibilitychange",visibility);document.removeEventListener("fullscreenchange",fullscreen);window.removeEventListener("blur",blur);};
+  },[report,t]);
+  useEffect(()=>{
+    const track=screenStream?.getVideoTracks()[0];
+    if(!track){setShareActive(false);return;}
+    const sync=()=>setShareActive(track.readyState==="live");
+    const ended=()=>{setShareActive(false);setShareError(t("shareStopped"));report("screen_share_stopped");};
+    sync();track.addEventListener("ended",ended);
+    return()=>track.removeEventListener("ended",ended);
+  },[screenStream,report,t]);
+  const restartShare=async()=>{
+    try{if(!navigator.mediaDevices?.getDisplayMedia)throw new Error(t("shareUnsupported"));
+      const stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:5},audio:false});
+      await api("/attempts/"+aid+"/event",{method:"POST",body:{type:"screen_share_started"}});
+      return stream;
+    }catch(e){setShareError(e.message||t("shareRequired"));report("screen_share_unavailable");return null;}
+  };
+  const restartFullscreen=async()=>{
+    try{if(!document.documentElement.requestFullscreen)throw new Error(t("fullscreenUnsupported"));await document.documentElement.requestFullscreen();setFullscreenActive(Boolean(document.fullscreenElement));}
+    catch(e){setShareError(e.message||t("fullscreenRequired"));}
+  };
+  return {shareActive,fullscreenActive,notice,shareError,setNotice,restartShare,restartFullscreen,report};
+}
+function ExamIntegrityBanner({integrity,onRestartShare}) {
+  const t=useT();
+  return <><div className={"exam-integrity-banner"+(integrity.shareActive&&integrity.fullscreenActive?" active":" warning")} role="status">
+    <strong>{integrity.shareActive?t("shareActive"):t("shareStopped")}</strong><span>{t("sharePrivacy")}</span>
+    {!integrity.shareActive&&<button type="button" className="btn sm" onClick={onRestartShare}>{t("restartShare")}</button>}
+    <strong>{integrity.fullscreenActive?t("fullscreenActive"):t("fullscreenWarning")}</strong>
+    {!integrity.fullscreenActive&&<button type="button" className="btn sm" onClick={integrity.restartFullscreen}>{t("restartFullscreen")}</button>}
+  </div>{integrity.notice&&<p className="exam-integrity-notice" role="status">{integrity.notice}</p>}{integrity.shareError&&<p className="err" role="alert">{integrity.shareError}</p>}</>;
+}
+
 /* ---------- exam ---------- */
-function ExamRun({ initial, onFinished }) {
-  if (initial.graphrag) return <GraphRAGExamRun initial={initial} onFinished={onFinished} />;
+function ExamRun({ initial, onFinished, screenStream }) {
+  const integrity=useExamIntegrity(initial.attempt_id,screenStream);
+  if (initial.graphrag) return <GraphRAGExamRun initial={initial} onFinished={onFinished} integrity={integrity} onRestartShare={integrity.restartShare} />;
   const t = useT();
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState("");
@@ -293,6 +345,7 @@ function ExamRun({ initial, onFinished }) {
 
   const q = v.question;
   const submit = async () => {
+    if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error(!integrity.shareActive?t("shareRequired"):t("fullscreenRequired")));return;}
     setBusy(true); setErr(null);
     try {
       const r = await api(`/attempts/${aid}/answer`, { method: "POST", body: { question_id: q.id, answer: String(ans) } });
@@ -300,7 +353,7 @@ function ExamRun({ initial, onFinished }) {
       if (r.status === "done") onFinished(aid);
     } catch (e) { setErr(e); } finally { setBusy(false); }
   };
-  const runSql = async () => { try { setOut(await api(`/attempts/${aid}/sql-run`, { method: "POST", body: { sql: ans } })); } catch (e) { setErr(e); } };
+  const runSql = async () => { if(!integrity.shareActive||!integrity.fullscreenActive){setErr(new Error(t("shareRequired")));return;} try { setOut(await api(`/attempts/${aid}/sql-run`, { method: "POST", body: { sql: ans } })); } catch (e) { setErr(e); } };
   const onPaste = () => api(`/attempts/${aid}/event`, { method: "POST", body: { type: "paste" } }).catch(() => {});
 
   if (!q) return <p>{t("loading")}</p>;
@@ -311,27 +364,28 @@ function ExamRun({ initial, onFinished }) {
         <progress value={q.index} max={q.total} />
         <span className={"timer" + (left < 120 ? " low" : "")}>{t("timeLeft")}: {fmt(left)}</span>
       </div>
-      <h3 className="qtext">{q.prompt}</h3>
+      <ExamIntegrityBanner integrity={integrity} onRestartShare={async()=>{const stream=await integrity.restartShare();if(stream)stream.getTracks().forEach(track=>track.stop());}} />
+      <h3 className="qtext exam-copy-locked">{q.prompt}</h3>
       {q.type === "mcq" ? (
         <fieldset className="opts">
           {q.options.map((o, i) => (
-            <label key={i} className={"opt" + (String(ans) === String(i) ? " on" : "")}>
+            <label key={i} className={"opt exam-copy-locked" + (String(ans) === String(i) ? " on" : "")}>
               <input type="radio" name="opt" checked={String(ans) === String(i)} onChange={() => setAns(String(i))} /> {o}
             </label>
           ))}
         </fieldset>
       ) : (
         <>
-          <details open><summary>{t("schema")}</summary><pre className="pre">{q.schema}</pre></details>
+          <details open><summary>{t("schema")}</summary><pre className="pre exam-copy-locked">{q.schema}</pre></details>
           <p className="note">{t("sqlHelp")}</p>
-          <textarea className="code" rows={6} spellCheck={false} value={ans} onChange={(e) => setAns(e.target.value)} onPaste={onPaste} placeholder="Write your answer..." />
+          <textarea className="code" rows={6} spellCheck={false} value={ans} onChange={(e) => setAns(e.target.value)} placeholder="Write your answer..." />
           <p className="muted">{t("pasteNote")}</p>
-          {String(q.type).toLowerCase().includes("sql") && <button className="btn ghost" onClick={runSql} disabled={!ans.trim()}>{t("run")}</button>}
+          {String(q.type).toLowerCase().includes("sql") && <button className="btn ghost" onClick={runSql} disabled={!ans.trim()||!integrity.shareActive||!integrity.fullscreenActive}>{t("run")}</button>}
           {out && <pre className="pre">{JSON.stringify(out, null, 2)}</pre>}
         </>
       )}
       <Err e={err} />
-      <button className="btn" onClick={submit} disabled={busy || String(ans).trim() === ""}>{busy ? t("saving") : t("submit")}</button>
+      <button className="btn" onClick={submit} disabled={busy || !integrity.shareActive || !integrity.fullscreenActive || String(ans).trim() === ""}>{busy ? t("saving") : t("submit")}</button>
     </section>
   );
 }
