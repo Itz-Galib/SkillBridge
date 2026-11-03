@@ -157,16 +157,133 @@ def score(answers):
     overall = round(100 * ep / pp) if pp else 0
     return {"overall": overall, "level": level_of(overall), "topics": out}
 
-def trust_label(events, answers):
-    """Never pass/fail: High / Medium / Needs review, with human-readable reasons. A human reviews 'Needs review'."""
-    paste, blur = events.get("paste", 0), events.get("blur", 0)
-    fast = sum(1 for a in answers if a["type"] == "mcq" and a["correct"] and a["difficulty"] >= 2 and a["seconds"] < 3)
-    pts = 2 * paste + blur + 2 * fast
+TRUST_RULES = {
+    "rule_version": "phase1-v1",
+    "normalize_per_30_minutes": True,
+    "weights": {
+        "external_clipboard": 2, "leave_window": 1,
+        "fullscreen_exit": 1, "screen_share_stopped": 3,
+        "wrong_share_surface": 3, "heartbeat_gap": 2,
+    },
+    "caps": {
+        "external_clipboard": 3, "leave_window": 4,
+        "fullscreen_exit": 3, "screen_share_stopped": 2,
+        "wrong_share_surface": 1, "heartbeat_gap": 3, "fast": 4,
+    },
+}
+
+def _event_value(event, key, default=None):
+    return event.get(key, default) if isinstance(event, dict) else getattr(event, key, default)
+
+def _group_integrity_incidents(events, window_seconds=3):
+    """Collapse related visibility/blur/fullscreen reports into one leave-window incident."""
+    ordered = sorted(
+        [e for e in events if _event_value(e, "type") not in {"heartbeat", "screen_share_started"}],
+        key=lambda e: float(_event_value(e, "server_ts", _event_value(e, "ts", 0)) or 0),
+    )
+    incidents, current = [], None
+    for event in ordered:
+        kind = _event_value(event, "type", "")
+        ts = float(_event_value(event, "server_ts", _event_value(event, "ts", 0)) or 0)
+        if kind == "tab_visible":
+            if current:
+                current["end_ts"] = max(current["start_ts"], ts)
+                current["types"].add(kind)
+                current = None
+            continue
+        if kind in {"tab_hidden", "blur", "fullscreen_exit"}:
+            if current and ts - current["end_ts"] <= window_seconds:
+                current["end_ts"] = max(current["end_ts"], ts)
+                current["types"].add(kind)
+            else:
+                current = {"start_ts": ts, "end_ts": ts, "types": {kind}}
+                incidents.append(current)
+        else:
+            current = None
+            incidents.append({"start_ts": ts, "end_ts": ts, "types": {kind}})
+    return incidents
+
+def trust_label(events, answers, rules=None, exam_seconds=1200, question_times=None):
+    """Explainable, versioned integrity score. Advisory only; never changes technical scoring."""
+    rules = rules or TRUST_RULES
+    events = list(events or []) if not isinstance(events, dict) else [
+        {"type": key, "server_ts": 0, "count": value} for key, value in events.items() for _ in range(int(value or 0))
+    ]
+    incidents = _group_integrity_incidents(events)
+    counts = {}
+    points = 0
     reasons = []
-    if paste: reasons.append({"key": "paste", "n": paste})
-    if blur: reasons.append({"key": "blur", "n": blur})
-    if fast: reasons.append({"key": "fast", "n": fast})
-    return ("High" if pts <= 1 else "Medium" if pts <= 4 else "Needs review"), reasons
+    hard_flags = set()
+    weights, caps = rules.get("weights", {}), rules.get("caps", {})
+    clipboard_n = sum(1 for e in events if _event_value(e, "type") in {"copy", "cut", "paste"} and _event_value(e, "external", True))
+    clipboard_charged = min(clipboard_n, caps.get("external_clipboard", 3))
+    if clipboard_charged:
+        value = clipboard_charged * weights.get("external_clipboard", 2)
+        points += value
+        reasons.append({"key": "external_clipboard", "n": clipboard_charged, "points": value})
+    leave_incidents = [i for i in incidents if i["types"] & {"tab_hidden", "blur"}]
+    for incident in leave_incidents:
+        duration = max(0, incident["end_ts"] - incident["start_ts"])
+        value = min(caps.get("leave_window", 4), weights.get("leave_window", 1) + int(duration // 60))
+        points += value
+        reasons.append({"key": "leave_window", "n": 1, "points": value, "duration_seconds": round(duration, 1)})
+    fs_events = []
+    for event in events:
+        if _event_value(event, "type") != "fullscreen_exit":
+            continue
+        ts = float(_event_value(event, "server_ts", 0) or 0)
+        grouped = any(
+            _event_value(other, "type") in {"tab_hidden", "blur"}
+            and abs(float(_event_value(other, "server_ts", 0) or 0) - ts) <= 3
+            for other in events
+        )
+        if not grouped:
+            fs_events.append(event)
+    fs_n = min(len(fs_events), caps.get("fullscreen_exit", 3))
+    if fs_n:
+        value = fs_n * weights.get("fullscreen_exit", 1)
+        points += value
+        reasons.append({"key": "fullscreen_exit", "n": fs_n, "points": value})
+    for kind, reason_key in (("screen_share_stopped", "screen_share_stopped"),
+                             ("screen_share_unavailable", "screen_share_stopped")):
+        n = sum(1 for e in events if _event_value(e, "type") == kind)
+        if n:
+            charged = min(n, caps.get("screen_share_stopped", 2))
+            value = charged * weights.get("screen_share_stopped", 3)
+            points += value
+            reasons.append({"key": reason_key, "n": charged, "points": value})
+    for kind, reason_key in (("wrong_share_surface", "wrong_share_surface"), ("heartbeat_gap", "heartbeat_gap")):
+        n = sum(1 for e in events if _event_value(e, "type") == kind)
+        if n:
+            charged = min(n, caps.get(reason_key, 3))
+            value = charged * weights.get(reason_key, 2 if reason_key == "heartbeat_gap" else 1)
+            points += value
+            reasons.append({"key": reason_key, "n": charged, "points": value})
+    for event in events:
+        flag = _event_value(event, "hard_flag")
+        if flag:
+            hard_flags.add(str(flag))
+    fast = 0
+    question_times = question_times or {}
+    for answer in answers:
+        if answer.get("type") != "mcq" or not answer.get("correct") or answer.get("difficulty", 0) < 2:
+            continue
+        prior = question_times.get(answer.get("qid"), [])
+        threshold = sorted(prior)[max(0, int(len(prior) * 0.05) - 1)] if len(prior) >= 30 else 3
+        if float(answer.get("seconds", 999999)) < threshold:
+            fast += 1
+    fast = min(fast, caps.get("fast", 4))
+    if fast:
+        value = fast
+        points += value
+        reasons.append({"key": "fast", "n": fast, "points": value, "threshold": "question_p05_or_3s_fallback"})
+    if rules.get("normalize_per_30_minutes", True) and exam_seconds > 0:
+        points = round(points * (1800 / exam_seconds), 2)
+    label = "Needs review" if hard_flags or points >= 7 else "Medium" if points >= 3 else "High trust"
+    return {
+        "label": label, "points": points, "rule_version": rules.get("rule_version", "unknown"),
+        "reasons": reasons, "hard_flags": sorted(hard_flags),
+    }
 
 # ---------- gap map + learning path ----------
 def gap_map(topic_scores):
