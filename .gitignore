@@ -8,3 +8,5 @@ __pycache__/
 *.db
 .secret
 .pytest_cache/
+cv_files/
+data/

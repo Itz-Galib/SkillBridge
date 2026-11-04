@@ -1,0 +1,2 @@
+# Extra dependency only needed when STORAGE_BACKEND=s3
+boto3==1.35.99

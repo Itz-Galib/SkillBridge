@@ -97,6 +97,8 @@ def init_db():
             schema = schema.replace("events(id INTEGER PRIMARY KEY", "events(id BIGSERIAL PRIMARY KEY")
             schema = schema.replace("audit(id INTEGER PRIMARY KEY", "audit(id BIGSERIAL PRIMARY KEY")
         c.executescript(schema)
+    import cv_store  # CV document + extraction-draft tables (imported here to avoid a circular import)
+    cv_store.ensure_schema()
 
 
 def one(sql, args=()):
@@ -255,6 +257,9 @@ def export_data(u=Depends(current_user)):
         d[t] = [dict(r) for r in allr(f"SELECT * FROM {t} WHERE user_id=?", (u["id"],))]
     cp = one("SELECT * FROM candidate_profiles WHERE user_id=?", (u["id"],))
     d["candidate_profile"] = dict(cp) if cp else None
+    import cv_store
+    d["cv_documents"] = cv_store.list_documents(u["id"])
+    d["cv_extractions"] = cv_store.list_extractions(u["id"])
     d["applications"] = [dict(r) for r in allr("SELECT * FROM applications WHERE candidate_id=?", (u["id"],))]
     audit(u["id"], "export")
     return d
@@ -264,6 +269,8 @@ def export_data(u=Depends(current_user)):
 def delete_me(u=Depends(current_user)):
     ids = [r["id"] for r in allr("SELECT id FROM attempts WHERE user_id=?", (u["id"],))]
     for i in ids: run("DELETE FROM events WHERE attempt_id=?", (i,))
+    import cv_store
+    cv_store.delete_user_documents(u["id"])   # removes the stored CV files and extraction drafts too
     for t in ("consents", "profiles", "attempts", "passports", "candidate_profiles", "user_roles"):
         run(f"DELETE FROM {t} WHERE user_id=?", (u["id"],))
     run("DELETE FROM applications WHERE candidate_id=?", (u["id"],))
@@ -308,10 +315,22 @@ def llm_extract(redacted: str):
 @app.post("/api/cv")
 async def upload_cv(text: str = Form(""), file: Optional[UploadFile] = File(None), u=Depends(current_user)):
     need_consent(u)
-    raw = text
-    if file is not None: raw = read_upload(file.filename or "", await file.read())
+    raw, file_bytes = text, None
+    if file is not None:
+        file_bytes = await file.read()
+        raw = read_upload(file.filename or "", file_bytes)
     raw = raw.strip()
     if len(raw) < 30: raise HTTPException(422, "CV text is too short")
+    document = None
+    if file_bytes is not None:
+        # Keep the original file (local disk now, S3-compatible bucket later - see storage.py).
+        import cv_store
+        from storage import StorageError
+        try:
+            document = cv_store.save_document(u["id"], file.filename or "cv", file_bytes)
+        except StorageError as ex:
+            log.error("CV storage failed: %s", ex)
+            raise HTTPException(503, "Could not store the CV file, please try again")
     redacted, counts = E.redact(raw[:30000], [u["name"]])
     skills, source = (llm_extract(redacted) if ANTHROPIC_API_KEY else None), "llm"
     if not skills: skills, source = E.rule_extract(redacted), "rules"
@@ -320,6 +339,7 @@ async def upload_cv(text: str = Form(""), file: Optional[UploadFile] = File(None
         (u["id"], redacted, json.dumps(counts), json.dumps(skills), source))
     audit(u["id"], "cv_parsed", source)
     return {"redacted_preview": redacted[:1500], "redaction": counts, "skills": skills, "source": source,
+            "document": {k: document[k] for k in ("id", "filename", "size_bytes", "status")} if document else None,
             "taxonomy": [{"id": k, "name": v["name"]} for k, v in TAXONOMY.items()]}
 
 

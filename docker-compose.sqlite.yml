@@ -1,0 +1,25 @@
+# Local development with SQLite + local file storage (no Postgres container).
+#   cp .env.example .env
+#   docker compose -f docker-compose.sqlite.yml up --build
+# Data (database + uploaded CVs) lives in the sb_data volume at /data.
+services:
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: "" # empty = use SQLite (overrides the value in .env)
+      DB_PATH: /data/skillbridge.db
+      STORAGE_BACKEND: local
+      STORAGE_LOCAL_DIR: /data/cv_files
+    volumes:
+      - sb_data:/data
+    restart: unless-stopped
+    expose: ["8000"]
+  frontend:
+    build: ./frontend
+    depends_on: [backend]
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+volumes:
+  sb_data:
