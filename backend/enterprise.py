@@ -8,6 +8,19 @@ from content import RESOURCES, JOB
 from urllib.parse import urlparse
 
 router = APIRouter(tags=["hiring"])
+# Candidate profile drafts are private until the candidate confirms.
+run("""
+CREATE TABLE IF NOT EXISTS candidate_profile_drafts (
+    user_id INTEGER PRIMARY KEY,
+    profile_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    method TEXT NOT NULL DEFAULT 'manual',
+    document_id TEXT,
+    created REAL NOT NULL,
+    updated REAL NOT NULL,
+    confirmed_at REAL
+)
+""")
 
 def role_of(user):
     row = one("SELECT role FROM user_roles WHERE user_id=?", (user["id"],))
@@ -83,6 +96,319 @@ class CandidateProfileUpdate(BaseModel):
     projects: List[ProjectItem] = Field(default_factory=list, max_length=20)
     preferences: dict = Field(default_factory=dict)
 
+class CandidateProfileDraftInput(CandidateProfileUpdate):
+    method: Optional[str] = None
+    document_id: Optional[str] = None
+
+
+def _profile_payload(body):
+    data = body.model_dump(exclude={"method", "document_id"})
+
+    preferences = data.get("preferences") or {}
+
+    allowed_types = {
+        "Internship",
+        "Full-time",
+        "Part-time",
+        "Contract",
+        "Temporary",
+    }
+
+    allowed_modes = {
+        "Any",
+        "Remote",
+        "Hybrid",
+        "On-site",
+    }
+
+    preferences["job_types"] = [
+        x for x in preferences.get("job_types", [])
+        if x in allowed_types
+    ][:5]
+
+    mode = preferences.get("work_mode", "Any")
+    preferences["work_mode"] = (
+        mode if mode in allowed_modes else "Any"
+    )
+
+    preferences["locations"] = [
+        str(x)[:100]
+        for x in preferences.get("locations", [])[:10]
+        if str(x).strip()
+    ]
+
+    data["preferences"] = preferences
+
+    return data
+
+
+def _decode_profile_json(raw):
+    profile = json.loads(raw or "{}")
+
+    profile.setdefault("headline", "")
+    profile.setdefault("phone", "")
+    profile.setdefault("location", "")
+    profile.setdefault("summary", "")
+    profile.setdefault("linkedin", "")
+    profile.setdefault("github", "")
+    profile.setdefault("portfolio", "")
+    profile.setdefault("education", [])
+    profile.setdefault("experience", [])
+    profile.setdefault("projects", [])
+    profile.setdefault(
+        "preferences",
+        {
+            "job_types": ["Internship", "Full-time"],
+            "work_mode": "Any",
+            "locations": [],
+        },
+    )
+
+    return profile
+
+
+@router.get("/api/candidate/profile/status")
+def candidate_profile_status(user=Depends(current_user)):
+    require_role(user, "candidate")
+
+    # Existing profiles created before this feature are already confirmed.
+    existing = one(
+        "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+        (user["id"],),
+    )
+
+    if existing:
+        return {
+            "status": "confirmed",
+            "method": "existing",
+        }
+
+    draft = one(
+        """
+        SELECT status, method
+        FROM candidate_profile_drafts
+        WHERE user_id=?
+        """,
+        (user["id"],),
+    )
+
+    if not draft:
+        return {
+            "status": "not_created",
+            "method": None,
+        }
+
+    return {
+        "status": draft["status"],
+        "method": draft["method"],
+    }
+
+
+@router.get("/api/candidate/profile/draft")
+def get_candidate_profile_draft(user=Depends(current_user)):
+    require_role(user, "candidate")
+
+    draft = one(
+        """
+        SELECT profile_json, status, method, document_id
+        FROM candidate_profile_drafts
+        WHERE user_id=?
+        """,
+        (user["id"],),
+    )
+
+    if not draft:
+        raise HTTPException(404, "Profile draft not found")
+
+    if draft["status"] != "draft":
+        raise HTTPException(409, "This profile draft is no longer editable")
+
+    return {
+        "status": draft["status"],
+        "method": draft["method"],
+        "document_id": draft["document_id"],
+        "profile": _decode_profile_json(draft["profile_json"]),
+    }
+
+
+@router.put("/api/candidate/profile/draft")
+def save_candidate_profile_draft(
+    body: CandidateProfileDraftInput,
+    user=Depends(current_user),
+):
+    require_role(user, "candidate")
+
+    # Never allow a draft request to overwrite an already confirmed profile.
+    existing = one(
+        "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+        (user["id"],),
+    )
+
+    if existing:
+        raise HTTPException(
+            409,
+            "Your profile is already confirmed. Use the profile update endpoint.",
+        )
+
+    previous = one(
+        """
+        SELECT method, document_id
+        FROM candidate_profile_drafts
+        WHERE user_id=?
+        """,
+        (user["id"],),
+    )
+
+    method = body.method or (
+        previous["method"] if previous else "manual"
+    )
+
+    if method not in ("manual", "cv"):
+        raise HTTPException(422, "Method must be manual or cv")
+
+    document_id = (
+        body.document_id
+        if body.document_id is not None
+        else (previous["document_id"] if previous else None)
+    )
+
+    profile = _profile_payload(body)
+    now = time.time()
+
+    run(
+        """
+        INSERT INTO candidate_profile_drafts(
+            user_id, profile_json, status, method,
+            document_id, created, updated
+        )
+        VALUES (?, ?, 'draft', ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            profile_json=excluded.profile_json,
+            status='draft',
+            method=excluded.method,
+            document_id=excluded.document_id,
+            updated=excluded.updated
+        """,
+        (
+            user["id"],
+            json.dumps(profile),
+            method,
+            document_id,
+            now,
+            now,
+        ),
+    )
+
+    audit(user["id"], "candidate_profile_draft_saved", method)
+
+    return {
+        "ok": True,
+        "status": "draft",
+        "method": method,
+    }
+
+
+@router.post("/api/candidate/profile/confirm")
+def confirm_candidate_profile(user=Depends(current_user)):
+    require_role(user, "candidate")
+
+    draft = one(
+        """
+        SELECT *
+        FROM candidate_profile_drafts
+        WHERE user_id=?
+        """,
+        (user["id"],),
+    )
+
+    if not draft:
+        raise HTTPException(404, "Profile draft not found")
+
+    if draft["status"] != "draft":
+        raise HTTPException(409, "Profile draft is not awaiting confirmation")
+
+    profile = _decode_profile_json(draft["profile_json"])
+
+    # Require some meaningful profile information before publication.
+    has_content = any([
+        profile.get("headline", "").strip(),
+        profile.get("summary", "").strip(),
+        profile.get("location", "").strip(),
+        profile.get("education"),
+        profile.get("experience"),
+        profile.get("projects"),
+    ])
+
+    if not has_content:
+        raise HTTPException(
+            422,
+            "Please add some profile information before confirming.",
+        )
+
+    now = time.time()
+
+    # Save the confirmed profile and update draft status in one transaction.
+    from main import db, DATABASE_URL
+
+    with db() as conn:
+        if DATABASE_URL:
+            conn.execute(
+                "SELECT id FROM users WHERE id=? FOR UPDATE",
+                (user["id"],),
+            ).fetchone()
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+
+        current = conn.execute(
+            "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+            (user["id"],),
+        ).fetchone()
+
+        if current:
+            raise HTTPException(409, "Profile is already confirmed")
+
+        conn.execute(
+            """
+            INSERT INTO candidate_profiles(
+                user_id, headline, phone, location, summary,
+                linkedin, github, portfolio, education,
+                experience, projects, preferences, updated
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
+                profile["headline"].strip(),
+                profile["phone"].strip(),
+                profile["location"].strip(),
+                profile["summary"].strip(),
+                profile["linkedin"].strip(),
+                profile["github"].strip(),
+                profile["portfolio"].strip(),
+                json.dumps(profile["education"]),
+                json.dumps(profile["experience"]),
+                json.dumps(profile["projects"]),
+                json.dumps(profile["preferences"]),
+                now,
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE candidate_profile_drafts
+            SET status='confirmed', confirmed_at=?, updated=?
+            WHERE user_id=?
+            """,
+            (now, now, user["id"]),
+        )
+
+    audit(user["id"], "candidate_profile_confirmed", draft["method"])
+
+    return {
+        "ok": True,
+        "status": "confirmed",
+        "message": "Candidate profile created successfully.",
+    }
 @router.get("/api/candidate/profile")
 def get_candidate_profile(user=Depends(current_user)):
     require_role(user, "candidate")

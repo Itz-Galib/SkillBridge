@@ -271,7 +271,15 @@ def delete_me(u=Depends(current_user)):
     for i in ids: run("DELETE FROM events WHERE attempt_id=?", (i,))
     import cv_store
     cv_store.delete_user_documents(u["id"])   # removes the stored CV files and extraction drafts too
-    for t in ("consents", "profiles", "attempts", "passports", "candidate_profiles", "user_roles"):
+    for t in (
+    "consents",
+    "profiles",
+    "attempts",
+    "passports",
+    "candidate_profiles",
+    "candidate_profile_drafts",
+    "user_roles",
+    ):
         run(f"DELETE FROM {t} WHERE user_id=?", (u["id"],))
     run("DELETE FROM applications WHERE candidate_id=?", (u["id"],))
     run("DELETE FROM users WHERE id=?", (u["id"],))
@@ -311,6 +319,518 @@ def llm_extract(redacted: str):
             log.warning("LLM extraction failed: %s", type(ex).__name__)
     return None
 
+def read_profile_cv(filename: str, data: bytes):
+    """
+    Read a PDF or DOCX CV.
+    Embedded PDF text is preferred; OCR is only used for image-based pages.
+    """
+    name = (filename or "").lower()
+
+    if len(data) > 5_000_000:
+        raise HTTPException(413, "CV file must be 5 MB or smaller")
+
+    if name.endswith(".pdf"):
+        if not data.startswith(b"%PDF-"):
+            raise HTTPException(415, "Invalid PDF file")
+
+        try:
+            import fitz
+            import pytesseract
+            from PIL import Image
+
+            pdf = fitz.open(stream=data, filetype="pdf")
+
+            if pdf.needs_pass:
+                raise HTTPException(422, "Password-protected PDFs are not supported")
+
+            if pdf.page_count > 10:
+                raise HTTPException(413, "CV PDF must contain 10 pages or fewer")
+
+            page_texts = []
+            ocr_pages = []
+
+            for page_number, page in enumerate(pdf, start=1):
+                text = (page.get_text("text") or "").strip()
+
+                # Only OCR pages that have little or no embedded text.
+                if len(text) < 40:
+                    try:
+                        pixmap = page.get_pixmap(
+                            matrix=fitz.Matrix(2, 2),
+                            alpha=False,
+                        )
+
+                        image = Image.open(
+                            io.BytesIO(pixmap.tobytes("png"))
+                        )
+
+                        text = pytesseract.image_to_string(
+                            image,
+                            lang=os.getenv("TESSERACT_LANG", "eng+ben"),
+                        ).strip()
+
+                        ocr_pages.append(page_number)
+
+                    except Exception as ex:
+                        log.warning(
+                            "OCR failed on page %s: %s",
+                            page_number,
+                            type(ex).__name__,
+                        )
+
+                if text:
+                    page_texts.append(
+                        f"[Page {page_number}]\n{text}"
+                    )
+
+            pdf.close()
+
+            raw_text = "\n\n".join(page_texts)
+
+            if len(raw_text.strip()) < 30:
+                raise HTTPException(
+                    422,
+                    "Could not read enough text from this PDF. Please try another CV or enter your profile manually.",
+                )
+
+            return raw_text, {
+                "parser": "pymupdf",
+                "ocr_used": bool(ocr_pages),
+                "ocr_pages": ocr_pages,
+            }
+
+        except HTTPException:
+            raise
+        except Exception as ex:
+            log.warning("PDF parsing failed: %s", type(ex).__name__)
+            raise HTTPException(422, "Could not read this PDF file")
+
+    if name.endswith(".docx"):
+        if not data.startswith(b"PK"):
+            raise HTTPException(415, "Invalid DOCX file")
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                names = archive.namelist()
+
+                if "word/document.xml" not in names:
+                    raise HTTPException(422, "Invalid DOCX document")
+
+                if len(names) > 500:
+                    raise HTTPException(422, "DOCX contains too many internal files")
+
+                total_size = sum(item.file_size for item in archive.infolist())
+
+                if total_size > 20_000_000:
+                    raise HTTPException(413, "DOCX expands beyond the allowed size")
+
+                xml = archive.read("word/document.xml")
+
+            import xml.etree.ElementTree as ET
+
+            root = ET.fromstring(xml)
+            namespace = {
+                "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            }
+
+            paragraphs = []
+
+            for paragraph in root.findall(".//w:p", namespace):
+                parts = [
+                    node.text or ""
+                    for node in paragraph.findall(".//w:t", namespace)
+                ]
+
+                line = "".join(parts).strip()
+
+                if line:
+                    paragraphs.append(line)
+
+            raw_text = "\n".join(paragraphs)
+
+            if len(raw_text.strip()) < 30:
+                raise HTTPException(422, "Could not extract enough text from this DOCX")
+
+            return raw_text, {
+                "parser": "docx_xml",
+                "ocr_used": False,
+                "ocr_pages": [],
+            }
+
+        except HTTPException:
+            raise
+        except Exception as ex:
+            log.warning("DOCX parsing failed: %s", type(ex).__name__)
+            raise HTTPException(422, "Could not read this DOCX file")
+
+    raise HTTPException(415, "Please upload a PDF or DOCX file")
+
+
+def extract_profile_fields(raw_text: str):
+    """
+    Conservative rule-based profile extraction.
+    Missing or uncertain information is left blank rather than invented.
+    """
+    import re
+
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in raw_text.splitlines()
+    ]
+    lines = [line for line in lines if line]
+
+    text = "\n".join(lines)
+
+    profile = {
+        "headline": "",
+        "phone": "",
+        "location": "",
+        "summary": "",
+        "linkedin": "",
+        "github": "",
+        "portfolio": "",
+        "education": [],
+        "experience": [],
+        "projects": [],
+        "preferences": {
+            "job_types": ["Internship", "Full-time"],
+            "work_mode": "Any",
+            "locations": [],
+        },
+    }
+
+    evidence = []
+
+    def add_evidence(field, value, confidence, snippet=""):
+        if value is None:
+            return
+
+        if isinstance(value, str) and not value.strip():
+            return
+
+        evidence.append({
+            "field": field,
+            "value": json.dumps(value, ensure_ascii=False)
+                if isinstance(value, (list, dict))
+                else str(value),
+            "confidence": confidence,
+            "source_snippet": snippet[:600],
+            "source_location": "CV text",
+            "source": "deterministic_parser",
+        })
+
+    # Email
+    email_match = re.search(
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        text,
+    )
+
+    if email_match:
+        add_evidence(
+            "email",
+            email_match.group(0),
+            0.99,
+            email_match.group(0),
+        )
+
+    # Phone
+    phone_match = re.search(
+        r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)",
+        text,
+    )
+
+    if phone_match:
+        profile["phone"] = phone_match.group(0).strip()
+
+        add_evidence(
+            "phone",
+            profile["phone"],
+            0.80,
+            phone_match.group(0),
+        )
+
+    # Professional links
+    url_patterns = {
+        "linkedin": r"(?:https?://)?(?:www\.)?linkedin\.com/[^\s|]+",
+        "github": r"(?:https?://)?(?:www\.)?github\.com/[^\s|]+",
+    }
+
+    for field, pattern in url_patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+
+        if match:
+            value = match.group(0).rstrip(".,;)")
+            if not value.startswith("http"):
+                value = "https://" + value
+
+            profile[field] = value
+
+            add_evidence(field, value, 0.98, match.group(0))
+
+    # Portfolio: do not mistake LinkedIn/GitHub for a portfolio.
+    for match in re.finditer(r"https?://[^\s|]+", text, re.IGNORECASE):
+        url = match.group(0).rstrip(".,;)")
+
+        if "linkedin.com" not in url.lower() and "github.com" not in url.lower():
+            profile["portfolio"] = url
+            add_evidence("portfolio", url, 0.75, url)
+            break
+
+    # Section detection.
+    section_aliases = {
+        "summary": [
+            "summary",
+            "professional summary",
+            "profile",
+            "career objective",
+            "objective",
+            "about me",
+        ],
+        "education": [
+            "education",
+            "academic qualification",
+            "academic qualifications",
+        ],
+        "experience": [
+            "experience",
+            "work experience",
+            "employment history",
+            "professional experience",
+        ],
+        "projects": [
+            "projects",
+            "personal projects",
+            "academic projects",
+        ],
+    }
+
+    def normalise_heading(line):
+        return re.sub(r"[^a-z ]", "", line.lower()).strip()
+
+    heading_lookup = {}
+
+    for section, aliases in section_aliases.items():
+        for alias in aliases:
+            heading_lookup[normalise_heading(alias)] = section
+
+    sections = {}
+    current_section = None
+
+    for line in lines:
+        heading = normalise_heading(line)
+
+        if heading in heading_lookup:
+            current_section = heading_lookup[heading]
+            sections.setdefault(current_section, [])
+            continue
+
+        # A new uppercase heading ends the previous section.
+        if (
+            len(line) < 60
+            and line.isupper()
+            and re.search(r"[A-Z]", line)
+        ):
+            current_section = None
+            continue
+
+        if current_section:
+            sections[current_section].append(line)
+
+    # Summary
+    summary_lines = sections.get("summary", [])
+
+    if summary_lines:
+        summary = " ".join(summary_lines)[:3000]
+        profile["summary"] = summary
+
+        add_evidence(
+            "summary",
+            summary,
+            0.70,
+            " ".join(summary_lines)[:600],
+        )
+
+    # Education: only retain lines that explicitly resemble institution names.
+    education_lines = sections.get("education", [])
+
+    institution_words = (
+        "university",
+        "college",
+        "institute",
+        "school",
+        "academy",
+    )
+
+    for line in education_lines:
+        if any(word in line.lower() for word in institution_words):
+            item = {
+                "institution": line[:160],
+                "degree": "",
+                "field": "",
+                "start_year": "",
+                "end_year": "",
+                "details": line[:1000],
+            }
+
+            profile["education"].append(item)
+
+            add_evidence(
+                "education",
+                item,
+                0.65,
+                line,
+            )
+
+    # Projects: preserve explicit project lines without inventing details.
+    project_lines = sections.get("projects", [])
+
+    for line in project_lines:
+        cleaned = line.lstrip("•-*0123456789. ").strip()
+
+        if len(cleaned) < 3:
+            continue
+
+        if " - " in cleaned:
+            project_name, description = cleaned.split(" - ", 1)
+        elif " — " in cleaned:
+            project_name, description = cleaned.split(" — ", 1)
+        else:
+            project_name, description = cleaned, ""
+
+        item = {
+            "name": project_name[:160],
+            "description": description[:2000],
+            "technologies": [],
+            "url": "",
+        }
+
+        profile["projects"].append(item)
+
+        add_evidence(
+            "projects",
+            item,
+            0.50,
+            line,
+        )
+
+    return profile, evidence
+@app.post("/api/cv/profile-extract")
+async def upload_cv_profile(
+    file: UploadFile = File(...),
+    u=Depends(current_user),
+):
+    need_consent(u)
+
+    role = one(
+        "SELECT role FROM user_roles WHERE user_id=?",
+        (u["id"],),
+    )
+
+    if role and role["role"] != "candidate":
+        raise HTTPException(403, "Only candidates can create candidate profiles")
+
+    # A confirmed profile must be updated through the normal profile endpoint.
+    existing = one(
+        "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+        (u["id"],),
+    )
+
+    if existing:
+        raise HTTPException(
+            409,
+            "Your profile is already confirmed. Update it from My Profile.",
+        )
+
+    filename = file.filename or "cv"
+
+    # Parse first. Do not store files that fail basic validation/parsing.
+    file_bytes = await file.read()
+
+    raw_text, parser_info = read_profile_cv(filename, file_bytes)
+
+    profile, evidence = extract_profile_fields(raw_text)
+
+    import cv_store
+    from storage import StorageError
+
+    try:
+        document = cv_store.save_document(
+            u["id"],
+            filename,
+            file_bytes,
+        )
+
+        cv_store.add_extractions(
+            u["id"],
+            document["id"],
+            evidence,
+        )
+
+    except StorageError as ex:
+        log.error("CV storage failed: %s", type(ex).__name__)
+        raise HTTPException(
+            503,
+            "Could not store the CV. Please try again.",
+        )
+
+    now = time.time()
+
+    # Store the extracted profile as a private draft.
+    # This does NOT create a candidate_profiles row.
+    run(
+        """
+        INSERT INTO candidate_profile_drafts(
+            user_id,
+            profile_json,
+            status,
+            method,
+            document_id,
+            created,
+            updated
+        )
+        VALUES (?, ?, 'draft', 'cv', ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            profile_json=excluded.profile_json,
+            status='draft',
+            method='cv',
+            document_id=excluded.document_id,
+            updated=excluded.updated
+        """,
+        (
+            u["id"],
+            json.dumps(profile, ensure_ascii=False),
+            document["id"],
+            now,
+            now,
+        ),
+    )
+
+    audit(
+        u["id"],
+        "candidate_profile_cv_extracted",
+        document["id"],
+    )
+
+    return {
+        "ok": True,
+        "status": "draft",
+        "method": "cv",
+        "profile": profile,
+        "document": {
+            "id": document["id"],
+            "filename": document["filename"],
+            "size_bytes": document["size_bytes"],
+            "status": document["status"],
+        },
+        "extraction": {
+            **parser_info,
+            "fields_found": len(evidence),
+            "fields": evidence,
+        },
+        "message": (
+            "CV processed. Please review and correct your profile before confirming."
+        ),
+    }
 
 @app.post("/api/cv")
 async def upload_cv(text: str = Form(""), file: Optional[UploadFile] = File(None), u=Depends(current_user)):
