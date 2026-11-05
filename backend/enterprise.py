@@ -1459,6 +1459,8 @@ def admin_scrape_questions(body: QuestionScrapeRequest, user=Depends(current_use
         raw = dict(raw or {})
         raw.setdefault("category_id", body.category_id)
         raw.setdefault("subcategory", body.subcategory or "General")
+        # Scraped content always enters the review queue as a draft; publication is a separate admin decision.
+        raw["status"] = "draft"
         payload = _question_payload(raw, actor)
         staging_id = uuid.uuid4().hex[:12]
         run("""INSERT INTO question_import_staging(id,batch_id,source_url,category_id,subcategory,question_type,
@@ -1486,35 +1488,46 @@ def admin_questions_staging(user=Depends(current_user)):
 def admin_commit_staging(body: StagingCommitRequest, user=Depends(current_user)):
     admin_only(user, "questions")
     actor = user.get("name") or "Admin"
-    added = skipped = rejected = 0
-    for staging_id in body.question_ids:
+    added = skipped = rejected = missing = 0
+    imported_ids = []
+    for staging_id in dict.fromkeys(body.question_ids):
         row = one("SELECT * FROM question_import_staging WHERE id=?", (staging_id,))
         if not row:
+            missing += 1
             continue
-        payload = _question_payload(row, actor)
+        raw = dict(row)
+        try:
+            raw["options"] = json.loads(raw.get("options") or "[]")
+        except (TypeError, ValueError):
+            raw["options"] = []
+        payload = _question_payload(raw, actor)
         if payload["errors"]:
             rejected += 1
-            run("DELETE FROM question_import_staging WHERE id=?", (staging_id,))
             continue
-        duplicate = one("SELECT id FROM question_bank WHERE lower(question_text)=lower(?) AND category_id=?",
-                        (payload["question_text"], payload["category_id"]))
+        duplicate = one(
+            "SELECT id FROM question_bank WHERE lower(trim(question_text))=lower(trim(?)) AND category_id=?",
+            (payload["question_text"], payload["category_id"])
+        )
         if duplicate:
             skipped += 1
-            run("DELETE FROM question_import_staging WHERE id=?", (staging_id,))
             continue
         payload["id"] = uuid.uuid4().hex[:12]
+        payload["created_at"] = time.time()
         run("""INSERT INTO question_bank(id,category_id,subcategory,question_type,difficulty_level,question_text,
             options,correct_answer,explanation,reference_answer,grading_rubric,marks,time_allocation,status,
-            created_by,created_at,version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            created_by,created_at,version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (payload["id"], payload["category_id"], payload["subcategory"], payload["question_type"],
              payload["difficulty_level"], payload["question_text"], json.dumps(payload["options"]),
              payload["correct_answer"], payload["explanation"], payload["reference_answer"],
              payload["grading_rubric"], payload["marks"], payload["time_allocation"],
-             payload["status"], payload["created_by"], payload["created_at"], 1))
+             payload["status"], actor, payload["created_at"], 1))
         run("DELETE FROM question_import_staging WHERE id=?", (staging_id,))
+        imported_ids.append(payload["id"])
         added += 1
-    audit(user["id"], "question_scrape_import", f"added={added};skipped={skipped};rejected={rejected}")
-    return {"added": added, "skipped": skipped, "rejected": rejected}
+    audit(user["id"], "question_scrape_import",
+          f"added={added};skipped={skipped};rejected={rejected};missing={missing}")
+    return {"added": added, "skipped": skipped, "rejected": rejected,
+            "missing": missing, "imported_ids": imported_ids}
 
 
 @router.delete("/api/admin/questions/staging/{staging_id}")

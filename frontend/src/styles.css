@@ -607,3 +607,18 @@ summary { cursor: pointer; font-weight: 600; margin: .4rem 0; }
 .ad-staging-del{flex:0 0 auto;border:0;background:#f1f5f2;border-radius:7px;padding:5px 9px;color:#a06b6b;font-size:1rem;line-height:1;cursor:pointer}
 .ad-staging-del:hover{background:#fbeaea;color:#b5473d}
 @media(max-width:700px){.ad-staging-row{align-items:flex-start}.ad-staging-head{align-items:flex-start;flex-direction:column}.ad-scrape-sub{flex:1 1 150px}}
+
+
+/* Question import review refinements */
+.ad-staging-head{align-items:flex-start;flex-wrap:wrap}
+.ad-staging-actions{display:flex;justify-content:flex-end;flex-wrap:wrap}
+.ad-staging-ready{display:block;margin-top:5px;color:#26754b;font-size:.52rem;font-weight:700}
+.ad-staging-row:has(.ad-staging-check input:disabled){background:#fffdf9}
+.ad-staging-row .ad-staging-check input:disabled+span{opacity:.35}
+.ad-staging-main{overflow-wrap:anywhere}
+@media(max-width:700px){
+  .ad-staging-actions{justify-content:flex-start;width:100%}
+  .ad-staging-actions button{flex:1 1 auto}
+  .ad-staging-row{gap:8px;padding:10px}
+  .ad-staging-del{padding:6px 10px}
+}
