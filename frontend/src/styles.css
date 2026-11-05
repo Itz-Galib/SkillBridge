@@ -576,6 +576,11 @@ summary { cursor: pointer; font-weight: 600; margin: .4rem 0; }
 .ad-scrape-input{height:38px;min-width:220px;flex:1;padding:0 11px;border:1px solid #e1e9e3;border-radius:8px;background:#fff;color:#345044;font:500 .6rem Inter,sans-serif;outline:none}
 .ad-scrape-input:focus{border-color:#6eaa88;box-shadow:0 0 0 3px #6eaa8819}
 .ad-scrape-sub{flex:0 0 150px;min-width:150px}
+.ad-scrape-tabs{display:flex;gap:4px;width:100%;margin-bottom:2px}
+.ad-scrape-tabs button{border:1px solid #dfe8e1;border-radius:7px;background:#fff;color:#6c7f73;font:650 .56rem Inter,sans-serif;padding:7px 11px;cursor:pointer}
+.ad-scrape-tabs button.on{background:#176b55;border-color:#176b55;color:#fff}
+.ad-scrape-textarea{width:100%;min-height:150px;resize:vertical;padding:10px 11px;border:1px solid #e1e9e3;border-radius:8px;background:#fff;color:#345044;font:500 .58rem/1.5 Consolas,Menlo,monospace;outline:none}
+.ad-scrape-textarea:focus{border-color:#6eaa88;box-shadow:0 0 0 3px #6eaa8819}
 .ad-staging{grid-column:1/-1;margin-top:4px;padding-top:16px;border-top:1px solid #e6eee8}
 .ad-staging-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
 .ad-staging-head b{display:block;color:#315541;font-size:.74rem}

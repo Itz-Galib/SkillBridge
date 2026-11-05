@@ -68,3 +68,30 @@ def test_leading_header_is_dropped():
     text = "Interview Questions\n1. Explain ACID.\nA) Atomicity\nB) Consistency\nAnswer: A"
     records = Q._extract_from_text(text)
     assert records and records[0]["question_text"].startswith("Explain ACID.")
+
+
+def test_extract_from_html_handles_full_page():
+    html_text = (
+        "<html><head><title>Quiz</title></head><body>"
+        "<h1>SQL Quiz</h1>"
+        "<p>1. What does SQL stand for?</p>"
+        "<ul><li>A) Structured Query Language</li><li>B) Simple Query Language</li></ul>"
+        "<p>Answer: A</p>"
+        "</body></html>"
+    )
+    records = Q.extract_from_html(html_text, "https://example.com/quiz")
+    assert records
+    assert any("What does SQL stand for" in r["question_text"] for r in records)
+
+
+def test_extract_from_html_jsonld():
+    html_text = (
+        '<html><head><script type="application/ld+json">'
+        '{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is SQL?",'
+        '"acceptedAnswer":{"@type":"Answer","text":"A query language."}}]}'
+        "</script></head><body></body></html>"
+    )
+    records = Q.extract_from_html(html_text)
+    assert len(records) == 1
+    assert records[0]["question_text"] == "What is SQL?"
+    assert records[0]["correct_answer"] == "A query language."

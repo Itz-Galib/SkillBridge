@@ -1422,7 +1422,8 @@ def _staging_row(row):
 
 
 class QuestionScrapeRequest(BaseModel):
-    url: str = Field(min_length=8, max_length=2000)
+    url: str = Field(default="", max_length=2000)
+    html: str = Field(default="", max_length=10_000_000)
     category_id: str = Field(default="")
     subcategory: str = Field(default="", max_length=100)
 
@@ -1436,13 +1437,21 @@ def admin_scrape_questions(body: QuestionScrapeRequest, user=Depends(current_use
     admin_only(user, "questions")
     if not body.category_id or body.category_id not in QUESTION_CATEGORY_BY_ID:
         raise HTTPException(422, "Choose a valid default category for the scraped questions.")
-    from question_scraper import scrape_url
-    try:
-        final_url, records = scrape_url(body.url)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc))
+    from question_scraper import scrape_url, extract_from_html
+    if body.html.strip():
+        # Admin provided saved HTML directly (useful for sites that block
+        # automated fetching). No outbound request is made for this path.
+        source = body.url.strip() or "pasted-html"
+        records = extract_from_html(body.html)
+    else:
+        if not body.url.strip():
+            raise HTTPException(422, "Provide a URL, or paste the page's HTML.")
+        try:
+            source, records = scrape_url(body.url)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
     if not records:
-        raise HTTPException(422, "No questions could be extracted from that URL. The page may not use a recognised question format (try a JSON-LD Quiz/FAQ page or a numbered MCQ list).")
+        raise HTTPException(422, "No questions could be extracted. The page may not use a recognised question format (try a JSON-LD Quiz/FAQ page or a numbered MCQ list).")
     actor = user.get("name") or "Admin"
     batch_id = uuid.uuid4().hex
     items = []
@@ -1455,14 +1464,14 @@ def admin_scrape_questions(body: QuestionScrapeRequest, user=Depends(current_use
         run("""INSERT INTO question_import_staging(id,batch_id,source_url,category_id,subcategory,question_type,
             difficulty_level,question_text,options,correct_answer,explanation,reference_answer,grading_rubric,
             marks,time_allocation,status,raw,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (staging_id, batch_id, final_url, payload["category_id"] or "", payload["subcategory"],
+            (staging_id, batch_id, source, payload["category_id"] or "", payload["subcategory"],
              payload["question_type"], payload["difficulty_level"], payload["question_text"],
              json.dumps(payload["options"]), payload["correct_answer"], payload["explanation"],
              payload["reference_answer"], payload["grading_rubric"], payload["marks"], payload["time_allocation"],
              payload["status"], json.dumps(raw), actor, time.time()))
         items.append(_staging_row(one("SELECT * FROM question_import_staging WHERE id=?", (staging_id,))))
-    audit(user["id"], "question_scrape_staged", f"{final_url};count={len(items)};batch={batch_id}")
-    return {"batch_id": batch_id, "source_url": final_url, "total": len(items), "items": items}
+    audit(user["id"], "question_scrape_staged", f"{source};count={len(items)};batch={batch_id}")
+    return {"batch_id": batch_id, "source_url": source, "total": len(items), "items": items}
 
 
 @router.get("/api/admin/questions/staging")

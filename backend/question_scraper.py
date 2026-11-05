@@ -9,6 +9,7 @@ auto-published. No live AI grading is used anywhere in the pipeline.
 """
 import ipaddress
 import json
+import os
 import re
 import socket
 from html.parser import HTMLParser
@@ -19,7 +20,29 @@ import httpx
 MAX_BYTES = 5_000_000
 TIMEOUT_SECONDS = 20.0
 MAX_QUESTIONS = 1000
-USER_AGENT = "SkillBridgeQuestionScraper/0.1 (admin question-bank curation)"
+MAX_HTML_BYTES = 10_000_000
+
+# A realistic browser User-Agent. Many sites block obvious bot agents; a browser
+# UA avoids the simplest 403s. Admins can override it via SCRAPER_USER_AGENT.
+USER_AGENT = os.environ.get("SCRAPER_USER_AGENT") or (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _browser_headers():
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
 
 
 # --------------------------------------------------------------------- SSRF
@@ -115,6 +138,9 @@ class _TextExtractor(HTMLParser):
         if self._heading is not None:
             self._heading.append(data)
         self.parts.append(data)
+
+    def text(self):
+        return "".join(self.parts)
 
 
 def _clean(s):
@@ -290,31 +316,8 @@ def _list_item_fallback(items):
 
 
 # ------------------------------------------------------------------- entry
-def scrape_url(url):
-    """Fetch a URL and return (final_url, records). Raises ValueError on bad input."""
-    url = (url or "").strip()
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("Only http:// and https:// URLs are supported.")
-    if not parsed.hostname:
-        raise ValueError("Invalid URL.")
-    _assert_public_host(parsed.hostname)
-
-    headers = {"User-Agent": USER_AGENT,
-               "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"}
-    try:
-        with httpx.Client(follow_redirects=True, timeout=TIMEOUT_SECONDS, headers=headers) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise ValueError("Could not fetch the URL: " + str(exc)[:160]) from exc
-
-    body = resp.content
-    if len(body) > MAX_BYTES:
-        raise ValueError("Page is larger than 5 MB.")
-    text = body.decode("utf-8", "ignore")
-    final_url = str(resp.url)
-
+def extract_from_html(text, source_url=""):
+    """Extract question records from already-fetched HTML/JSON text."""
     records = _jsonld_questions(_maybe_jsonld(text))
 
     if not records:
@@ -329,8 +332,42 @@ def scrape_url(url):
         extractor.close()
         records = _list_item_fallback(extractor.list_items)
 
-    records = records[:MAX_QUESTIONS]
-    return final_url, records
+    return records[:MAX_QUESTIONS]
+
+
+def scrape_url(url):
+    """Fetch a URL and return (final_url, records). Raises ValueError on bad input."""
+    url = (url or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http:// and https:// URLs are supported.")
+    if not parsed.hostname:
+        raise ValueError("Invalid URL.")
+    _assert_public_host(parsed.hostname)
+
+    try:
+        with httpx.Client(follow_redirects=True, timeout=TIMEOUT_SECONDS, headers=_browser_headers()) as client:
+            resp = client.get(url)
+    except httpx.HTTPError as exc:
+        raise ValueError("Could not fetch the URL: " + str(exc)[:160]) from exc
+
+    if resp.status_code == 403:
+        raise ValueError(
+            "The site returned 403 Forbidden. It is likely protected by a bot filter "
+            "(for example Cloudflare) that blocks automated requests. Changing the "
+            "User-Agent will not reliably bypass this. Open the page in your browser "
+            "and save or copy its HTML, then use the 'Paste HTML' option instead."
+        )
+    if resp.status_code >= 400:
+        raise ValueError(f"The site returned HTTP {resp.status_code} and could not be fetched.")
+
+    body = resp.content
+    if len(body) > MAX_BYTES:
+        raise ValueError("Page is larger than 5 MB.")
+    text = body.decode("utf-8", "ignore")
+    final_url = str(resp.url)
+
+    return final_url, extract_from_html(text, final_url)
 
 
 def _maybe_jsonld(html_text):
