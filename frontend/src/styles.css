@@ -622,3 +622,27 @@ summary { cursor: pointer; font-weight: 600; margin: .4rem 0; }
   .ad-staging-row{gap:8px;padding:10px}
   .ad-staging-del{padding:6px 10px}
 }
+
+
+/* Dynamic question category management */
+.ad-category-manager{display:grid;grid-template-columns:minmax(220px,1fr) minmax(280px,1.2fr);gap:16px;align-items:center;padding:18px 20px;margin:16px 0;border:1px solid #e4ebe5;border-radius:16px;background:linear-gradient(135deg,#fbfdfb,#f5f9f6)}
+.ad-category-manager h3{margin:5px 0 4px;color:#244d37;font-size:1rem}
+.ad-category-manager p{margin:0;color:#7a897f;font-size:.68rem;line-height:1.55}
+.ad-category-manager form{display:flex;gap:8px;min-width:0}
+.ad-category-manager form input{flex:1;min-width:0;border:1px solid #dce6de;border-radius:9px;padding:11px 12px;background:white;color:#294c38;font:inherit;font-size:.7rem}
+.ad-category-manager form input:focus{outline:2px solid #b9d9c3;border-color:#6da782}
+.ad-category-manager form button{white-space:nowrap}
+.ad-category-chips{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:7px;padding-top:4px}
+.ad-category-chips button{display:inline-flex;align-items:center;gap:9px;border:1px solid #e0e9e2;border-radius:999px;padding:7px 11px;background:#fff;color:#557060;font-size:.62rem;cursor:pointer}
+.ad-category-chips button span{display:grid;place-items:center;min-width:20px;height:20px;border-radius:50%;background:#eff5f0;color:#42674e;font-weight:800}
+.ad-category-chips button.on{border-color:#75ae88;background:#eaf5ed;color:#245c38}
+.ad-category-chips button.on span{background:#d4ead9}
+.ad-scrape-panel form select{min-height:40px;border:1px solid #dce6de;border-radius:8px;padding:8px 10px;background:#fff;color:#365642;font:inherit;font-size:.68rem}
+@media(max-width:760px){
+ .ad-category-manager{grid-template-columns:1fr;padding:15px}
+ .ad-category-manager form{flex-wrap:wrap}
+ .ad-category-manager form input{flex-basis:100%}
+ .ad-category-manager form button{width:100%}
+ .ad-category-chips{gap:6px}
+ .ad-category-chips button{font-size:.58rem;padding:6px 9px}
+}

@@ -809,6 +809,10 @@ def ensure_admin_console_schema():
         """CREATE TABLE IF NOT EXISTS admin_staff_roles (
             user_id INTEGER PRIMARY KEY, admin_role TEXT NOT NULL DEFAULT 'super_admin',
             updated_by INTEGER NOT NULL, updated_at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS question_categories (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL DEFAULT '',
+            icon TEXT NOT NULL DEFAULT '◇', subcategories TEXT NOT NULL DEFAULT '[]',
+            created_by TEXT NOT NULL DEFAULT 'System', created_at REAL NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS question_bank (
             id TEXT PRIMARY KEY, category_id TEXT NOT NULL, subcategory TEXT NOT NULL DEFAULT '',
             question_type TEXT NOT NULL, difficulty_level TEXT NOT NULL, question_text TEXT NOT NULL,
@@ -825,7 +829,10 @@ def ensure_admin_console_schema():
             explanation TEXT NOT NULL DEFAULT '', reference_answer TEXT NOT NULL DEFAULT '',
             grading_rubric TEXT NOT NULL DEFAULT '', marks INTEGER NOT NULL DEFAULT 1,
             time_allocation INTEGER NOT NULL DEFAULT 60, status TEXT NOT NULL DEFAULT 'draft',
-            raw TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at REAL NOT NULL)"""
+            raw TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at REAL NOT NULL)""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_question_categories_name_ci ON question_categories(lower(name))",
+        "CREATE INDEX IF NOT EXISTS idx_question_bank_category_status ON question_bank(category_id,status)",
+        "CREATE INDEX IF NOT EXISTS idx_question_staging_category ON question_import_staging(category_id)"
     ]:
         run(statement)
     # Existing internally provisioned admin accounts retain their current authority.
@@ -1210,6 +1217,70 @@ QUESTION_CATEGORIES = [
 QUESTION_CATEGORY_BY_ID = {x["id"]:x for x in QUESTION_CATEGORIES}
 QUESTION_CATEGORY_BY_NAME = {x["name"].lower():x["id"] for x in QUESTION_CATEGORIES}
 
+
+def _ensure_question_category(value, actor="Admin"):
+    name = re.sub(r"\s+", " ", str(value or "").strip())[:80] or "Uncategorized"
+    existing = one("SELECT * FROM question_categories WHERE lower(name)=lower(?)", (name,))
+    if existing:
+        return dict(existing)
+    base = re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")[:24] or "CUSTOM"
+    category_id = "CAT-" + base
+    if one("SELECT id FROM question_categories WHERE id=?", (category_id,)):
+        category_id = "CAT-" + base[:16] + "-" + uuid.uuid4().hex[:6].upper()
+    run("INSERT INTO question_categories(id,name,description,icon,subcategories,created_by,created_at) VALUES (?,?,?,?,?,?,?)",
+        (category_id,name,"Automatically created from imported question metadata","◇","[]",actor,time.time()))
+    return dict(one("SELECT * FROM question_categories WHERE id=?", (category_id,)))
+
+
+def _seed_question_categories():
+    for category in QUESTION_CATEGORIES:
+        if not one("SELECT id FROM question_categories WHERE id=?", (category["id"],)):
+            run("INSERT INTO question_categories(id,name,description,icon,subcategories,created_by,created_at) VALUES (?,?,?,?,?,?,?)",
+                (category["id"],category["name"],category.get("description",""),category.get("icon","◇"),
+                 json.dumps(category.get("subcategories",[])),"System",time.time()))
+
+
+_seed_question_categories()
+
+
+def _guess_question_category(question_text):
+    text = str(question_text or "").lower()
+    rules = [
+        ("Scenario-Based", ("scenario", "production issue", "your team", "your application", "suppose you", "what would you do", "how would you handle")),
+        ("RAG & AI", ("rag", "retrieval augmented", "embedding", "vector database", "llm", "large language model", "prompt engineering", "ai agent")),
+        ("System Design", ("design a system", "system architecture", "scalability", "high availability", "load balancer", "distributed system", "rate limiting")),
+        ("SQL", ("sql", "select ", "join ", "database query", "normalization", "foreign key", "indexing")),
+        ("Java", ("java", "jvm", "spring boot", "garbage collection")),
+        ("DSA", ("data structure", "algorithm", "big-o", "time complexity", "binary tree", "linked list", "graph traversal", "dynamic programming")),
+        ("Coding", ("write a program", "write code", "implement ", "function that", "debug the following", "complete the code", "write a function")),
+        ("IQ & Aptitude", ("sequence", "next number", "probability", "logical reasoning", "aptitude", "pattern is", "odd one out")),
+        ("CS Fundamentals", ("operating system", "process scheduling", "deadlock", "computer network", "tcp/ip", "oop", "compiler", "software engineering")),
+    ]
+    for category, keywords in rules:
+        if any(keyword in text for keyword in keywords):
+            return category
+    return ""
+
+
+def _infer_question_type(question_text, options=None, requested=""):
+    options = options if isinstance(options,list) else []
+    label = str(requested or "").strip().lower()
+    if len(options) >= 2:
+        return "MCQ"
+    text = str(question_text or "").lower()
+    coding_terms = ("write a program","write code","implement ","function that","code to ",
+                    "debug the following","complete the code","write a function","sql query to",
+                    "predict the output","find the output","what is the output","trace this code",
+                    "def ","print(","#include","public static","console.log(")
+    scenario_terms = ("scenario","you are given","you are working","in a production","suppose that",
+                      "your team","your application","in this situation","what would you do","how would you handle")
+    if any(term in text for term in coding_terms) or label in ("coding","code","programming"):
+        return "Coding"
+    if any(term in text for term in scenario_terms) or label in ("scenario","scenario-based","case study"):
+        return "Scenario-Based"
+    return "Explainable"
+
+
 def _seed_question_bank():
     if one("SELECT id FROM question_bank LIMIT 1"):
         return
@@ -1230,10 +1301,15 @@ def _seed_question_bank():
 
 def _question_payload(raw, actor="Admin"):
     raw = dict(raw or {})
-    category = str(raw.get("category_id") or raw.get("category") or "").strip()
+    category_hint = str(raw.get("category") or raw.get("topic") or raw.get("skill") or "").strip()
+    supplied_id = str(raw.get("category_id") or "").strip()
+    category = category_hint or supplied_id
     category_id = category.upper() if category.upper() in QUESTION_CATEGORY_BY_ID else QUESTION_CATEGORY_BY_NAME.get(category.lower())
+    if category and not category_id:
+        existing_category = one("SELECT id FROM question_categories WHERE id=? OR lower(name)=lower(?)", (category, category))
+        category_id = existing_category["id"] if existing_category else None
     qtext = str(raw.get("question_text") or raw.get("question") or raw.get("prompt") or "").strip()
-    qtype = str(raw.get("question_type") or raw.get("type") or ("MCQ" if raw.get("options") else "Short Answer")).strip()
+    requested_type = str(raw.get("question_type") or raw.get("type") or "").strip()
     difficulty = str(raw.get("difficulty_level") or raw.get("difficulty") or "Medium").strip().title()
     if difficulty not in ("Easy","Medium","Hard"):
         difficulty = {"1":"Easy","2":"Medium","3":"Hard"}.get(difficulty,"")
@@ -1243,6 +1319,8 @@ def _question_payload(raw, actor="Admin"):
         except Exception: options=[x.strip() for x in re.split(r"\s*[|;]\s*",options) if x.strip()]
     if not isinstance(options,list): options=[]
     options=[str(x).strip() for x in options if str(x).strip()]
+    qtype = _infer_question_type(qtext, options, requested_type)
+    category_id = _ensure_question_category(category_id or category or _guess_question_category(qtext) or "Uncategorized", actor)["id"]
     try: marks=int(raw.get("marks") or 1)
     except (TypeError,ValueError): marks=0
     try:
@@ -1264,7 +1342,7 @@ def _question_payload(raw, actor="Admin"):
     if status not in ("draft","active","archived"): errors.append("Status must be Draft, Active or Archived.")
     if len(qtext)>10000: errors.append("Question text is too long.")
     if len(options)>10: errors.append("A question can have at most 10 options.")
-    if qtype.lower() in ("mcq","multiple choice") and len(options)<2: errors.append("MCQ requires at least two options.")
+    if qtype == "MCQ" and len(options)<2: errors.append("MCQ requires at least two options.")
     return {"id":str(raw.get("id") or uuid.uuid4().hex[:12]),"category_id":category_id or "",
         "subcategory":str(raw.get("subcategory") or "General").strip()[:100],"question_type":qtype[:40],
         "difficulty_level":difficulty,"question_text":qtext,"options":options,
@@ -1287,12 +1365,35 @@ def admin_questions(user=Depends(current_user)):
     admin_only(user, "questions")
     _seed_question_bank()
     items=[_question_row(r) for r in allr("SELECT * FROM question_bank ORDER BY created_at DESC")]
-    counts={c["id"]:0 for c in QUESTION_CATEGORIES}
+    category_rows=allr("SELECT * FROM question_categories ORDER BY lower(name)")
+    counts={}
     for q in items: counts[q["category_id"]]=counts.get(q["category_id"],0)+1
-    return {"items":items,"categories":[{**c,"count":counts.get(c["id"],0)} for c in QUESTION_CATEGORIES],
+    categories=[]
+    for row in category_rows:
+        c=dict(row)
+        try: c["subcategories"]=json.loads(c.get("subcategories") or "[]")
+        except Exception: c["subcategories"]=[]
+        c["count"]=counts.get(c["id"],0)
+        categories.append(c)
+    return {"items":items,"categories":categories,
         "summary":{"total":len(items),"active":sum(q["status"]=="active" for q in items),
         "draft":sum(q["status"]=="draft" for q in items),"archived":sum(q["status"]=="archived" for q in items)},
         "governance":"Database-backed question bank with versioned edits, explicit status and audited imports."}
+
+@router.post("/api/admin/questions/categories")
+def admin_create_question_category(body: dict, user=Depends(current_user)):
+    admin_only(user, "questions")
+    name = re.sub(r"\s+", " ", str(body.get("name") or "").strip())[:80]
+    if len(name) < 2:
+        raise HTTPException(422, "Category name must contain at least 2 characters.")
+    if one("SELECT id FROM question_categories WHERE lower(name)=lower(?)", (name,)):
+        raise HTTPException(409, "This category already exists.")
+    category = _ensure_question_category(name, user.get("name") or "Admin")
+    audit(user["id"], "question_category_created", category["id"] + ":" + name)
+    category["subcategories"] = []
+    category["count"] = 0
+    return category
+
 
 @router.post("/api/admin/questions")
 def admin_create_question(body: dict, user=Depends(current_user)):
@@ -1424,7 +1525,7 @@ def _staging_row(row):
 class QuestionScrapeRequest(BaseModel):
     url: str = Field(default="", max_length=2000)
     html: str = Field(default="", max_length=10_000_000)
-    category_id: str = Field(default="")
+    category_id: str = Field(default="", max_length=80)
     subcategory: str = Field(default="", max_length=100)
 
 
@@ -1435,8 +1536,8 @@ class StagingCommitRequest(BaseModel):
 @router.post("/api/admin/questions/scrape")
 def admin_scrape_questions(body: QuestionScrapeRequest, user=Depends(current_user)):
     admin_only(user, "questions")
-    if not body.category_id or body.category_id not in QUESTION_CATEGORY_BY_ID:
-        raise HTTPException(422, "Choose a valid default category for the scraped questions.")
+    if body.category_id:
+        _ensure_question_category(body.category_id, user.get("name") or "Admin")
     from question_scraper import scrape_url, extract_from_html
     if body.html.strip():
         # Admin provided saved HTML directly (useful for sites that block
