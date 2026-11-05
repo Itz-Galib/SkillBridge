@@ -816,7 +816,16 @@ def ensure_admin_console_schema():
             explanation TEXT NOT NULL DEFAULT '', reference_answer TEXT NOT NULL DEFAULT '',
             grading_rubric TEXT NOT NULL DEFAULT '', marks INTEGER NOT NULL DEFAULT 1,
             time_allocation INTEGER NOT NULL DEFAULT 60, status TEXT NOT NULL DEFAULT 'draft',
-            created_by TEXT NOT NULL, created_at REAL NOT NULL, version INTEGER NOT NULL DEFAULT 1)"""
+            created_by TEXT NOT NULL, created_at REAL NOT NULL, version INTEGER NOT NULL DEFAULT 1)""",
+        """CREATE TABLE IF NOT EXISTS question_import_staging (
+            id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, source_url TEXT NOT NULL DEFAULT '',
+            category_id TEXT NOT NULL DEFAULT '', subcategory TEXT NOT NULL DEFAULT '',
+            question_type TEXT NOT NULL, difficulty_level TEXT NOT NULL, question_text TEXT NOT NULL,
+            options TEXT NOT NULL DEFAULT '[]', correct_answer TEXT NOT NULL DEFAULT '',
+            explanation TEXT NOT NULL DEFAULT '', reference_answer TEXT NOT NULL DEFAULT '',
+            grading_rubric TEXT NOT NULL DEFAULT '', marks INTEGER NOT NULL DEFAULT 1,
+            time_allocation INTEGER NOT NULL DEFAULT 60, status TEXT NOT NULL DEFAULT 'draft',
+            raw TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at REAL NOT NULL)"""
     ]:
         run(statement)
     # Existing internally provisioned admin accounts retain their current authority.
@@ -1388,6 +1397,129 @@ def admin_commit_question_import(body: QuestionImportCommit,user=Depends(current
         added+=1
     audit(user["id"],"question_bulk_import",f"added={added};skipped={skipped};rejected={rejected}")
     return {"added":added,"skipped":skipped,"rejected":rejected}
+
+
+# ---------------------------------------------------------------------------
+# URL scraping → staging table → selective import.
+# Admin supplies a URL; the backend fetches and extracts question/answer pairs,
+# normalises them into the question-bank format and stores them in a staging
+# table. The admin reviews and selects which staged questions to commit to the
+# real question_bank. No question is auto-published; scoring stays answer-key
+# based and there is no AI grading anywhere in this flow.
+def _staging_row(row):
+    item = dict(row)
+    try: item["options"] = json.loads(item.get("options") or "[]")
+    except Exception: item["options"] = []
+    try: item["raw"] = json.loads(item.get("raw") or "{}")
+    except Exception: item["raw"] = {}
+    payload = _question_payload(item, item.get("created_by") or "Admin")
+    item["errors"] = payload["errors"]
+    dup = one("SELECT id FROM question_bank WHERE lower(question_text)=lower(?) AND category_id=?",
+              (payload["question_text"], payload["category_id"])) if payload["question_text"] and payload["category_id"] else None
+    item["duplicate"] = bool(dup)
+    item["created_date"] = item.pop("created_at", None)
+    return item
+
+
+class QuestionScrapeRequest(BaseModel):
+    url: str = Field(min_length=8, max_length=2000)
+    category_id: str = Field(default="")
+    subcategory: str = Field(default="", max_length=100)
+
+
+class StagingCommitRequest(BaseModel):
+    question_ids: List[str] = Field(default_factory=list, max_length=1000)
+
+
+@router.post("/api/admin/questions/scrape")
+def admin_scrape_questions(body: QuestionScrapeRequest, user=Depends(current_user)):
+    admin_only(user, "questions")
+    if not body.category_id or body.category_id not in QUESTION_CATEGORY_BY_ID:
+        raise HTTPException(422, "Choose a valid default category for the scraped questions.")
+    from question_scraper import scrape_url
+    try:
+        final_url, records = scrape_url(body.url)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    if not records:
+        raise HTTPException(422, "No questions could be extracted from that URL. The page may not use a recognised question format (try a JSON-LD Quiz/FAQ page or a numbered MCQ list).")
+    actor = user.get("name") or "Admin"
+    batch_id = uuid.uuid4().hex
+    items = []
+    for raw in records:
+        raw = dict(raw or {})
+        raw.setdefault("category_id", body.category_id)
+        raw.setdefault("subcategory", body.subcategory or "General")
+        payload = _question_payload(raw, actor)
+        staging_id = uuid.uuid4().hex[:12]
+        run("""INSERT INTO question_import_staging(id,batch_id,source_url,category_id,subcategory,question_type,
+            difficulty_level,question_text,options,correct_answer,explanation,reference_answer,grading_rubric,
+            marks,time_allocation,status,raw,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (staging_id, batch_id, final_url, payload["category_id"] or "", payload["subcategory"],
+             payload["question_type"], payload["difficulty_level"], payload["question_text"],
+             json.dumps(payload["options"]), payload["correct_answer"], payload["explanation"],
+             payload["reference_answer"], payload["grading_rubric"], payload["marks"], payload["time_allocation"],
+             payload["status"], json.dumps(raw), actor, time.time()))
+        items.append(_staging_row(one("SELECT * FROM question_import_staging WHERE id=?", (staging_id,))))
+    audit(user["id"], "question_scrape_staged", f"{final_url};count={len(items)};batch={batch_id}")
+    return {"batch_id": batch_id, "source_url": final_url, "total": len(items), "items": items}
+
+
+@router.get("/api/admin/questions/staging")
+def admin_questions_staging(user=Depends(current_user)):
+    admin_only(user, "questions")
+    rows = allr("SELECT * FROM question_import_staging ORDER BY created_at DESC, id")
+    items = [_staging_row(r) for r in rows]
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/api/admin/questions/staging/commit")
+def admin_commit_staging(body: StagingCommitRequest, user=Depends(current_user)):
+    admin_only(user, "questions")
+    actor = user.get("name") or "Admin"
+    added = skipped = rejected = 0
+    for staging_id in body.question_ids:
+        row = one("SELECT * FROM question_import_staging WHERE id=?", (staging_id,))
+        if not row:
+            continue
+        payload = _question_payload(row, actor)
+        if payload["errors"]:
+            rejected += 1
+            run("DELETE FROM question_import_staging WHERE id=?", (staging_id,))
+            continue
+        duplicate = one("SELECT id FROM question_bank WHERE lower(question_text)=lower(?) AND category_id=?",
+                        (payload["question_text"], payload["category_id"]))
+        if duplicate:
+            skipped += 1
+            run("DELETE FROM question_import_staging WHERE id=?", (staging_id,))
+            continue
+        payload["id"] = uuid.uuid4().hex[:12]
+        run("""INSERT INTO question_bank(id,category_id,subcategory,question_type,difficulty_level,question_text,
+            options,correct_answer,explanation,reference_answer,grading_rubric,marks,time_allocation,status,
+            created_by,created_at,version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (payload["id"], payload["category_id"], payload["subcategory"], payload["question_type"],
+             payload["difficulty_level"], payload["question_text"], json.dumps(payload["options"]),
+             payload["correct_answer"], payload["explanation"], payload["reference_answer"],
+             payload["grading_rubric"], payload["marks"], payload["time_allocation"],
+             payload["status"], payload["created_by"], payload["created_at"], 1))
+        run("DELETE FROM question_import_staging WHERE id=?", (staging_id,))
+        added += 1
+    audit(user["id"], "question_scrape_import", f"added={added};skipped={skipped};rejected={rejected}")
+    return {"added": added, "skipped": skipped, "rejected": rejected}
+
+
+@router.delete("/api/admin/questions/staging/{staging_id}")
+def admin_delete_staging_item(staging_id: str, user=Depends(current_user)):
+    admin_only(user, "questions")
+    run("DELETE FROM question_import_staging WHERE id=?", (staging_id,))
+    return {"deleted": True}
+
+
+@router.delete("/api/admin/questions/staging")
+def admin_clear_staging(user=Depends(current_user)):
+    admin_only(user, "questions")
+    run("DELETE FROM question_import_staging")
+    return {"deleted": True}
 
 
 @router.get("/api/admin/ai-operations")

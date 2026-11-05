@@ -1,6 +1,11 @@
+# SkillBridge uses an external Neon PostgreSQL database (DATABASE_URL from .env).
+# A local Postgres container is kept as an optional fallback behind the "localdb"
+# profile: `docker compose --profile localdb up`. To use it, point DATABASE_URL in
+# .env at postgresql://skillbridge:skillbridge_dev_password@db:5432/skillbridge.
 services:
   db:
     image: postgres:16-alpine
+    profiles: ["localdb"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-skillbridge}
       POSTGRES_USER: ${POSTGRES_USER:-skillbridge}
@@ -17,11 +22,8 @@ services:
     build: ./backend
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-skillbridge}:${POSTGRES_PASSWORD:-skillbridge_dev_password}@db:5432/${POSTGRES_DB:-skillbridge}
+      DATABASE_URL: ${DATABASE_URL}
       DB_PATH: /data/skillbridge.db
-    depends_on:
-      db:
-        condition: service_healthy
     volumes:
       - sb_data:/data
     restart: unless-stopped

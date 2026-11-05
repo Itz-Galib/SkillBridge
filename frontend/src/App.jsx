@@ -864,6 +864,8 @@ function AdminConsole({ onLogout }) {
   const [questionModal,setQuestionModal]=useState(false),[questionEditing,setQuestionEditing]=useState(null),[questionSaving,setQuestionSaving]=useState(false);
   const [questionDraft,setQuestionDraft]=useState({category_id:"CAT-01",subcategory:"",question_type:"MCQ",difficulty_level:"Medium",question_text:"",options:"",correct_answer:"",explanation:"",reference_answer:"",grading_rubric:"",marks:2,time_minutes:2,status:"draft"});
   const [importFile,setImportFile]=useState(null),[importCategory,setImportCategory]=useState("CAT-01"),[importPreview,setImportPreview]=useState(null),[importBusy,setImportBusy]=useState(false);
+  const [scrapeUrl,setScrapeUrl]=useState(""),[scrapeCategory,setScrapeCategory]=useState("CAT-01"),[scrapeSubcategory,setScrapeSubcategory]=useState(""),[scrapeBusy,setScrapeBusy]=useState(false);
+  const [stagingSelected,setStagingSelected]=useState({}),[stagingBusy,setStagingBusy]=useState(false);
   const nav=[
     ["overview","Overview","⌂"],["users","Users & accounts","♙"],["staff","Admin staff & roles","♜"],["companies","Company verification","▣"],
     ["jobs","Job moderation","▤"],["assessments","Assessment reviews","◎"],["integrity","Exam integrity","◈"],["appeals","Candidate appeals","⚑"],
@@ -876,7 +878,7 @@ function AdminConsole({ onLogout }) {
     const endpoints={
       overview:"/admin/console/overview",users:"/admin/console/users",staff:"/admin/console/staff",companies:"/admin/console/company-verifications",
       jobs:"/admin/console/job-review-queue",assessments:"/admin/assessment-reviews",integrity:"/admin/integrity/attempts",appeals:"/admin/appeals",
-      questions:"/admin/questions",graphrag:"/admin/assessment/graphrag/status",learning:"/admin/learning",ai:"/admin/ai-operations",billing:"/admin/billing",privacy:"/admin/privacy",
+      questions:"/admin/questions",graphrag:"/admin/assessment/graphrag/status",staging:"/admin/questions/staging",learning:"/admin/learning",ai:"/admin/ai-operations",billing:"/admin/billing",privacy:"/admin/privacy",
       quality:"/admin/quality",audit:"/admin/audit-logs",phaseTwo:"/admin/phase-two-requests"
     };
     const keys=Object.keys(endpoints);
@@ -942,6 +944,28 @@ function AdminConsole({ onLogout }) {
       setImportPreview(null);setImportFile(null);flash("Import complete · "+result.added+" added · "+result.skipped+" duplicates skipped · "+result.rejected+" rejected.");await load();
     }catch(x){setError(x.message||"Import could not be completed.");}finally{setImportBusy(false);}
   };
+  const runScrape=async(e)=>{
+    e.preventDefault();if(!scrapeUrl.trim())return;setScrapeBusy(true);setError("");setStagingSelected({});
+    try{
+      const result=await api("/admin/questions/scrape",{method:"POST",body:{url:scrapeUrl.trim(),category_id:scrapeCategory,subcategory:scrapeSubcategory.trim()}});
+      flash("Scraped "+result.total+" questions into staging from "+result.source_url+" · review and select which to import.");await load();
+    }catch(x){setError(x.message||"Scraping failed.");}finally{setScrapeBusy(false);}
+  };
+  const toggleStaging=(id,on)=>{setStagingSelected(s=>{const n={...s};if(on)n[id]=true;else delete n[id];return n;});};
+  const commitStaging=async()=>{
+    const ids=Object.keys(stagingSelected).filter(k=>stagingSelected[k]);
+    if(!ids.length){flash("Select at least one staged question to import.");return;}
+    setStagingBusy(true);setError("");
+    try{const result=await api("/admin/questions/staging/commit",{method:"POST",body:{question_ids:ids}});
+      setStagingSelected({});flash("Import complete · "+result.added+" added · "+result.skipped+" duplicates skipped · "+result.rejected+" rejected.");await load();
+    }catch(x){setError(x.message||"Could not import selected questions.");}finally{setStagingBusy(false);}
+  };
+  const clearStaging=async()=>{
+    setStagingBusy(true);setError("");
+    try{await api("/admin/questions/staging",{method:"DELETE"});setStagingSelected({});flash("Staging table cleared.");await load();}
+    catch(x){setError(x.message||"Could not clear staging.");}finally{setStagingBusy(false);}
+  };
+  const deleteStagingItem=async(id)=>{setStagingBusy(true);try{await api("/admin/questions/staging/"+encodeURIComponent(id),{method:"DELETE"});setStagingSelected(s=>{const n={...s};delete n[id];return n;});await load();}catch(x){setError(x.message||"Could not remove that staged question.");}finally{setStagingBusy(false);}};
   const printAssessmentReport=(report)=>{
     const esc=(v)=>String(v??"—").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
     const evidence=report.answer_evidence||[];
@@ -997,6 +1021,7 @@ function AdminConsole({ onLogout }) {
         {page==="appeals"&&<section className="ad-panel"><div className="ad-panel-head"><div><h2>Candidate appeals</h2><p>Appeals should be reviewed independently where staffing permits.</p></div><span className="ad-count">{rows("appeals").length} appeals</span></div>{table(["CANDIDATE","ATTEMPT","APPEAL NOTE","STATUS","OUTCOME"],rows("appeals").map(x=><tr><td><b>{x.candidate_name}</b><small>{x.email}</small></td><td><code>{x.attempt_id}</code><small>{stamp(x.finished)}</small></td><td>{x.appeal}</td><td>{pill(x.decision||"open")}</td><td>{!x.decision&&<div className="ad-row-actions"><button className="ad-mini-primary" onClick={()=>openAction("appeal",x.attempt_id,"upheld")}>Uphold</button><button onClick={()=>openAction("appeal",x.attempt_id,"overturned")}>Overturn</button><button onClick={()=>openAction("appeal",x.attempt_id,"needs_more_info")}>More info</button></div>}</td></tr>),"No candidate appeals have been submitted.")}</section>}
         {page==="questions"&&(()=>{
           const qdata=data.questions||{},cats=qdata.categories||[],allQuestions=qdata.items||[];
+          const stagingItems=data.staging?.items||[],selectedCount=Object.keys(stagingSelected).filter(k=>stagingSelected[k]).length;
           const visibleQuestions=allQuestions.filter(q=>(questionCategory==="all"||q.category_id===questionCategory)&&(questionStatus==="all"||q.status===questionStatus)&&[q.question_text,q.subcategory,q.question_type,q.id].some(v=>String(v||"").toLowerCase().includes(questionQuery.toLowerCase())));
           const activeCategory=cats.find(c=>c.id===questionCategory);
           return <section className="ad-question-workspace">
@@ -1015,6 +1040,13 @@ function AdminConsole({ onLogout }) {
             <div className="ad-question-import"><div><span className="ad-q-upload-icon">⇧</span><div><h3>Import questions in bulk</h3><p>Upload CSV, JSON or text-based PDF. Preview and validate records before saving them to the database.</p><small>Maximum 5 MB · Up to 1,000 questions per import</small></div></div>
               <form onSubmit={previewQuestionImport}><label className="ad-q-file"><input type="file" accept=".csv,.json,.pdf,application/pdf,text/csv,application/json" onChange={e=>{setImportFile(e.target.files?.[0]||null);setImportPreview(null);}}/><span>＋ Choose file</span><b>{importFile?.name||"No file selected"}</b></label><select value={importCategory} onChange={e=>setImportCategory(e.target.value)}><option value="">Choose default category (if file has no category)</option>{cats.map(c=><option value={c.id}>{c.name}</option>)}</select><button className="ad-q-add-btn" disabled={!importFile||importBusy}>{importBusy?"Preparing preview…":"Preview import →"}</button></form>
               {importPreview&&<div className="ad-import-preview"><div className="ad-import-preview-head"><div><b>Import preview</b><small>{importPreview.filename} · Review before committing</small></div><button onClick={()=>setImportPreview(null)}>×</button></div><div className="ad-import-counts"><span><b>{importPreview.total}</b>Total</span><span><b>{importPreview.valid}</b>Valid</span><span><b>{importPreview.invalid}</b>Invalid / duplicate</span></div>{importPreview.pdf_note&&<p className="ad-q-pdf-note">{importPreview.pdf_note}</p>}<div className="ad-import-items">{importPreview.items.slice(0,8).map((q,i)=><div><b>{i+1}. {q.question_text.slice(0,150)||"Empty question"}</b><small>{q.category_id} · {q.difficulty_level} · {q.question_type} · {q.time_allocation}s</small>{q.errors.length>0&&<em>{q.errors.join(" ")}</em>}</div>)}</div>{importPreview.items.length>8&&<small>Showing first 8 of {importPreview.items.length} records.</small>}<button className="ad-q-add-btn" disabled={!importPreview.valid||importBusy} onClick={commitQuestionImport}>{importBusy?"Importing…":"Import "+importPreview.valid+" valid questions"}</button></div>}
+            </div>
+            <div className="ad-question-import ad-scrape-panel"><div><span className="ad-q-upload-icon">⌖</span><div><h3>Scrape questions from a URL</h3><p>Paste a public page URL (JSON-LD Quiz/FAQ, or a numbered MCQ list). Questions are extracted, preprocessed into the question-bank format and staged for your review before saving.</p><small>Only http(s) URLs · Up to 1,000 questions · Human review required</small></div></div>
+              <form onSubmit={runScrape}><input className="ad-scrape-input" type="url" placeholder="https://…" value={scrapeUrl} onChange={e=>setScrapeUrl(e.target.value)} required/><select value={scrapeCategory} onChange={e=>setScrapeCategory(e.target.value)}>{cats.map(c=><option value={c.id}>{c.name}</option>)}</select><input className="ad-scrape-input ad-scrape-sub" type="text" placeholder="Subcategory (optional)" value={scrapeSubcategory} onChange={e=>setScrapeSubcategory(e.target.value)}/><button className="ad-q-add-btn" disabled={!scrapeUrl.trim()||scrapeBusy}>{scrapeBusy?"Scraping…":"Scrape URL →"}</button></form>
+              <div className="ad-staging"><div className="ad-staging-head"><div><b>Staging table</b><small>{stagingItems.length} question(s) awaiting review</small></div><div className="ad-staging-actions">{selectedCount>0&&<button className="ad-q-add-btn" onClick={commitStaging} disabled={stagingBusy}>{stagingBusy?"Importing…":"Import "+selectedCount+" selected"}</button>}{stagingItems.length>0&&<button className="ad-q-clear" onClick={clearStaging} disabled={stagingBusy}>Clear staging</button>}</div></div>
+                {!stagingItems.length&&<div className="ad-q-empty"><span>⌖</span><b>No staged questions</b><p>Scrape a URL above to populate the staging table.</p></div>}
+                {stagingItems.length>0&&<div className="ad-staging-list">{stagingItems.map(q=>{const sel=!!stagingSelected[q.id],invalid=q.errors?.length>0,dup=q.duplicate;return <article className={"ad-staging-row"+(sel?" selected":"")} key={q.id}><label className="ad-staging-check"><input type="checkbox" checked={sel} disabled={invalid} onChange={e=>toggleStaging(q.id,e.target.checked)}/><span/></label><div className="ad-staging-main"><div className="ad-question-meta"><span>{cats.find(c=>c.id===q.category_id)?.name||q.category_id||"—"}</span><i>·</i><span>{q.subcategory}</span><i>·</i><span>{q.question_type}</span><i>·</i><span>{q.difficulty_level}</span></div><h4>{q.question_text}</h4>{q.options?.length>0&&<div className="ad-staging-options">{q.options.map((o,i)=><span key={i} className={q.correct_answer&&o===q.correct_answer?"ad-staging-answer":""}>{String.fromCharCode(65+i)}. {o}</span>)}</div>}{!q.options?.length&&q.correct_answer&&<small className="ad-staging-answer-line">Answer: {q.correct_answer}</small>}{q.explanation&&<small>Explanation: {q.explanation}</small>}{dup&&<em className="ad-staging-warn">Duplicate of an existing question — will be skipped.</em>}{invalid&&<em className="ad-staging-warn">{q.errors.join(" ")}</em>}<small className="ad-staging-src">Source: {q.source_url}</small></div><button className="ad-staging-del" onClick={()=>deleteStagingItem(q.id)} title="Remove from staging">×</button></article>;})}</div>}
+              </div>
             </div>
           </section>;
         })()}
