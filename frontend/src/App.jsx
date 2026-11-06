@@ -303,7 +303,7 @@ function useExamIntegrity(aid, screenStream) {
     try{if(!document.documentElement.requestFullscreen)throw new Error(t("fullscreenUnsupported"));await document.documentElement.requestFullscreen();setFullscreenActive(Boolean(document.fullscreenElement));}
     catch(e){setShareError(e.message||t("fullscreenRequired"));}
   };
-  return {shareActive,fullscreenActive,notice,shareError,setNotice,restartShare,restartFullscreen,report};
+  return {shareActive,fullscreenActive,notice,shareError,setNotice,restartFullscreen,report};
 }
 function ExamIntegrityBanner({integrity,onRestartShare}) {
   const t=useT();
