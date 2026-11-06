@@ -1,5 +1,8 @@
 # SkillBridge deployment: Vercel frontend + Render FastAPI backend + managed PostgreSQL.
-# Syncing this Blueprint creates a billable Render Postgres instance (lowest paid tier).
+#
+# docker-compose.yml provides a local PostgreSQL container only through the
+# optional "localdb" profile for development. Render uses its own managed
+# PostgreSQL service below; DATABASE_URL is injected into the backend.
 services:
   - type: web
     name: skillbridge
@@ -17,14 +20,13 @@ services:
         fromDatabase:
           name: skillbridge-db
           property: connectionString
-      - key: DB_PATH
-        value: /data/skillbridge.db
       - key: RETEST_COOLDOWN_HOURS
         value: "336"
       - key: MAX_ATTEMPTS_90D
         value: "3"
+      # Never seed demo accounts into the public production database.
       - key: SEED_DEMO
-        value: "true"
+        value: "false"
       - key: SEED_GRAPHRAG_QUESTIONS
         value: "false"
       - key: CORS_ORIGINS
@@ -50,6 +52,8 @@ services:
       - key: SPACY_MODEL
         value: en_core_web_sm
 
+# Render-managed PostgreSQL replaces the optional local "db" container from
+# docker-compose.yml. The backend connects using the internal connection string.
 databases:
   - name: skillbridge-db
     databaseName: skillbridge
