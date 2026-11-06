@@ -646,3 +646,51 @@ summary { cursor: pointer; font-weight: 600; margin: .4rem 0; }
  .ad-category-chips{gap:6px}
  .ad-category-chips button{font-size:.58rem;padding:6px 9px}
 }
+
+
+/* ---------- Enterprise-wide interaction and accessibility polish ---------- */
+:root {
+  --ui-radius-sm: 9px;
+  --ui-radius-md: 13px;
+  --ui-radius-lg: 18px;
+  --ui-shadow-soft: 0 8px 26px rgba(24, 43, 67, .055);
+  --ui-shadow-hover: 0 14px 34px rgba(24, 43, 67, .10);
+}
+html { scroll-behavior: smooth; scroll-padding-top: 88px; -webkit-text-size-adjust: 100%; }
+body { font-family: Inter, "Hind Siliguri", "Noto Sans Bengali", system-ui, sans-serif; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; }
+button, input, select, textarea { font: inherit; }
+button:not(:disabled), a, summary, label.check { -webkit-tap-highlight-color: transparent; }
+button:not(:disabled) { cursor: pointer; }
+button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; }
+:where(input:not([type=checkbox]):not([type=radio]), select, textarea) {
+  transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease;
+}
+:where(button, a, input, select, textarea, summary):focus-visible {
+  outline: 3px solid rgba(49, 92, 232, .38);
+  outline-offset: 3px;
+}
+.card { border-radius: var(--ui-radius-md); box-shadow: 0 2px 10px rgba(24, 43, 67, .025); }
+.btn { border-radius: 10px; transition: transform .16s ease, box-shadow .16s ease, background-color .16s ease, border-color .16s ease; }
+.btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 7px 16px rgba(18, 50, 65, .12); }
+.wrap { max-width: 1120px; }
+.tablewrap { max-width: 100%; border-radius: 11px; }
+.tablewrap table { min-width: 580px; width: 100%; }
+.top { padding-top: max(0px, env(safe-area-inset-top)); }
+.sb-auth-card, .sb-value-card, .portal-panel, .cr-panel, .ad-panel {
+  box-shadow: var(--ui-shadow-soft);
+}
+.sb-auth-card { border-radius: 20px; }
+.sb-value-card { border-radius: 18px; }
+.portal-panel, .cr-panel, .ad-panel { border-radius: 15px; }
+.metric-card, .cr-metric, .ad-metric { transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease; }
+.metric-card:hover, .cr-metric:hover, .ad-metric:hover { transform: translateY(-2px); box-shadow: var(--ui-shadow-hover); }
+@media (max-width: 760px) {
+  html { scroll-padding-top: 18px; }
+  .wrap { padding-left: 16px; padding-right: 16px; }
+  .card { padding: 16px; }
+  .top { gap: 10px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
