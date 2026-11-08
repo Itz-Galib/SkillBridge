@@ -11,4 +11,3 @@ neo4j==5.27.0
 PyMuPDF==1.25.3
 pytesseract==0.3.13
 Pillow==11.1.0
-httpx

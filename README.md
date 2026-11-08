@@ -24,6 +24,8 @@ cd backend && pip install -r requirements.txt && DB_PATH=./dev.db uvicorn main:a
 cd frontend && npm install && npm run dev                                                         # :5173 (proxies /api)
 ```
 
+For scanned PDF CVs when running the backend outside Docker, install Tesseract OCR and the language packs listed by `TESSERACT_LANG` (defaults to `eng+ben`). Docker installs English and Bangla packs for you.
+
 Deploy on any VPS with Docker: clone, create `.env` (strong `SECRET_KEY`), `docker compose up -d --build`, put HTTPS (Caddy/Traefik/Cloudflare) in front of port 8080. Set `RETEST_COOLDOWN_HOURS=336` for the spec's 14-day cooldown (0 is for demos).
 
 ## Deploy: Vercel frontend + Render API
@@ -67,6 +69,7 @@ Enter your own email and a unique password of at least 14 characters when prompt
 - The Blueprint sets `RETEST_COOLDOWN_HOURS=336`. `SEED_DEMO` is enabled for local/demo testing; disable it before a public launch.
 - Add any additional frontend domains to `CORS_ORIGINS` and redeploy the API.
 - Add `ANTHROPIC_API_KEY` in Render only if you want the optional LLM extraction path.
+- For CV-to-profile extraction, set `AI_PROVIDER` and the matching provider API key/model (`OPENAI_*`, `GEMINI_*`, `GROK_*`, or `DEEPSEEK_*`) in the backend environment. `AI_PROVIDER_FALLBACKS` may list additional configured providers. Never put these keys in frontend/Vite environment variables. If no provider is configured, CV profile extraction reports an error and candidates can still create a profile manually.
 
 ## Demo path (about 5 minutes)
 1. Create account → accept consent. 2. **Use sample CV** → Analyse (see what was redacted) → confirm skills.
@@ -80,6 +83,7 @@ Enter your own email and a unique password of at least 14 characters when prompt
 | SQL sandbox (SELECT-only, authorizer, op limit, graded on 2 generated datasets) | **Real**, in-process SQLite. Python sandbox: not in R0 |
 | PII redaction before AI | **Real** (regex + name heuristics; not perfect) |
 | Skill extraction | Rule-based offline by default. **LLM path exists** (schema-validated, falls back to rules) and runs only if `ANTHROPIC_API_KEY` is set. Not exercised in CI |
+| CV-to-profile extraction | PDF/DOCX/TXT/MD parsing with OCR for scanned PDF pages, a shared validated profile schema for OpenAI/Gemini/Grok/DeepSeek, evidence-backed editable drafts, and candidate-only confirmation. Provider calls receive PII-redacted text; provider API keys stay on the backend. |
 | Trust label (paste, tab-blur, fast-perfect signals) | **Real**, never pass/fail; appeal is stored |
 | Learning path | Curated index, topic/level retrieval with source + licence. **Not** pgvector RAG yet. Curator must verify links/licences |
 | Skill Passport | **Real**: HMAC-signed, revocable, public verify page. Signature is server-secret HMAC, not public-key |

@@ -29,6 +29,107 @@ def _user(email):
     return uid, h
 
 
+def test_cv_text_extraction_stays_private_until_profile_confirmation(monkeypatch):
+    import ai_providers
+
+    uid, headers = _user("profile-draft@example.com")
+    cv_text = (
+        "Rafi Ahmed\n"
+        "Email: rafi@example.com | Phone: +880 1712-345678\n"
+        "Junior Software Engineer\n"
+        "Skills: Python\n"
+    )
+    received_text = {}
+
+    def fake_extract(redacted_text, identity=None):
+        received_text["text"] = redacted_text
+        return {
+            "profile": {
+                "name": identity["name"],
+                "email": identity["email"],
+                "headline": "Junior Software Engineer",
+                "phone": "",
+                "location": "",
+                "summary": "",
+                "linkedin": "",
+                "github": "",
+                "portfolio": "",
+                "education": [],
+                "experience": [],
+                "projects": [],
+                "skills": [{"name": "Python", "category": "Programming"}],
+                "certifications": [
+                    {"name": "Python Certificate", "issuer": "Example Institute"}
+                ],
+                "achievements": [{"title": "Hackathon finalist"}],
+                "languages": [{"name": "English", "proficiency": "Fluent"}],
+                "preferences": {
+                    "job_types": [],
+                    "work_mode": "",
+                    "locations": [],
+                },
+            },
+            "evidence": [
+                {
+                    "field": "headline",
+                    "value": "Junior Software Engineer",
+                    "source_snippet": "Junior Software Engineer",
+                    "source": "ai_extraction",
+                    "confidence": 0.0,
+                },
+                {
+                    "field": "skills.0.name",
+                    "value": "Python",
+                    "source_snippet": "Python",
+                    "source": "ai_extraction",
+                    "confidence": 0.0,
+                },
+            ],
+            "provider": "openai",
+            "model": "test-model",
+        }
+
+    monkeypatch.setattr(ai_providers, "extract_cv_profile", fake_extract)
+    response = client.post(
+        "/api/cv/profile-extract",
+        files={"file": ("profile.txt", cv_text.encode("utf-8"), "text/plain")},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert "rafi@example.com" not in received_text["text"]
+    assert "+880" not in received_text["text"]
+    assert "Rafi Ahmed" not in received_text["text"]
+    assert main.one("SELECT user_id FROM candidate_profiles WHERE user_id=?", (uid,)) is None
+
+    draft = client.get("/api/candidate/profile/draft", headers=headers)
+    assert draft.status_code == 200
+    assert draft.json()["profile"]["email"] == "profile-draft@example.com"
+    assert draft.json()["extraction"]
+
+    edited = draft.json()["profile"]
+    edited["skills"][0]["category"] = "Technical"
+    save = client.put(
+        "/api/candidate/profile/draft",
+        json=edited,
+        headers=headers,
+    )
+    assert save.status_code == 200, save.text
+    confirmed = client.post(
+        "/api/candidate/profile/confirm",
+        json={},
+        headers=headers,
+    )
+    assert confirmed.status_code == 200, confirmed.text
+
+    profile = client.get("/api/candidate/profile", headers=headers).json()["profile"]
+    assert profile["skills"] == [
+        {"name": "Python", "category": "Technical", "status": "claimed"}
+    ]
+    assert profile["certifications"][0]["name"] == "Python Certificate"
+    assert profile["achievements"][0]["title"] == "Hackathon finalist"
+    assert profile["languages"][0]["name"] == "English"
+
+
 def test_local_storage_roundtrip_and_traversal():
     s = storage.LocalStorage(os.path.join(_TMP, "ls"))
     s.put("cv/1/a.txt", b"hello")

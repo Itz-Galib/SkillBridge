@@ -1,6 +1,6 @@
 """Initial hiring workflow APIs for SkillBridge PRD."""
 import json, time, uuid, os, re, secrets, csv, io
-from typing import Optional, List
+from typing import Optional, List, Literal
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 from main import current_user, one, allr, run, audit, QBYID, db, DATABASE_URL, COOLDOWN_HOURS, MAX_ATTEMPTS_90D
@@ -83,6 +83,28 @@ class ProjectItem(BaseModel):
     technologies: List[str] = Field(default_factory=list, max_length=30)
     url: str = Field(default="", max_length=300)
 
+class SkillItem(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    category: str = Field(default="", max_length=60)
+    status: Literal["claimed"] = "claimed"
+
+class CertificationItem(BaseModel):
+    name: str = Field(min_length=1, max_length=180)
+    issuer: str = Field(default="", max_length=160)
+    issue_date: str = Field(default="", max_length=40)
+    expiry_date: str = Field(default="", max_length=40)
+    credential_id: str = Field(default="", max_length=120)
+    credential_url: str = Field(default="", max_length=300)
+
+class AchievementItem(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+    description: str = Field(default="", max_length=1000)
+    date: str = Field(default="", max_length=40)
+
+class LanguageItem(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    proficiency: str = Field(default="", max_length=80)
+
 class CandidateProfileUpdate(BaseModel):
     headline: str = Field(default="", max_length=180)
     phone: str = Field(default="", max_length=40)
@@ -94,6 +116,10 @@ class CandidateProfileUpdate(BaseModel):
     education: List[EducationItem] = Field(default_factory=list, max_length=12)
     experience: List[ExperienceItem] = Field(default_factory=list, max_length=20)
     projects: List[ProjectItem] = Field(default_factory=list, max_length=20)
+    skills: List[SkillItem] = Field(default_factory=list, max_length=80)
+    certifications: List[CertificationItem] = Field(default_factory=list, max_length=30)
+    achievements: List[AchievementItem] = Field(default_factory=list, max_length=30)
+    languages: List[LanguageItem] = Field(default_factory=list, max_length=20)
     preferences: dict = Field(default_factory=dict)
 
 class CandidateProfileDraftInput(CandidateProfileUpdate):
@@ -155,6 +181,10 @@ def _decode_profile_json(raw):
     profile.setdefault("education", [])
     profile.setdefault("experience", [])
     profile.setdefault("projects", [])
+    profile.setdefault("skills", [])
+    profile.setdefault("certifications", [])
+    profile.setdefault("achievements", [])
+    profile.setdefault("languages", [])
     profile.setdefault(
         "preferences",
         {
@@ -223,11 +253,24 @@ def get_candidate_profile_draft(user=Depends(current_user)):
     if draft["status"] != "draft":
         raise HTTPException(409, "This profile draft is no longer editable")
 
+    extraction = []
+    if draft["document_id"]:
+        import cv_store
+
+        extraction = cv_store.list_extractions(
+            user["id"], draft["document_id"]
+        )
+
     return {
         "status": draft["status"],
         "method": draft["method"],
         "document_id": draft["document_id"],
-        "profile": _decode_profile_json(draft["profile_json"]),
+        "profile": {
+            **_decode_profile_json(draft["profile_json"]),
+            "name": user["name"],
+            "email": user["email"],
+        },
+        "extraction": extraction,
     }
 
 
@@ -263,7 +306,7 @@ def save_candidate_profile_draft(
         previous["method"] if previous else "manual"
     )
 
-    if method not in ("manual", "cv"):
+    if method not in ("manual", "cv", "cv_ai", "cv_offline"):
         raise HTTPException(422, "Method must be manual or cv")
 
     document_id = (
@@ -337,6 +380,10 @@ def confirm_candidate_profile(user=Depends(current_user)):
         profile.get("education"),
         profile.get("experience"),
         profile.get("projects"),
+        profile.get("skills"),
+        profile.get("certifications"),
+        profile.get("achievements"),
+        profile.get("languages"),
     ])
 
     if not has_content:
@@ -372,9 +419,10 @@ def confirm_candidate_profile(user=Depends(current_user)):
             INSERT INTO candidate_profiles(
                 user_id, headline, phone, location, summary,
                 linkedin, github, portfolio, education,
-                experience, projects, preferences, updated
+                experience, projects, skills, certifications,
+                achievements, languages, preferences, updated
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user["id"],
@@ -388,6 +436,10 @@ def confirm_candidate_profile(user=Depends(current_user)):
                 json.dumps(profile["education"]),
                 json.dumps(profile["experience"]),
                 json.dumps(profile["projects"]),
+                json.dumps(profile["skills"]),
+                json.dumps(profile["certifications"]),
+                json.dumps(profile["achievements"]),
+                json.dumps(profile["languages"]),
                 json.dumps(profile["preferences"]),
                 now,
             ),
@@ -420,6 +472,7 @@ def get_candidate_profile(user=Depends(current_user)):
             "headline": "", "phone": "", "location": "", "summary": "",
             "linkedin": "", "github": "", "portfolio": "",
             "education": [], "experience": [], "projects": [],
+            "skills": [], "certifications": [], "achievements": [], "languages": [],
             "preferences": {"job_types": ["Internship", "Full-time"], "work_mode": "Any", "locations": []},
             "updated": None,
         },
@@ -430,9 +483,16 @@ def get_candidate_profile(user=Depends(current_user)):
     }
     if row:
         p = dict(row)
-        for key in ("education", "experience", "projects", "preferences"):
+        for key in (
+            "education", "experience", "projects", "skills",
+            "certifications", "achievements", "languages", "preferences"
+        ):
             p[key] = json.loads(p[key] or ("{}" if key == "preferences" else "[]"))
-        result["profile"].update({k: p[k] for k in ("headline","phone","location","summary","linkedin","github","portfolio","education","experience","projects","preferences","updated")})
+        result["profile"].update({k: p[k] for k in (
+            "headline", "phone", "location", "summary", "linkedin", "github",
+            "portfolio", "education", "experience", "projects", "skills",
+            "certifications", "achievements", "languages", "preferences", "updated"
+        )})
     return result
 
 @router.put("/api/candidate/profile")
@@ -444,16 +504,22 @@ def update_candidate_profile(body: CandidateProfileUpdate, user=Depends(current_
     preferences["job_types"] = [x for x in preferences.get("job_types", []) if x in allowed_types][:5]
     preferences["work_mode"] = preferences.get("work_mode", "Any") if preferences.get("work_mode", "Any") in allowed_modes else "Any"
     preferences["locations"] = [str(x)[:100] for x in preferences.get("locations", [])[:10] if str(x).strip()]
-    run("""INSERT INTO candidate_profiles(user_id,headline,phone,location,summary,linkedin,github,portfolio,education,experience,projects,preferences,updated)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    run("""INSERT INTO candidate_profiles(user_id,headline,phone,location,summary,linkedin,github,portfolio,education,experience,projects,skills,certifications,achievements,languages,preferences,updated)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(user_id) DO UPDATE SET headline=excluded.headline,phone=excluded.phone,location=excluded.location,
            summary=excluded.summary,linkedin=excluded.linkedin,github=excluded.github,portfolio=excluded.portfolio,
            education=excluded.education,experience=excluded.experience,projects=excluded.projects,
-           preferences=excluded.preferences,updated=excluded.updated""",
+           skills=excluded.skills,certifications=excluded.certifications,achievements=excluded.achievements,
+           languages=excluded.languages,preferences=excluded.preferences,updated=excluded.updated""",
         (user["id"],body.headline.strip(),body.phone.strip(),body.location.strip(),body.summary.strip(),
          body.linkedin.strip(),body.github.strip(),body.portfolio.strip(),
          json.dumps([x.model_dump() for x in body.education]),json.dumps([x.model_dump() for x in body.experience]),
-         json.dumps([x.model_dump() for x in body.projects]),json.dumps(preferences),time.time()))
+         json.dumps([x.model_dump() for x in body.projects]),
+         json.dumps([x.model_dump() for x in body.skills]),
+         json.dumps([x.model_dump() for x in body.certifications]),
+         json.dumps([x.model_dump() for x in body.achievements]),
+         json.dumps([x.model_dump() for x in body.languages]),
+         json.dumps(preferences),time.time()))
     audit(user["id"], "candidate_profile_updated")
     return {"ok": True, "updated": time.time()}
 

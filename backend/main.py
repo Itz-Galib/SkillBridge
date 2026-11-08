@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS companies(id TEXT PRIMARY KEY, owner_user_id INTEGER 
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, location TEXT NOT NULL DEFAULT 'Remote', employment_type TEXT NOT NULL DEFAULT 'Full-time', skills TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', is_mock INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY, job_id TEXT NOT NULL, candidate_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'submitted', results_shared INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, UNIQUE(job_id, candidate_id));
 CREATE TABLE IF NOT EXISTS company_assessments(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, job_id TEXT, title TEXT NOT NULL, requirements TEXT NOT NULL, questions TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', created REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS candidate_profiles(user_id INTEGER PRIMARY KEY, headline TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', linkedin TEXT NOT NULL DEFAULT '', github TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL DEFAULT '', education TEXT NOT NULL DEFAULT '[]', experience TEXT NOT NULL DEFAULT '[]', projects TEXT NOT NULL DEFAULT '[]', preferences TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS candidate_profiles(user_id INTEGER PRIMARY KEY, headline TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', linkedin TEXT NOT NULL DEFAULT '', github TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL DEFAULT '', education TEXT NOT NULL DEFAULT '[]', experience TEXT NOT NULL DEFAULT '[]', projects TEXT NOT NULL DEFAULT '[]', skills TEXT NOT NULL DEFAULT '[]', certifications TEXT NOT NULL DEFAULT '[]', achievements TEXT NOT NULL DEFAULT '[]', languages TEXT NOT NULL DEFAULT '[]', preferences TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_blueprints(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_answer_events(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, question_id TEXT NOT NULL, revision INTEGER NOT NULL, answer_hash TEXT NOT NULL, answer_length INTEGER NOT NULL, created REAL NOT NULL);
 """
@@ -97,6 +97,24 @@ def init_db():
             schema = schema.replace("events(id INTEGER PRIMARY KEY", "events(id BIGSERIAL PRIMARY KEY")
             schema = schema.replace("audit(id INTEGER PRIMARY KEY", "audit(id BIGSERIAL PRIMARY KEY")
         c.executescript(schema)
+    if DATABASE_URL:
+        profile_columns = {
+            row["column_name"]
+            for row in allr(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='candidate_profiles'"
+            )
+        }
+    else:
+        profile_columns = {
+            row["name"] for row in allr("PRAGMA table_info(candidate_profiles)")
+        }
+    for column in ("skills", "certifications", "achievements", "languages"):
+        if column not in profile_columns:
+            run(
+                f"ALTER TABLE candidate_profiles ADD COLUMN {column} "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
     import cv_store  # CV document + extraction-draft tables (imported here to avoid a circular import)
     cv_store.ensure_schema()
 
@@ -364,12 +382,28 @@ def read_profile_cv(filename: str, data: bytes):
                             io.BytesIO(pixmap.tobytes("png"))
                         )
 
-                        text = pytesseract.image_to_string(
-                            image,
-                            lang=os.getenv("TESSERACT_LANG", "eng+ben"),
-                        ).strip()
-
-                        ocr_pages.append(page_number)
+                        # Prefer eng+ben when available; fall back to eng so
+                        # missing language packs do not kill extraction.
+                        preferred = os.getenv("TESSERACT_LANG", "eng+ben")
+                        ocr_text = ""
+                        for lang in (preferred, "eng"):
+                            try:
+                                ocr_text = pytesseract.image_to_string(
+                                    image,
+                                    lang=lang,
+                                ).strip()
+                                if ocr_text:
+                                    break
+                            except Exception as lang_ex:
+                                log.warning(
+                                    "OCR lang=%s failed on page %s: %s",
+                                    lang,
+                                    page_number,
+                                    type(lang_ex).__name__,
+                                )
+                        text = ocr_text or text
+                        if ocr_text:
+                            ocr_pages.append(page_number)
 
                     except Exception as ex:
                         log.warning(
@@ -463,27 +497,43 @@ def read_profile_cv(filename: str, data: bytes):
             log.warning("DOCX parsing failed: %s", type(ex).__name__)
             raise HTTPException(422, "Could not read this DOCX file")
 
-    raise HTTPException(415, "Please upload a PDF or DOCX file")
+    if name.endswith((".txt", ".md")):
+        try:
+            raw_text = data.decode("utf-8-sig").strip()
+        except UnicodeDecodeError:
+            raise HTTPException(422, "Text CV must be encoded as UTF-8")
+        if len(raw_text) < 30:
+            raise HTTPException(422, "Could not extract enough text from this CV")
+        return raw_text, {
+            "parser": "utf8_text",
+            "ocr_used": False,
+            "ocr_pages": [],
+        }
+
+    raise HTTPException(415, "Please upload a PDF, DOCX, TXT or MD file")
 
 
-def extract_profile_fields(raw_text: str):
+def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
     """
-    Conservative rule-based profile extraction.
-    Missing or uncertain information is left blank rather than invented.
+    Offline rule-based profile extraction used as the primary fallback when
+    AI providers are unavailable. Fills as many fields as the CV text supports
+    without inventing facts. identity may supply name/email from the account.
     """
-    import re
+    identity = identity or {}
 
     lines = [
         re.sub(r"\s+", " ", line).strip()
-        for line in raw_text.splitlines()
+        for line in (raw_text or "").splitlines()
     ]
     lines = [line for line in lines if line]
-
     text = "\n".join(lines)
+    low = text.lower()
 
     profile = {
-        "headline": "",
+        "name": str(identity.get("name") or "").strip(),
+        "email": str(identity.get("email") or "").strip(),
         "phone": "",
+        "headline": "",
         "location": "",
         "summary": "",
         "linkedin": "",
@@ -492,228 +542,563 @@ def extract_profile_fields(raw_text: str):
         "education": [],
         "experience": [],
         "projects": [],
+        "skills": [],
+        "certifications": [],
+        "achievements": [],
+        "languages": [],
         "preferences": {
             "job_types": ["Internship", "Full-time"],
             "work_mode": "Any",
             "locations": [],
         },
     }
-
     evidence = []
 
     def add_evidence(field, value, confidence, snippet=""):
         if value is None:
             return
-
         if isinstance(value, str) and not value.strip():
             return
-
         evidence.append({
             "field": field,
             "value": json.dumps(value, ensure_ascii=False)
-                if isinstance(value, (list, dict))
-                else str(value),
+            if isinstance(value, (list, dict))
+            else str(value),
             "confidence": confidence,
-            "source_snippet": snippet[:600],
+            "source_snippet": (snippet or str(value))[:600],
             "source_location": "CV text",
             "source": "deterministic_parser",
         })
 
-    # Email
+    # ---- Contact ----
     email_match = re.search(
         r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
         text,
     )
+    if email_match and not profile["email"]:
+        profile["email"] = email_match.group(0)
+        add_evidence("email", profile["email"], 0.99, email_match.group(0))
+    elif email_match:
+        add_evidence("email", email_match.group(0), 0.99, email_match.group(0))
 
-    if email_match:
-        add_evidence(
-            "email",
-            email_match.group(0),
-            0.99,
-            email_match.group(0),
-        )
-
-    # Phone
     phone_match = re.search(
         r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)",
         text,
     )
-
     if phone_match:
         profile["phone"] = phone_match.group(0).strip()
+        add_evidence("phone", profile["phone"], 0.85, phone_match.group(0))
 
-        add_evidence(
-            "phone",
-            profile["phone"],
-            0.80,
-            phone_match.group(0),
-        )
-
-    # Professional links
     url_patterns = {
-        "linkedin": r"(?:https?://)?(?:www\.)?linkedin\.com/[^\s|]+",
-        "github": r"(?:https?://)?(?:www\.)?github\.com/[^\s|]+",
+        "linkedin": r"(?:https?://)?(?:www\.)?linkedin\.com/[^\s|,;]+",
+        "github": r"(?:https?://)?(?:www\.)?github\.com/[^\s|,;]+",
     }
-
     for field, pattern in url_patterns.items():
         match = re.search(pattern, text, re.IGNORECASE)
-
         if match:
             value = match.group(0).rstrip(".,;)")
             if not value.startswith("http"):
                 value = "https://" + value
-
             profile[field] = value
-
             add_evidence(field, value, 0.98, match.group(0))
 
-    # Portfolio: do not mistake LinkedIn/GitHub for a portfolio.
-    for match in re.finditer(r"https?://[^\s|]+", text, re.IGNORECASE):
+    for match in re.finditer(r"https?://[^\s|,;]+", text, re.IGNORECASE):
         url = match.group(0).rstrip(".,;)")
+        low_url = url.lower()
+        if "linkedin.com" in low_url or "github.com" in low_url:
+            continue
+        if any(x in low_url for x in ("facebook.com", "twitter.com", "x.com", "instagram.com")):
+            continue
+        profile["portfolio"] = url
+        add_evidence("portfolio", url, 0.75, url)
+        break
 
-        if "linkedin.com" not in url.lower() and "github.com" not in url.lower():
-            profile["portfolio"] = url
-            add_evidence("portfolio", url, 0.75, url)
-            break
+    # ---- Name (first non-contact short line) ----
+    if not profile["name"]:
+        for line in lines[:8]:
+            if "@" in line or re.search(r"\d{3,}", line):
+                continue
+            if re.search(r"https?://|www\.", line, re.I):
+                continue
+            words = line.split()
+            if 1 <= len(words) <= 5 and len(line) <= 60:
+                if re.match(r"^[A-Za-z .'\-]+$", line):
+                    profile["name"] = line.strip()
+                    add_evidence("name", profile["name"], 0.70, line)
+                    break
 
-    # Section detection.
+    # ---- Location (city/country style lines near the top) ----
+    location_hint = re.search(
+        r"\b("
+        r"Dhaka|Chittagong|Chattogram|Sylhet|Khulna|Rajshahi|Barisal|"
+        r"Rangpur|Mymensingh|Gazipur|Narayanganj|"
+        r"Bangladesh|India|Pakistan|Nepal|Sri Lanka|"
+        r"Remote|Hybrid|"
+        r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?,\s*[A-Z]{2,}"
+        r")\b",
+        text,
+    )
+    if location_hint:
+        # Prefer a short line that contains the match
+        for line in lines[:15]:
+            if location_hint.group(0).lower() in line.lower() and len(line) < 80:
+                profile["location"] = line.strip()[:120]
+                add_evidence("location", profile["location"], 0.65, line)
+                break
+        if not profile["location"]:
+            profile["location"] = location_hint.group(0)
+            add_evidence("location", profile["location"], 0.55, location_hint.group(0))
+
+    # ---- Section split ----
     section_aliases = {
         "summary": [
-            "summary",
-            "professional summary",
-            "profile",
-            "career objective",
-            "objective",
-            "about me",
+            "summary", "professional summary", "profile", "career objective",
+            "objective", "about me", "about", "professional profile",
         ],
         "education": [
-            "education",
-            "academic qualification",
-            "academic qualifications",
+            "education", "academic qualification", "academic qualifications",
+            "academic background", "academics",
         ],
         "experience": [
-            "experience",
-            "work experience",
-            "employment history",
-            "professional experience",
+            "experience", "work experience", "employment history",
+            "professional experience", "work history", "employment",
+            "internships", "internship experience",
         ],
         "projects": [
-            "projects",
-            "personal projects",
-            "academic projects",
+            "projects", "personal projects", "academic projects",
+            "key projects", "selected projects", "project experience",
+        ],
+        "skills": [
+            "skills", "technical skills", "core skills", "key skills",
+            "technologies", "tech stack", "tools", "competencies",
+        ],
+        "certifications": [
+            "certifications", "certificates", "licenses", "credentials",
+            "professional certifications",
+        ],
+        "achievements": [
+            "achievements", "awards", "honors", "accomplishments",
+            "awards and achievements",
+        ],
+        "languages": [
+            "languages", "language proficiency", "spoken languages",
         ],
     }
 
-    def normalise_heading(line):
+    def normalise_heading(line: str) -> str:
         return re.sub(r"[^a-z ]", "", line.lower()).strip()
 
     heading_lookup = {}
-
     for section, aliases in section_aliases.items():
         for alias in aliases:
             heading_lookup[normalise_heading(alias)] = section
 
-    sections = {}
+    sections: dict = {}
     current_section = None
-
     for line in lines:
         heading = normalise_heading(line)
-
-        if heading in heading_lookup:
+        if heading in heading_lookup and len(line) < 80:
             current_section = heading_lookup[heading]
             sections.setdefault(current_section, [])
             continue
-
-        # A new uppercase heading ends the previous section.
+        # Standalone ALL-CAPS heading ends the previous section if unknown
         if (
-            len(line) < 60
+            current_section
+            and len(line) < 50
             and line.isupper()
             and re.search(r"[A-Z]", line)
+            and heading not in heading_lookup
         ):
             current_section = None
             continue
-
         if current_section:
-            sections[current_section].append(line)
+            sections.setdefault(current_section, []).append(line)
 
-    # Summary
+    # ---- Summary / headline ----
     summary_lines = sections.get("summary", [])
-
     if summary_lines:
         summary = " ".join(summary_lines)[:3000]
         profile["summary"] = summary
+        add_evidence("summary", summary, 0.75, " ".join(summary_lines)[:600])
+        # First sentence often works as headline
+        first = re.split(r"[.!?]\s+", summary, maxsplit=1)[0].strip()
+        if 10 <= len(first) <= 120:
+            profile["headline"] = first
+            add_evidence("headline", first, 0.55, first)
 
-        add_evidence(
-            "summary",
-            summary,
-            0.70,
-            " ".join(summary_lines)[:600],
+    if not profile["headline"]:
+        title_match = re.search(
+            r"\b("
+            r"(?:Senior |Junior |Lead |Principal |Staff )?"
+            r"(?:Software|Full[- ]?Stack|Frontend|Backend|Data|Machine Learning|ML|AI|"
+            r"DevOps|Cloud|Mobile|Android|iOS|Web|QA|Security)?"
+            r"\s*(?:Engineer|Developer|Analyst|Scientist|Intern|Designer|Architect|"
+            r"Manager|Consultant|Specialist)"
+            r")\b",
+            text,
+            re.I,
         )
+        if title_match:
+            profile["headline"] = title_match.group(1).strip()
+            add_evidence("headline", profile["headline"], 0.60, title_match.group(0))
 
-    # Education: only retain lines that explicitly resemble institution names.
-    education_lines = sections.get("education", [])
-
-    institution_words = (
-        "university",
-        "college",
-        "institute",
-        "school",
-        "academy",
+    # ---- Education ----
+    degree_re = re.compile(
+        r"\b("
+        r"B\.?Sc\.?|M\.?Sc\.?|B\.?S\.?|M\.?S\.?|B\.?A\.?|M\.?A\.?|"
+        r"Bachelors?(?:\s+of\s+Science|\s+of\s+Arts)?|"
+        r"Masters?(?:\s+of\s+Science|\s+of\s+Arts)?|"
+        r"Ph\.?D\.?|Doctorate|Diploma|HSC|SSC|A[- ]?Level|O[- ]?Level|"
+        r"Bachelor(?:'s)?|Master(?:'s)?"
+        r")\b",
+        re.I,
     )
+    institution_words = (
+        "university", "college", "institute", "school", "academy",
+        "polytechnic", "varsity",
+    )
+    year_re = re.compile(r"\b(19|20)\d{2}\b")
 
+    education_lines = sections.get("education", [])
+    if not education_lines:
+        # Fallback: scan whole text for degree + institution patterns
+        for line in lines:
+            if degree_re.search(line) and any(w in line.lower() for w in institution_words):
+                education_lines.append(line)
+
+    seen_edu = set()
     for line in education_lines:
-        if any(word in line.lower() for word in institution_words):
-            item = {
-                "institution": line[:160],
-                "degree": "",
-                "field": "",
-                "start_year": "",
-                "end_year": "",
-                "details": line[:1000],
-            }
+        key = line.lower()[:80]
+        if key in seen_edu:
+            continue
+        seen_edu.add(key)
 
-            profile["education"].append(item)
+        degree_m = degree_re.search(line)
+        years = year_re.findall(line)
+        # findall with groups returns tuples; normalize
+        year_nums = re.findall(r"\b(?:19|20)\d{2}\b", line)
+        institution = ""
+        for word in institution_words:
+            if word in line.lower():
+                # take a chunk around the institution word
+                institution = line[:200]
+                break
+        if not institution and degree_m:
+            institution = line[:200]
 
-            add_evidence(
-                "education",
-                item,
-                0.65,
-                line,
-            )
-
-    # Projects: preserve explicit project lines without inventing details.
-    project_lines = sections.get("projects", [])
-
-    for line in project_lines:
-        cleaned = line.lstrip("•-*0123456789. ").strip()
-
-        if len(cleaned) < 3:
+        if not (degree_m or any(w in line.lower() for w in institution_words)):
             continue
 
+        item = {
+            "degree": degree_m.group(0) if degree_m else "",
+            "field_of_study": "",
+            "institution": institution[:160] if institution else line[:160],
+            "location": "",
+            "start_date": year_nums[0] if len(year_nums) >= 2 else "",
+            "end_date": year_nums[-1] if year_nums else "",
+            "graduation_year": year_nums[-1] if year_nums else "",
+            "grade": "",
+            "description": line[:500],
+        }
+        # Field of study heuristics
+        field_m = re.search(
+            r"(?:in|of)\s+([A-Za-z][A-Za-z &/]{2,40})(?:\s+from|\s*$|,)",
+            line,
+            re.I,
+        )
+        if field_m:
+            item["field_of_study"] = field_m.group(1).strip()[:80]
+
+        grade_m = re.search(
+            r"(?:CGPA|GPA|Grade)\s*[:=]?\s*([0-9.]+(?:\s*/\s*[0-9.]+)?)",
+            line,
+            re.I,
+        )
+        if grade_m:
+            item["grade"] = grade_m.group(1).strip()
+
+        profile["education"].append(item)
+        add_evidence("education", item, 0.70, line)
+
+    # ---- Experience ----
+    experience_lines = sections.get("experience", [])
+    # Group consecutive lines into job blocks separated by blank-ish boundaries
+    job_blocks: list[list[str]] = []
+    current_block: list[str] = []
+    for line in experience_lines:
+        # New block often starts with a title-like short line or company + date
+        looks_like_header = (
+            len(line) < 100
+            and (
+                bool(year_re.search(line))
+                or bool(re.search(
+                    r"\b(intern|engineer|developer|analyst|manager|assistant|"
+                    r"associate|officer|consultant|trainee)\b",
+                    line,
+                    re.I,
+                ))
+            )
+        )
+        if looks_like_header and current_block and len(current_block) >= 1:
+            job_blocks.append(current_block)
+            current_block = [line]
+        else:
+            current_block.append(line)
+    if current_block:
+        job_blocks.append(current_block)
+
+    date_chunk_re = re.compile(
+        r"(?:,?\s*)?(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+        r"|\d{1,2}[/-]\d{1,2})?[.\s/-]*(?:19|20)\d{2}\s*[-–—to]+\s*"
+        r"(?:Present|Current|Now|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"[a-z]*\.?\s*(?:19|20)\d{2}|(?:19|20)\d{2})",
+        re.I,
+    )
+
+    for block in job_blocks[:12]:
+        header = block[0]
+        body = " ".join(block[1:])[:2000] if len(block) > 1 else ""
+        years = re.findall(r"\b(?:19|20)\d{2}\b", header + " " + body)
+        is_current = bool(re.search(r"\b(present|current|now|ongoing)\b", header + " " + body, re.I))
+
+        # Strip trailing date ranges so company parsing stays clean
+        header_no_dates = date_chunk_re.sub("", header).strip(" |,-–—")
+        if not header_no_dates:
+            header_no_dates = header
+
+        title_m = re.search(
+            r"\b("
+            r"(?:Senior |Junior |Lead |Principal |Staff |Associate )?"
+            r"(?:Software |Full[- ]?Stack |Frontend |Backend |Data |ML |AI )?"
+            r"(?:Engineer|Developer|Analyst|Scientist|Intern|Designer|"
+            r"Architect|Manager|Consultant|Specialist|Officer|Assistant|"
+            r"Trainee|Coordinator)"
+            r"(?:\s+Intern)?"
+            r")\b",
+            header_no_dates,
+            re.I,
+        )
+        company = ""
+        # Prefer explicit separators: @, " at ", |, " - "
+        company_m = re.search(
+            r"(?:@|\bat\b|\||\s[-–—]\s)\s*([A-Za-z0-9][A-Za-z0-9 .,&'()-]{1,60})",
+            header_no_dates,
+            re.I,
+        )
+        if company_m:
+            company = company_m.group(1).strip(" ,-|–—")
+            # Drop residual date tokens from company
+            company = re.sub(
+                r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b",
+                "",
+                company,
+                flags=re.I,
+            ).strip(" ,-|")
+            company = re.sub(r"\b(?:19|20)\d{2}\b", "", company).strip(" ,-|")
+        elif title_m:
+            # Remainder of the header after the title is often the company
+            after = header_no_dates[title_m.end():].strip(" ,-|–—@")
+            after = re.sub(r"^(?:at\s+)", "", after, flags=re.I).strip()
+            if after and not re.match(r"^(?:19|20)\d{2}", after):
+                company = after[:120]
+
+        job_title = title_m.group(0).strip() if title_m else header_no_dates[:120]
+        # Prefer longer title phrase when "Software Engineer Intern" style
+        long_title = re.search(
+            r"\b((?:Senior |Junior |Lead |Principal |Staff |Associate )?"
+            r"[A-Za-z][A-Za-z /&-]{0,40}"
+            r"(?:Engineer|Developer|Analyst|Scientist|Intern|Designer|"
+            r"Architect|Manager|Consultant|Specialist|Officer|Assistant|"
+            r"Trainee|Coordinator)(?:\s+Intern)?)\b",
+            header_no_dates,
+            re.I,
+        )
+        if long_title and len(long_title.group(1)) > len(job_title):
+            job_title = long_title.group(1).strip()
+
+        item = {
+            "job_title": job_title[:120],
+            "company": company[:120],
+            "location": "",
+            "employment_type": "",
+            "start_date": years[0] if years else "",
+            "end_date": "Present" if is_current else (years[-1] if years else ""),
+            "is_current": is_current,
+            "description": body or header[:500],
+            "achievements": [],
+            "technologies": [],
+        }
+        if re.search(r"\bintern\b", header, re.I):
+            item["employment_type"] = "Internship"
+        elif re.search(r"\bfull[- ]?time\b", header, re.I):
+            item["employment_type"] = "Full-time"
+        elif re.search(r"\bpart[- ]?time\b", header, re.I):
+            item["employment_type"] = "Part-time"
+
+        profile["experience"].append(item)
+        add_evidence("experience", item, 0.60, header)
+
+    # ---- Projects ----
+    for line in sections.get("projects", [])[:20]:
+        cleaned = line.lstrip("•-*–—0123456789. ").strip()
+        if len(cleaned) < 3:
+            continue
         if " - " in cleaned:
             project_name, description = cleaned.split(" - ", 1)
         elif " — " in cleaned:
             project_name, description = cleaned.split(" — ", 1)
+        elif ":" in cleaned[:60]:
+            project_name, description = cleaned.split(":", 1)
         else:
             project_name, description = cleaned, ""
-
         item = {
-            "name": project_name[:160],
-            "description": description[:2000],
+            "name": project_name.strip()[:160],
+            "description": description.strip()[:2000],
+            "role": "",
             "technologies": [],
-            "url": "",
+            "project_url": "",
+            "start_date": "",
+            "end_date": "",
         }
-
+        url_m = re.search(r"https?://[^\s|,;]+", cleaned)
+        if url_m:
+            item["project_url"] = url_m.group(0).rstrip(".,;)")
         profile["projects"].append(item)
+        add_evidence("projects", item, 0.55, line)
 
-        add_evidence(
-            "projects",
-            item,
-            0.50,
-            line,
-        )
+    # ---- Skills (taxonomy + free-form from skills section) ----
+    skill_seen = set()
+    for sid, meta in TAXONOMY.items():
+        for alias in meta.get("aliases", []) + [meta.get("name", "")]:
+            alias = (alias or "").strip()
+            if len(alias) < 2:
+                continue
+            if re.search(
+                r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])",
+                low,
+            ):
+                if sid in skill_seen:
+                    break
+                skill_seen.add(sid)
+                item = {
+                    "name": meta["name"],
+                    "category": "Technical",
+                    "source_snippet": alias[:120],
+                    "status": "claimed",
+                }
+                profile["skills"].append(item)
+                add_evidence("skills", item, 0.70, alias)
+                break
+
+    # Extra skills from the skills section (comma / bullet separated)
+    for line in sections.get("skills", []):
+        parts = re.split(r"[,|•·/]| {2,}", line)
+        for part in parts:
+            name = part.strip(" -•*·\t")
+            if not (2 <= len(name) <= 40):
+                continue
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9 .+#\-]{1,38}$", name):
+                continue
+            key = name.lower()
+            if key in skill_seen:
+                continue
+            skill_seen.add(key)
+            item = {
+                "name": name,
+                "category": "Technical",
+                "source_snippet": name,
+                "status": "claimed",
+            }
+            profile["skills"].append(item)
+            add_evidence("skills", item, 0.55, name)
+
+    # ---- Certifications ----
+    for line in sections.get("certifications", [])[:15]:
+        cleaned = line.lstrip("•-*–—0123456789. ").strip()
+        if len(cleaned) < 3:
+            continue
+        item = {
+            "name": cleaned[:160],
+            "issuer": "",
+            "issue_date": "",
+            "expiry_date": "",
+            "credential_id": "",
+            "credential_url": "",
+        }
+        years = re.findall(r"\b(?:19|20)\d{2}\b", cleaned)
+        if years:
+            item["issue_date"] = years[0]
+        issuer_m = re.search(r"\b(?:by|from|issued by)\s+([A-Za-z0-9 .,&-]{2,60})", cleaned, re.I)
+        if issuer_m:
+            item["issuer"] = issuer_m.group(1).strip()
+        profile["certifications"].append(item)
+        add_evidence("certifications", item, 0.55, line)
+
+    # ---- Achievements ----
+    for line in sections.get("achievements", [])[:15]:
+        cleaned = line.lstrip("•-*–—0123456789. ").strip()
+        if len(cleaned) < 3:
+            continue
+        years = re.findall(r"\b(?:19|20)\d{2}\b", cleaned)
+        item = {
+            "title": cleaned[:160],
+            "description": cleaned[:500],
+            "date": years[0] if years else "",
+        }
+        profile["achievements"].append(item)
+        add_evidence("achievements", item, 0.50, line)
+
+    # ---- Languages ----
+    for line in sections.get("languages", [])[:10]:
+        parts = re.split(r"[,|•·;]", line)
+        for part in parts:
+            name = part.strip(" -•*")
+            if not (2 <= len(name) <= 40):
+                continue
+            # Strip proficiency in parentheses
+            prof = ""
+            pm = re.search(r"\(([^)]+)\)", name)
+            if pm:
+                prof = pm.group(1).strip()
+                name = name[: pm.start()].strip()
+            if not name:
+                continue
+            item = {"name": name[:60], "proficiency": prof[:40]}
+            profile["languages"].append(item)
+            add_evidence("languages", item, 0.55, part)
 
     return profile, evidence
+
+
+def _merge_profiles(ai_profile: dict, deterministic: dict) -> dict:
+    """Prefer AI values when present; fill gaps from offline parser."""
+    from ai_providers import empty_profile
+
+    merged = empty_profile()
+    # Start from AI
+    for k, v in (ai_profile or {}).items():
+        if k in merged:
+            merged[k] = v
+    # Fill scalars from deterministic if AI left them empty
+    for field in (
+        "name", "email", "phone", "headline", "location", "summary",
+        "linkedin", "github", "portfolio",
+    ):
+        if not (merged.get(field) or "").strip() and deterministic.get(field):
+            merged[field] = deterministic[field]
+    # Fill list fields if AI returned nothing
+    for field in (
+        "education", "experience", "projects", "skills",
+        "certifications", "achievements", "languages",
+    ):
+        if not merged.get(field) and deterministic.get(field):
+            merged[field] = deterministic[field]
+    if not merged.get("preferences") and deterministic.get("preferences"):
+        merged["preferences"] = deterministic["preferences"]
+    return merged
+
+
 @app.post("/api/cv/profile-extract")
 async def upload_cv_profile(
     file: UploadFile = File(...),
@@ -748,7 +1133,72 @@ async def upload_cv_profile(
 
     raw_text, parser_info = read_profile_cv(filename, file_bytes)
 
-    profile, evidence = extract_profile_fields(raw_text)
+    identity = {
+        "name": u.get("name", "") or "",
+        "email": u.get("email", "") or "",
+    }
+    deterministic_profile, deterministic_evidence = extract_profile_fields(
+        raw_text,
+        identity=identity,
+    )
+
+    # Always try AI, but NEVER fail the upload if providers are down.
+    # Offline extraction still produces an editable draft.
+    extraction_result = None
+    ai_error = None
+    redacted_text, _ = E.redact(raw_text, known_names=[identity["name"]])
+    from ai_providers import AIExtractionError, extract_cv_profile
+
+    try:
+        extraction_result = extract_cv_profile(
+            redacted_text,
+            identity=identity,
+        )
+    except AIExtractionError as ex:
+        ai_error = str(ex)
+        log.warning("CV AI extraction unavailable, using offline parser: %s", ai_error)
+
+    if extraction_result:
+        profile = _merge_profiles(
+            extraction_result["profile"],
+            deterministic_profile,
+        )
+        for skill in profile.get("skills") or []:
+            if isinstance(skill, dict) and "status" not in skill:
+                skill["status"] = "claimed"
+        # Contact from deterministic wins (PII was redacted before AI)
+        for field in ("phone", "linkedin", "github", "portfolio", "email"):
+            if deterministic_profile.get(field):
+                profile[field] = deterministic_profile[field]
+        if deterministic_profile.get("name") and not profile.get("name"):
+            profile["name"] = deterministic_profile["name"]
+
+        evidence = list(extraction_result.get("evidence") or [])
+        seen_fields = {e.get("field") for e in evidence if isinstance(e, dict)}
+        for item in deterministic_evidence:
+            if item["field"] not in seen_fields or item["field"] in (
+                "phone", "linkedin", "github", "portfolio", "email", "name",
+            ):
+                evidence.append(item)
+        method = "cv_ai"
+        ai_provider = extraction_result.get("provider", "")
+        ai_model = extraction_result.get("model", "")
+        message = (
+            "CV processed with AI. Please review and correct your profile before confirming."
+        )
+    else:
+        profile = deterministic_profile
+        for skill in profile.get("skills") or []:
+            if isinstance(skill, dict) and "status" not in skill:
+                skill["status"] = "claimed"
+        evidence = deterministic_evidence
+        method = "cv_offline"
+        ai_provider = ""
+        ai_model = ""
+        message = (
+            "AI providers were unavailable, so your profile was built with the offline parser. "
+            "Please review carefully and fill any missing fields before confirming."
+        )
 
     import cv_store
     from storage import StorageError
@@ -788,17 +1238,18 @@ async def upload_cv_profile(
             created,
             updated
         )
-        VALUES (?, ?, 'draft', 'cv', ?, ?, ?)
+        VALUES (?, ?, 'draft', ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             profile_json=excluded.profile_json,
             status='draft',
-            method='cv',
+            method=excluded.method,
             document_id=excluded.document_id,
             updated=excluded.updated
         """,
         (
             u["id"],
             json.dumps(profile, ensure_ascii=False),
+            method,
             document["id"],
             now,
             now,
@@ -814,7 +1265,7 @@ async def upload_cv_profile(
     return {
         "ok": True,
         "status": "draft",
-        "method": "cv",
+        "method": method,
         "profile": profile,
         "document": {
             "id": document["id"],
@@ -824,13 +1275,15 @@ async def upload_cv_profile(
         },
         "extraction": {
             **parser_info,
+            "ai_provider": ai_provider,
+            "ai_model": ai_model,
+            "ai_error": ai_error,
             "fields_found": len(evidence),
             "fields": evidence,
         },
-        "message": (
-            "CV processed. Please review and correct your profile before confirming."
-        ),
+        "message": message,
     }
+
 
 @app.post("/api/cv")
 async def upload_cv(text: str = Form(""), file: Optional[UploadFile] = File(None), u=Depends(current_user)):

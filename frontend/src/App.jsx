@@ -2342,6 +2342,10 @@ const emptyCandidateProfile = {
   education: [],
   experience: [],
   projects: [],
+  skills: [],
+  certifications: [],
+  achievements: [],
+  languages: [],
   preferences: {
     job_types: ["Internship", "Full-time"],
     work_mode: "Any",
@@ -2352,6 +2356,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
   const [p, setP] = useState(emptyCandidateProfile),
     [account, setAccount] = useState({}),
     [cv, setCv] = useState(null),
+    [evidence, setEvidence] = useState([]),
     [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false),
     [message, setMessage] = useState(""),
@@ -2365,7 +2370,13 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
 
       const r = await api(endpoint);
 
-      setAccount(r.user || {});
+      setAccount(
+        r.user ||
+          (r.profile
+            ? { name: r.profile.name, email: r.profile.email }
+            : {}),
+      );
+      setEvidence(r.extraction || []);
 
       const profileData = r.profile || r.draft || {};
 
@@ -2481,8 +2492,8 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
           <span style={{ width: progress + "%" }} />
         </div>
         <div className="profile-mini-stat">
-          <strong>{cv?.skills?.length || 0}</strong>
-          <span>Confirmed skills</span>
+          <strong>{p.skills.length}</strong>
+          <span>Listed skills (unverified)</span>
         </div>
         <div className="profile-mini-stat">
           <strong>{p.experience.length}</strong>
@@ -2506,6 +2517,28 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
           <p className="err" role="alert">
             {error}
           </p>
+        )}
+        {draftMode && evidence.length > 0 && (
+          <section className="portal-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="eyebrow">SOURCE EVIDENCE</span>
+                <h2>CV extraction evidence</h2>
+                <p>
+                  These snippets show what the extraction was based on. Review
+                  and correct every draft field before confirming.
+                </p>
+              </div>
+            </div>
+            <div className="job-grid">
+              {evidence.map((entry) => (
+                <article className="job-card" key={entry.id || entry.field}>
+                  <strong>{entry.field}</strong>
+                  <p>{entry.source_snippet}</p>
+                </article>
+              ))}
+            </div>
+          </section>
         )}
         <section className="portal-panel">
           <div className="panel-heading">
@@ -2890,6 +2923,249 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
             <p className="empty-inline">
               Add projects to demonstrate what you can build.
             </p>
+          )}
+        </section>
+        <section className="portal-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">SKILLS</span>
+              <h2>Skills</h2>
+              <p>These are candidate-provided claims, not independently verified.</p>
+            </div>
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() => add("skills", { name: "", category: "" })}
+            >
+              + Add skill
+            </button>
+          </div>
+          {p.skills.map((x, i) => (
+            <div className="repeat-card" key={i}>
+              <div className="repeat-top">
+                <strong>Skill {i + 1}</strong>
+                <button
+                  type="button"
+                  className="text-danger"
+                  onClick={() => remove("skills", i)}
+                >
+                  Remove
+                </button>
+              </div>
+              <div className="form-grid">
+                <label>
+                  Skill
+                  <input
+                    required
+                    maxLength={100}
+                    value={x.name}
+                    onChange={(e) => item("skills", i, "name", e.target.value)}
+                  />
+                </label>
+                <label>
+                  Category
+                  <input
+                    maxLength={60}
+                    value={x.category}
+                    onChange={(e) =>
+                      item("skills", i, "category", e.target.value)
+                    }
+                    placeholder="Technical, soft skill, tool…"
+                  />
+                </label>
+              </div>
+            </div>
+          ))}
+          {!p.skills.length && (
+            <p className="empty-inline">Add your technical, soft and tool skills.</p>
+          )}
+        </section>
+        <section className="portal-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">CREDENTIALS</span>
+              <h2>Certifications</h2>
+            </div>
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() =>
+                add("certifications", {
+                  name: "",
+                  issuer: "",
+                  issue_date: "",
+                  expiry_date: "",
+                  credential_id: "",
+                  credential_url: "",
+                })
+              }
+            >
+              + Add certification
+            </button>
+          </div>
+          {p.certifications.map((x, i) => (
+            <div className="repeat-card" key={i}>
+              <div className="repeat-top">
+                <strong>Certification {i + 1}</strong>
+                <button
+                  type="button"
+                  className="text-danger"
+                  onClick={() => remove("certifications", i)}
+                >
+                  Remove
+                </button>
+              </div>
+              <div className="form-grid">
+                {[
+                  ["name", "Certification"],
+                  ["issuer", "Issuing organization"],
+                  ["issue_date", "Issue date"],
+                  ["expiry_date", "Expiry date"],
+                  ["credential_id", "Credential ID"],
+                  ["credential_url", "Credential URL"],
+                ].map(([key, label]) => (
+                  <label key={key}>
+                    {label}
+                    <input
+                      required={key === "name"}
+                      maxLength={key === "credential_url" ? 300 : 180}
+                      value={x[key] || ""}
+                      onChange={(e) =>
+                        item("certifications", i, key, e.target.value)
+                      }
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+          ))}
+          {!p.certifications.length && (
+            <p className="empty-inline">Add relevant certifications if you have them.</p>
+          )}
+        </section>
+        <section className="portal-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">HIGHLIGHTS</span>
+              <h2>Achievements</h2>
+            </div>
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() =>
+                add("achievements", { title: "", description: "", date: "" })
+              }
+            >
+              + Add achievement
+            </button>
+          </div>
+          {p.achievements.map((x, i) => (
+            <div className="repeat-card" key={i}>
+              <div className="repeat-top">
+                <strong>Achievement {i + 1}</strong>
+                <button
+                  type="button"
+                  className="text-danger"
+                  onClick={() => remove("achievements", i)}
+                >
+                  Remove
+                </button>
+              </div>
+              <div className="form-grid">
+                <label>
+                  Title
+                  <input
+                    required
+                    maxLength={180}
+                    value={x.title}
+                    onChange={(e) =>
+                      item("achievements", i, "title", e.target.value)
+                    }
+                  />
+                </label>
+                <label>
+                  Date
+                  <input
+                    maxLength={40}
+                    value={x.date}
+                    onChange={(e) =>
+                      item("achievements", i, "date", e.target.value)
+                    }
+                  />
+                </label>
+              </div>
+              <label>
+                Description
+                <textarea
+                  rows={2}
+                  maxLength={1000}
+                  value={x.description}
+                  onChange={(e) =>
+                    item("achievements", i, "description", e.target.value)
+                  }
+                />
+              </label>
+            </div>
+          ))}
+          {!p.achievements.length && (
+            <p className="empty-inline">Add awards, publications or other achievements.</p>
+          )}
+        </section>
+        <section className="portal-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">LANGUAGES</span>
+              <h2>Languages</h2>
+            </div>
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() =>
+                add("languages", { name: "", proficiency: "" })
+              }
+            >
+              + Add language
+            </button>
+          </div>
+          {p.languages.map((x, i) => (
+            <div className="repeat-card" key={i}>
+              <div className="repeat-top">
+                <strong>Language {i + 1}</strong>
+                <button
+                  type="button"
+                  className="text-danger"
+                  onClick={() => remove("languages", i)}
+                >
+                  Remove
+                </button>
+              </div>
+              <div className="form-grid">
+                <label>
+                  Language
+                  <input
+                    required
+                    maxLength={100}
+                    value={x.name}
+                    onChange={(e) =>
+                      item("languages", i, "name", e.target.value)
+                    }
+                  />
+                </label>
+                <label>
+                  Proficiency
+                  <input
+                    maxLength={80}
+                    value={x.proficiency}
+                    onChange={(e) =>
+                      item("languages", i, "proficiency", e.target.value)
+                    }
+                  />
+                </label>
+              </div>
+            </div>
+          ))}
+          {!p.languages.length && (
+            <p className="empty-inline">Add the languages you speak.</p>
           )}
         </section>
         <section className="portal-panel">
