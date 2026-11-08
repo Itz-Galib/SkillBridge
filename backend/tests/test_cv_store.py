@@ -112,6 +112,13 @@ def test_cv_text_extraction_stays_private_until_profile_confirmation(monkeypatch
                     "source": "ai_extraction",
                     "confidence": 0.0,
                 },
+                {
+                    "field": "skills.0.name",
+                    "value": "Python",
+                    "source_snippet": "Python",
+                    "source": "ai_extraction",
+                    "confidence": 0.0,
+                },
             ],
             "provider": "openai",
             "model": "test-model",
@@ -131,17 +138,25 @@ def test_cv_text_extraction_stays_private_until_profile_confirmation(monkeypatch
 
     draft = client.get("/api/candidate/profile/draft", headers=headers)
     assert draft.status_code == 200
-    assert draft.json()["profile"]["email"] == "profile-draft@example.com"
+    assert draft.json()["profile"]["email"] == "rafi@example.com"
     assert draft.json()["profile"]["name"] == "CV Name"
-    assert draft.json()["profile"]["email"] == "profile-draft@example.com"
-    assert any(
-        entry["field"] == "name_suggestion"
-        and entry["source_snippet"] == "CV Name"
-        for entry in draft.json()["extraction"]
-    )
+    assert draft.json()["profile"]["email"] == "rafi@example.com"
+    assert "name_suggestion" not in draft.json()["extraction"]
     assert draft.json()["profile"]["experience"][0]["title"] == "Software Intern"
-    assert draft.json()["profile"]["projects"][0]["url"] == "https://example.test"
-    assert draft.json()["extraction"]
+    assert draft.json()["profile"]["projects"][0]["url"] == ""
+    assert "fields" not in draft.json()["extraction"]
+    assert "low_confidence_fields" in draft.json()["extraction"]
+    assert "completeness" in draft.json()
+    extraction_response = response.json()["extraction"]
+    assert "fields" not in extraction_response
+    assert len(extraction_response["low_confidence_fields"]) == len(
+        set(extraction_response["low_confidence_fields"])
+    )
+    stored_evidence = cv_store.list_extractions(
+        uid, response.json()["document"]["id"]
+    )
+    pairs = [(row["field"], row["value"]) for row in stored_evidence]
+    assert len(pairs) == len(set(pairs))
 
     edited = draft.json()["profile"]
     edited["skills"][0]["category"] = "Technical"
@@ -170,8 +185,12 @@ def test_cv_text_extraction_stays_private_until_profile_confirmation(monkeypatch
 
     confirmed_response = client.get("/api/candidate/profile", headers=headers).json()
     profile = confirmed_response["profile"]
+    assert confirmed_response["completeness"]["total"] >= 0
+    assert "Projects" in confirmed_response["completeness"]["sections"]
     assert profile["name"] == "CV Name"
+    assert profile["email"] == "rafi@example.com"
     assert confirmed_response["user"]["name"] == "Rafi Ahmed"
+    assert confirmed_response["user"]["email"] == "profile-draft@example.com"
     assert profile["skills"] == [
         {"name": "Python", "category": "Technical", "status": "claimed"}
     ]
@@ -182,7 +201,10 @@ def test_cv_text_extraction_stays_private_until_profile_confirmation(monkeypatch
     assert profile["education"][0]["grade"] == "3.8"
     assert profile["experience"][0]["achievements"] == ["Improved response times"]
     assert profile["experience"][0]["technologies"] == ["Python", "FastAPI"]
-    assert profile["projects"][0]["role"] == "Developer"
+    assert profile["projects"][0] == {
+        "name": "SkillBridge",
+        "url": "",
+    }
 
     updated_profile = {key: value for key, value in profile.items() if key != "updated"}
     updated_profile["name"] = "Reviewed Profile Name"

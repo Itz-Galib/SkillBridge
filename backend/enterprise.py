@@ -86,16 +86,17 @@ class ExperienceItem(ProfileModel):
     start_date: str = Field(default="", max_length=20)
     end_date: str = Field(default="", max_length=20)
     current: bool = False
+    duration_months: int = Field(default=0, ge=0, le=600)
     description: str = Field(default="", max_length=2000)
     achievements: List[Text160] = Field(default_factory=list, max_length=30)
     technologies: List[Text160] = Field(default_factory=list, max_length=30)
 
 class ProjectItem(ProfileModel):
     name: str = Field(default="", max_length=160)
+    url: str = Field(default="", max_length=300)
     description: str = Field(default="", max_length=2000)
     role: str = Field(default="", max_length=160)
     technologies: List[Text160] = Field(default_factory=list, max_length=30)
-    url: str = Field(default="", max_length=300)
     start_date: str = Field(default="", max_length=40)
     end_date: str = Field(default="", max_length=40)
 
@@ -121,6 +122,19 @@ class LanguageItem(ProfileModel):
     name: str = Field(default="", max_length=100)
     proficiency: str = Field(default="", max_length=80)
 
+class ReferenceItem(ProfileModel):
+    name: str = Field(default="", max_length=120)
+    relationship: str = Field(default="", max_length=80)
+    email: str = Field(default="", max_length=254)
+    phone: str = Field(default="", max_length=40)
+
+class VolunteerItem(ProfileModel):
+    organization: str = Field(default="", max_length=120)
+    role: str = Field(default="", max_length=120)
+    start_date: str = Field(default="", max_length=20)
+    end_date: str = Field(default="", max_length=20)
+    description: str = Field(default="", max_length=1000)
+
 class CandidatePreferences(ProfileModel):
     job_types: List[Literal["Internship", "Full-time", "Part-time", "Contract", "Temporary"]] = Field(default_factory=list, max_length=5)
     work_mode: Literal["", "Any", "Remote", "Hybrid", "On-site"] = ""
@@ -143,6 +157,8 @@ class CandidateProfileUpdate(ProfileModel):
     certifications: List[CertificationItem] = Field(default_factory=list, max_length=30)
     achievements: List[AchievementItem] = Field(default_factory=list, max_length=30)
     languages: List[LanguageItem] = Field(default_factory=list, max_length=20)
+    references: List[ReferenceItem] = Field(default_factory=list, max_length=20)
+    volunteer: List[VolunteerItem] = Field(default_factory=list, max_length=20)
     preferences: CandidatePreferences = Field(default_factory=CandidatePreferences)
 
 class CandidateProfileDraftInput(CandidateProfileUpdate):
@@ -165,6 +181,11 @@ def _decode_profile_json(raw):
     from ai_providers import empty_profile, normalize_profile
 
     canonical = {**empty_profile(), **profile}
+    canonical["projects"] = [
+        {"name": item.get("name", ""), "url": item.get("url") or item.get("project_url", "")}
+        for item in canonical.get("projects", [])
+        if isinstance(item, dict)
+    ]
     preferences = canonical.get("preferences")
     if preferences == {
         "job_types": ["Internship", "Full-time"],
@@ -248,13 +269,16 @@ def get_candidate_profile_draft(user=Depends(current_user)):
 
     profile = _decode_profile_json(draft["profile_json"])
     profile["name"] = profile.get("name") or user["name"]
-    profile["email"] = user["email"]
+    profile["email"] = profile.get("email") or user["email"]
+    from main import profile_completeness, profile_review_summary
+    review = profile_review_summary(profile, extraction)
     return {
         "status": draft["status"],
         "method": draft["method"],
         "document_id": draft["document_id"],
         "profile": profile,
-        "extraction": extraction,
+        "extraction": review,
+        "completeness": profile_completeness(profile),
     }
 
 
@@ -301,7 +325,7 @@ def save_candidate_profile_draft(
 
     profile = _profile_payload(body)
     profile["name"] = profile.get("name") or user["name"]
-    profile["email"] = user["email"]
+    profile["email"] = profile.get("email") or user["email"]
 
     if document_id:
         import cv_store
@@ -337,10 +361,18 @@ def save_candidate_profile_draft(
 
     audit(user["id"], "candidate_profile_draft_saved", method)
 
+    extraction = []
+    if document_id:
+        import cv_store
+
+        extraction = cv_store.list_extractions(user["id"], document_id)
+    from main import profile_completeness, profile_review_summary
     return {
         "ok": True,
         "status": "draft",
         "method": method,
+        "completeness": profile_completeness(profile),
+        "extraction": profile_review_summary(profile, extraction),
     }
 
 
@@ -389,7 +421,7 @@ def confirm_candidate_profile(user=Depends(current_user)):
             },
         ) from exc
     profile["name"] = profile["name"].strip() or user["name"]
-    profile["email"] = user["email"]
+    profile["email"] = profile.get("email") or user["email"]
 
     required_fields = {
         "education": ("institution",),
@@ -399,6 +431,8 @@ def confirm_candidate_profile(user=Depends(current_user)):
         "certifications": ("name",),
         "achievements": ("title",),
         "languages": ("name",),
+        "references": ("name",),
+        "volunteer": ("organization",),
     }
     incomplete = []
     for collection, fields in required_fields.items():
@@ -433,6 +467,7 @@ def confirm_candidate_profile(user=Depends(current_user)):
         profile["certifications"],
         profile["achievements"],
         profile["languages"],
+        profile["volunteer"],
     ])
 
     if not has_content:
@@ -479,9 +514,10 @@ def confirm_candidate_profile(user=Depends(current_user)):
                 user_id, name, headline, phone, location, summary,
                 linkedin, github, portfolio, education,
                 experience, projects, skills, certifications,
-                achievements, languages, preferences, updated
+                achievements, languages, email, profile_references,
+                volunteer, preferences, updated
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user["id"],
@@ -495,11 +531,17 @@ def confirm_candidate_profile(user=Depends(current_user)):
                 profile["portfolio"].strip(),
                 json.dumps(profile["education"]),
                 json.dumps(profile["experience"]),
-                json.dumps(profile["projects"]),
+                json.dumps([
+                    {"name": item["name"], "url": item["url"]}
+                    for item in profile["projects"]
+                ]),
                 json.dumps(profile["skills"]),
                 json.dumps(profile["certifications"]),
                 json.dumps(profile["achievements"]),
                 json.dumps(profile["languages"]),
+                profile["email"].strip(),
+                json.dumps(profile["references"]),
+                json.dumps(profile["volunteer"]),
                 json.dumps(profile["preferences"]),
                 now,
             ),
@@ -535,6 +577,7 @@ def get_candidate_profile(user=Depends(current_user)):
             "linkedin": "", "github": "", "portfolio": "",
             "education": [], "experience": [], "projects": [],
             "skills": [], "certifications": [], "achievements": [], "languages": [],
+            "references": [], "volunteer": [],
             "preferences": {"job_types": [], "work_mode": "", "locations": []},
             "updated": None,
         },
@@ -547,10 +590,18 @@ def get_candidate_profile(user=Depends(current_user)):
         p = dict(row)
         for key in (
             "education", "experience", "projects", "skills",
-            "certifications", "achievements", "languages", "preferences"
+            "certifications", "achievements", "languages", "preferences",
+            "profile_references", "volunteer",
         ):
             p[key] = json.loads(p[key] or ("{}" if key == "preferences" else "[]"))
+        p["references"] = p.pop("profile_references", [])
+        p["projects"] = [
+            {"name": item.get("name", ""), "url": item.get("url") or item.get("project_url", "")}
+            for item in p["projects"]
+            if isinstance(item, dict)
+        ]
         p["name"] = p.get("name") or user["name"]
+        p["email"] = p.get("email") or user["email"]
         if p["preferences"] == {
             "job_types": ["Internship", "Full-time"],
             "work_mode": "Any",
@@ -562,34 +613,50 @@ def get_candidate_profile(user=Depends(current_user)):
                 "locations": [],
             }
         result["profile"].update({k: p[k] for k in (
-            "name", "headline", "phone", "location", "summary", "linkedin", "github",
+            "name", "email", "headline", "phone", "location", "summary", "linkedin", "github",
             "portfolio", "education", "experience", "projects", "skills",
-            "certifications", "achievements", "languages", "preferences", "updated"
+            "certifications", "achievements", "languages", "references",
+            "volunteer", "preferences", "updated"
         )})
+    else:
+        result["profile"]["email"] = user["email"]
+        result["profile"]["references"] = []
+        result["profile"]["volunteer"] = []
+    from main import profile_completeness
+    result["completeness"] = profile_completeness(result["profile"])
     return result
 
 @router.put("/api/candidate/profile")
 def update_candidate_profile(body: CandidateProfileUpdate, user=Depends(current_user)):
     require_role(user, "candidate")
-    preferences = _profile_payload(body)["preferences"]
-    run("""INSERT INTO candidate_profiles(user_id,name,headline,phone,location,summary,linkedin,github,portfolio,education,experience,projects,skills,certifications,achievements,languages,preferences,updated)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    profile = _profile_payload(body)
+    preferences = profile["preferences"]
+    run("""INSERT INTO candidate_profiles(user_id,name,email,headline,phone,location,summary,linkedin,github,portfolio,education,experience,projects,skills,certifications,achievements,languages,profile_references,volunteer,preferences,updated)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,headline=excluded.headline,phone=excluded.phone,location=excluded.location,
            summary=excluded.summary,linkedin=excluded.linkedin,github=excluded.github,portfolio=excluded.portfolio,
            education=excluded.education,experience=excluded.experience,projects=excluded.projects,
            skills=excluded.skills,certifications=excluded.certifications,achievements=excluded.achievements,
-           languages=excluded.languages,preferences=excluded.preferences,updated=excluded.updated""",
-        (user["id"],body.name.strip() or user["name"],body.headline.strip(),body.phone.strip(),body.location.strip(),body.summary.strip(),
+           email=excluded.email,languages=excluded.languages,profile_references=excluded.profile_references,
+           volunteer=excluded.volunteer,preferences=excluded.preferences,updated=excluded.updated""",
+        (user["id"],profile["name"].strip() or user["name"],profile["email"].strip() or user["email"],body.headline.strip(),body.phone.strip(),body.location.strip(),body.summary.strip(),
          body.linkedin.strip(),body.github.strip(),body.portfolio.strip(),
          json.dumps([x.model_dump() for x in body.education]),json.dumps([x.model_dump() for x in body.experience]),
-         json.dumps([x.model_dump() for x in body.projects]),
+         json.dumps([{"name": x.name, "url": x.url} for x in body.projects]),
          json.dumps([x.model_dump() for x in body.skills]),
          json.dumps([x.model_dump() for x in body.certifications]),
          json.dumps([x.model_dump() for x in body.achievements]),
          json.dumps([x.model_dump() for x in body.languages]),
+         json.dumps([x.model_dump() for x in body.references]),
+         json.dumps([x.model_dump() for x in body.volunteer]),
          json.dumps(preferences),time.time()))
     audit(user["id"], "candidate_profile_updated")
-    return {"ok": True, "updated": time.time()}
+    from main import profile_completeness
+    return {
+        "ok": True,
+        "updated": time.time(),
+        "completeness": profile_completeness(profile),
+    }
 
 @router.get("/api/enterprise/me")
 def enterprise_me(user=Depends(current_user)):

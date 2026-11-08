@@ -55,7 +55,6 @@ PROVIDERS = {
     },
 }
 
-
 # ---------------------------------------------------------
 # Errors (safe for API responses — no keys, no secret bodies)
 # ---------------------------------------------------------
@@ -131,6 +130,8 @@ def empty_profile() -> dict:
         "certifications": [],
         "achievements": [],
         "languages": [],
+        "references": [],
+        "volunteer": [],
         "preferences": {
             "job_types": [],
             "work_mode": "",
@@ -161,9 +162,12 @@ IMPORTANT RULES:
 8. Do not convert an unverified skill into a verified skill.
 9. Extract technical skills, soft skills, tools and technologies.
 10. Do not assume career preferences unless explicitly stated.
-11. Keep descriptions concise but preserve important details.
-12. Return ONLY valid JSON. Do not use Markdown code fences.
-13. For every non-empty field you populate, include an evidence entry
+11. Do not extract or infer gender, date of birth, religion, permanent
+    address, references, or reference contact details.
+12. Projects contain only a title ("name") and URL ("url"). Do not extract
+    project descriptions, roles, technologies, or dates.
+13. Return ONLY valid JSON. Do not use Markdown code fences.
+14. For every non-empty field you populate, include an evidence entry
     with a short source_snippet that appears in the CV text. Use canonical
     paths such as "experience[0].title". Drop unsupported fields.
 
@@ -193,6 +197,9 @@ Return this JSON structure:
     }
   ],
 
+  "references": [],
+  "volunteer": [],
+
   "experience": [
     {
       "title": "",
@@ -204,19 +211,15 @@ Return this JSON structure:
       "current": false,
       "description": "",
       "achievements": [],
-      "technologies": []
+      "technologies": [],
+      "duration_months": 0
     }
   ],
 
   "projects": [
     {
       "name": "",
-      "description": "",
-      "role": "",
-      "technologies": [],
-      "url": "",
-      "start_date": "",
-      "end_date": ""
+      "url": ""
     }
   ],
 
@@ -367,16 +370,9 @@ PROFILE_OBJECT_DEFAULTS = {
         "description": "",
         "achievements": [],
         "technologies": [],
+        "duration_months": 0,
     },
-    "projects": {
-        "name": "",
-        "description": "",
-        "role": "",
-        "technologies": [],
-        "url": "",
-        "start_date": "",
-        "end_date": "",
-    },
+    "projects": {"name": "", "url": ""},
     "skills": {"name": "", "category": "", "status": "claimed"},
     "certifications": {
         "name": "",
@@ -411,10 +407,10 @@ PROFILE_ITEM_LIMITS = {
         "title": 160, "company": 160, "location": 160,
         "employment_type": 60, "start_date": 20, "end_date": 20,
         "description": 2000,
+        "duration_months": 600,
     }),
     "projects": (20, {
-        "name": 160, "description": 2000, "role": 160, "url": 300,
-        "start_date": 40, "end_date": 40,
+        "name": 160, "url": 300,
     }),
     "skills": (80, {"name": 100, "category": 60, "status": 20}),
     "certifications": (30, {
@@ -458,6 +454,9 @@ def _normalize_item(field: str, item: Any, index: int, evidence: list) -> dict:
         if key in ("current",):
             if not isinstance(value, bool):
                 raise ValueError(f"profile schema: {field}.{key} must be a boolean")
+        elif key == "duration_months" and field == "experience":
+            if not isinstance(value, int) or value < 0 or value > limits[key]:
+                raise ValueError(f"profile schema: invalid {field}.{key}")
         elif isinstance(defaults[key], list):
             if not isinstance(value, list) or len(value) > 30:
                 raise ValueError(f"profile schema: {field}.{key} must be a bounded list")
@@ -556,6 +555,26 @@ def normalize_profile(data: dict) -> dict:
             for index, item in enumerate(data[field])
         ]
 
+    for collection, allowed_fields in {
+        "references": {"name", "relationship", "email", "phone"},
+        "volunteer": {"organization", "role", "start_date", "end_date", "description"},
+    }.items():
+        value = data.get(collection, [])
+        if not isinstance(value, list) or len(value) > 20:
+            raise ValueError(f"profile schema: invalid {collection} list")
+        normalized_items = []
+        for item in value:
+            if not isinstance(item, dict) or set(item) - allowed_fields:
+                raise ValueError(f"profile schema: invalid {collection} entry")
+            normalized_item = {}
+            for key in allowed_fields:
+                member = item.get(key, "")
+                if not isinstance(member, str) or len(member) > 300:
+                    raise ValueError(f"profile schema: invalid {collection}.{key}")
+                normalized_item[key] = member.strip()
+            normalized_items.append(normalized_item)
+        profile[collection] = normalized_items
+
     return {
         "profile": profile,
         "evidence": normalized_evidence,
@@ -614,6 +633,8 @@ def _validated_result(
     allowed_top = set(PROFILE_SCALAR_FIELDS) | set(PROFILE_LIST_FIELDS) | {
         "preferences",
         "evidence",
+        "references",
+        "volunteer",
     }
     extra = set(data.keys()) - allowed_top
     if extra:
@@ -621,6 +642,8 @@ def _validated_result(
 
     normalized = normalize_profile(data)
     profile = normalized["profile"]
+    profile["references"] = []
+    profile["volunteer"] = []
     emap = _evidence_map(normalized["evidence"])
     kept_evidence = []
     seen_evidence = set()

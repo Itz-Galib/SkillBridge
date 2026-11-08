@@ -1,7 +1,9 @@
 """SkillBridge Global R0 API (FastAPI). Scores come from stored answer keys + server logic; AI never grades."""
 import os, io, re, json, time, uuid, base64, hmac, hashlib, secrets, sqlite3, zipfile, logging
+from datetime import date
 from pathlib import Path
 from typing import Optional, List
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form
@@ -48,7 +50,7 @@ CREATE TABLE IF NOT EXISTS companies(id TEXT PRIMARY KEY, owner_user_id INTEGER 
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, location TEXT NOT NULL DEFAULT 'Remote', employment_type TEXT NOT NULL DEFAULT 'Full-time', skills TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', is_mock INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY, job_id TEXT NOT NULL, candidate_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'submitted', results_shared INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, UNIQUE(job_id, candidate_id));
 CREATE TABLE IF NOT EXISTS company_assessments(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, job_id TEXT, title TEXT NOT NULL, requirements TEXT NOT NULL, questions TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', created REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS candidate_profiles(user_id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', headline TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', linkedin TEXT NOT NULL DEFAULT '', github TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL DEFAULT '', education TEXT NOT NULL DEFAULT '[]', experience TEXT NOT NULL DEFAULT '[]', projects TEXT NOT NULL DEFAULT '[]', skills TEXT NOT NULL DEFAULT '[]', certifications TEXT NOT NULL DEFAULT '[]', achievements TEXT NOT NULL DEFAULT '[]', languages TEXT NOT NULL DEFAULT '[]', preferences TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS candidate_profiles(user_id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', headline TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', linkedin TEXT NOT NULL DEFAULT '', github TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL DEFAULT '', education TEXT NOT NULL DEFAULT '[]', experience TEXT NOT NULL DEFAULT '[]', projects TEXT NOT NULL DEFAULT '[]', skills TEXT NOT NULL DEFAULT '[]', certifications TEXT NOT NULL DEFAULT '[]', achievements TEXT NOT NULL DEFAULT '[]', languages TEXT NOT NULL DEFAULT '[]', profile_references TEXT NOT NULL DEFAULT '[]', volunteer TEXT NOT NULL DEFAULT '[]', preferences TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_blueprints(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_answer_events(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, question_id TEXT NOT NULL, revision INTEGER NOT NULL, answer_hash TEXT NOT NULL, answer_length INTEGER NOT NULL, created REAL NOT NULL);
 """
@@ -114,11 +116,12 @@ def init_db():
             "ALTER TABLE candidate_profiles ADD COLUMN name "
             "TEXT NOT NULL DEFAULT ''"
         )
-    for column in ("skills", "certifications", "achievements", "languages"):
+    for column in ("email", "profile_references", "volunteer"):
         if column not in profile_columns:
+            default = "" if column == "email" else "[]"
             run(
                 f"ALTER TABLE candidate_profiles ADD COLUMN {column} "
-                "TEXT NOT NULL DEFAULT '[]'"
+                f"TEXT NOT NULL DEFAULT '{default}'"
             )
     import cv_store  # CV document + extraction-draft tables (imported here to avoid a circular import)
     cv_store.ensure_schema()
@@ -342,6 +345,46 @@ def llm_extract(redacted: str):
             log.warning("LLM extraction failed: %s", type(ex).__name__)
     return None
 
+
+_URL_RE = re.compile(
+    r"(?i)(?<![a-z0-9@._-])(?:https?://|www\.)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}"
+    r"(?![a-z0-9.-])"
+    r"(?:/[^\s<>\"']*)?"
+)
+
+
+def _normalize_profile_url(value: str) -> str:
+    value = (value or "").strip().rstrip(".,;:!?)]}")
+    if not value:
+        return ""
+    if value.startswith("//"):
+        value = value[2:]
+    value = re.sub(r"^https?://", "", value, flags=re.I)
+    if value.lower().startswith("www."):
+        value = value[4:]
+    parsed = urlparse("https://" + value)
+    if not parsed.hostname or "." not in parsed.hostname:
+        return ""
+    return "https://" + parsed.netloc.lower() + parsed.path + (
+        "?" + parsed.query if parsed.query else ""
+    ) + ("#" + parsed.fragment if parsed.fragment else "")
+
+
+def _urls_in_text(text: str) -> list[str]:
+    return list(dict.fromkeys(
+        normalized
+        for match in _URL_RE.findall(text or "")
+        if (normalized := _normalize_profile_url(match))
+    ))
+
+
+def _append_document_links(text: str, links: list[str]) -> str:
+    links = list(dict.fromkeys(url for url in links if url))
+    if not links:
+        return text
+    return text.rstrip() + "\n\nLINKS FOUND IN DOCUMENT:\n" + "\n".join(links)
+
+
 def read_profile_cv(filename: str, data: bytes):
     """
     Read a PDF or DOCX CV.
@@ -371,9 +414,11 @@ def read_profile_cv(filename: str, data: bytes):
 
             page_texts = []
             ocr_pages = []
+            links = []
 
             for page_number, page in enumerate(pdf, start=1):
                 text = (page.get_text("text") or "").strip()
+                links.extend(_urls_in_text(text))
 
                 # Only OCR pages that have little or no embedded text.
                 if len(text) < 40:
@@ -425,6 +470,24 @@ def read_profile_cv(filename: str, data: bytes):
             pdf.close()
 
             raw_text = "\n\n".join(page_texts)
+            try:
+                from pypdf import PdfReader
+
+                for pdf_page in PdfReader(io.BytesIO(data)).pages:
+                    for annotation in pdf_page.get("/Annots", []):
+                        annotation = annotation.get_object()
+                        action = annotation.get("/A")
+                        if action:
+                            target = action.get_object().get("/URI")
+                            if target:
+                                normalized = _normalize_profile_url(str(target))
+                                if normalized:
+                                    links.append(normalized)
+            except Exception as ex:
+                log.warning("PDF link extraction failed: %s", type(ex).__name__)
+
+            links = list(dict.fromkeys(links))
+            raw_text = _append_document_links(raw_text, links)
 
             if len(raw_text.strip()) < 30:
                 raise HTTPException(
@@ -436,6 +499,7 @@ def read_profile_cv(filename: str, data: bytes):
                 "parser": "pymupdf",
                 "ocr_used": bool(ocr_pages),
                 "ocr_pages": ocr_pages,
+                "links_found": links,
             }
 
         except HTTPException:
@@ -464,6 +528,11 @@ def read_profile_cv(filename: str, data: bytes):
                     raise HTTPException(413, "DOCX expands beyond the allowed size")
 
                 xml = archive.read("word/document.xml")
+                relations = (
+                    archive.read("word/_rels/document.xml.rels")
+                    if "word/_rels/document.xml.rels" in names
+                    else b""
+                )
 
             import xml.etree.ElementTree as ET
 
@@ -486,6 +555,20 @@ def read_profile_cv(filename: str, data: bytes):
                     paragraphs.append(line)
 
             raw_text = "\n".join(paragraphs)
+            links = _urls_in_text(raw_text)
+            if relations:
+                relation_root = ET.fromstring(relations)
+                for relation in relation_root:
+                    target = relation.attrib.get("Target", "")
+                    if (
+                        relation.attrib.get("TargetMode") == "External"
+                        or target.lower().startswith(("http://", "https://", "www."))
+                    ):
+                        normalized = _normalize_profile_url(target)
+                        if normalized:
+                            links.append(normalized)
+            links = list(dict.fromkeys(links))
+            raw_text = _append_document_links(raw_text, links)
 
             if len(raw_text.strip()) < 30:
                 raise HTTPException(422, "Could not extract enough text from this DOCX")
@@ -494,6 +577,7 @@ def read_profile_cv(filename: str, data: bytes):
                 "parser": "docx_xml",
                 "ocr_used": False,
                 "ocr_pages": [],
+                "links_found": links,
             }
 
         except HTTPException:
@@ -509,10 +593,13 @@ def read_profile_cv(filename: str, data: bytes):
             raise HTTPException(422, "Text CV must be encoded as UTF-8")
         if len(raw_text) < 30:
             raise HTTPException(422, "Could not extract enough text from this CV")
+        links = _urls_in_text(raw_text)
+        raw_text = _append_document_links(raw_text, links)
         return raw_text, {
             "parser": "utf8_text",
             "ocr_used": False,
             "ocr_pages": [],
+            "links_found": links,
         }
 
     raise HTTPException(415, "Please upload a PDF, DOCX, TXT or MD file")
@@ -551,6 +638,8 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
         "certifications": [],
         "achievements": [],
         "languages": [],
+        "references": [],
+        "volunteer": [],
         "preferences": {
             "job_types": [],
             "work_mode": "",
@@ -580,11 +669,9 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
         r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
         text,
     )
-    if email_match and not profile["email"]:
+    if email_match:
         profile["email"] = email_match.group(0)
         add_evidence("email", profile["email"], 0.99, email_match.group(0))
-    elif email_match:
-        add_evidence("email", email_match.group(0), 0.99, email_match.group(0))
 
     phone_match = re.search(
         r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)",
@@ -594,29 +681,27 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
         profile["phone"] = phone_match.group(0).strip()
         add_evidence("phone", profile["phone"], 0.85, phone_match.group(0))
 
-    url_patterns = {
-        "linkedin": r"(?:https?://)?(?:www\.)?linkedin\.com/[^\s|,;]+",
-        "github": r"(?:https?://)?(?:www\.)?github\.com/[^\s|,;]+",
-    }
-    for field, pattern in url_patterns.items():
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            value = match.group(0).rstrip(".,;)")
-            if not value.startswith("http"):
-                value = "https://" + value
-            profile[field] = value
-            add_evidence(field, value, 0.98, match.group(0))
+    for url in _urls_in_text(text):
+        parsed_url = urlparse(url)
+        path_parts = [part for part in parsed_url.path.split("/") if part]
+        if parsed_url.hostname == "linkedin.com" and len(path_parts) >= 2 and path_parts[0].lower() == "in":
+            profile["linkedin"] = url
+            add_evidence("linkedin", url, 0.98, url)
+        elif (
+            parsed_url.hostname == "github.com"
+            and len(path_parts) == 1
+            and path_parts[0].lower() not in {"features", "topics", "settings", "organizations"}
+        ):
+            profile["github"] = url
+            add_evidence("github", url, 0.98, url)
 
-    for match in re.finditer(r"https?://[^\s|,;]+", text, re.IGNORECASE):
-        url = match.group(0).rstrip(".,;)")
-        low_url = url.lower()
-        if "linkedin.com" in low_url or "github.com" in low_url:
-            continue
-        if any(x in low_url for x in ("facebook.com", "twitter.com", "x.com", "instagram.com")):
-            continue
-        profile["portfolio"] = url
-        add_evidence("portfolio", url, 0.75, url)
-        break
+    portfolio_match = re.search(
+        r"(?i)\bportfolio\b\s*[:|,-]?\s*((?:https?://|www\.)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:/[^\s<>\"']*)?)",
+        text,
+    )
+    if portfolio_match:
+        profile["portfolio"] = _normalize_profile_url(portfolio_match.group(1))
+        add_evidence("portfolio", profile["portfolio"], 0.9, portfolio_match.group(1))
 
     # ---- Name (first non-contact short line) ----
     if not profile["name"]:
@@ -633,7 +718,7 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
                     break
 
     # ---- Location (city/country style lines near the top) ----
-    location_hint = re.search(
+    location_pattern = re.compile(
         r"\b("
         r"Dhaka|Chittagong|Chattogram|Sylhet|Khulna|Rajshahi|Barisal|"
         r"Rangpur|Mymensingh|Gazipur|Narayanganj|"
@@ -641,18 +726,18 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
         r"Remote|Hybrid|"
         r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?,\s*[A-Z]{2,}"
         r")\b",
-        text,
     )
-    if location_hint:
-        # Prefer a short line that contains the match
-        for line in lines[:15]:
-            if location_hint.group(0).lower() in line.lower() and len(line) < 80:
-                profile["location"] = line.strip()[:120]
-                add_evidence("location", profile["location"], 0.65, line)
-                break
-        if not profile["location"]:
+    for line in lines[:15]:
+        if re.search(
+            r"(?i)\b(permanent address|address|house|road|rd\.|flat|block|sector|village)\b",
+            line,
+        ):
+            continue
+        location_hint = location_pattern.search(line)
+        if location_hint:
             profile["location"] = location_hint.group(0)
             add_evidence("location", profile["location"], 0.55, location_hint.group(0))
+            break
 
     # ---- Section split ----
     section_aliases = {
@@ -720,7 +805,13 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
             sections.setdefault(current_section, []).append(line)
 
     # ---- Summary / headline ----
-    summary_lines = sections.get("summary", [])
+    summary_lines = [
+        line for line in sections.get("summary", [])
+        if not re.match(
+            r"(?i)^\s*(?:gender|dob|date of birth|religion|permanent address)\s*[:\-]",
+            line,
+        )
+    ]
     if summary_lines:
         summary = " ".join(summary_lines)[:3000]
         profile["summary"] = summary
@@ -930,6 +1021,7 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
             "start_date": years[0] if years else "",
             "end_date": "Present" if is_current else (years[-1] if years else ""),
             "is_current": is_current,
+            "duration_months": 0,
             "description": body or header[:500],
             "achievements": [],
             "technologies": [],
@@ -946,29 +1038,13 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
 
     # ---- Projects ----
     for line in sections.get("projects", [])[:20]:
-        cleaned = line.lstrip("•-*–—0123456789. ").strip()
+        cleaned = line.strip()
         if len(cleaned) < 3:
             continue
-        if " - " in cleaned:
-            project_name, description = cleaned.split(" - ", 1)
-        elif " — " in cleaned:
-            project_name, description = cleaned.split(" — ", 1)
-        elif ":" in cleaned[:60]:
-            project_name, description = cleaned.split(":", 1)
-        else:
-            project_name, description = cleaned, ""
         item = {
-            "name": project_name.strip()[:160],
-            "description": description.strip()[:2000],
-            "role": "",
-            "technologies": [],
-            "project_url": "",
-            "start_date": "",
-            "end_date": "",
+            "name": cleaned[:160],
+            "url": "",
         }
-        url_m = re.search(r"https?://[^\s|,;]+", cleaned)
-        if url_m:
-            item["project_url"] = url_m.group(0).rstrip(".,;)")
         profile["projects"].append(item)
         add_evidence("projects", item, 0.55, line)
 
@@ -1079,63 +1155,433 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
     return canonical, evidence
 
 
+_SKILL_CANONICAL = {
+    "git": "Git & GitHub",
+    "github": "Git & GitHub",
+    "gitlab": "Git & GitHub",
+    "js": "JavaScript (ES6+)",
+    "javascript": "JavaScript (ES6+)",
+    "es6": "JavaScript (ES6+)",
+    "ecmascript6": "JavaScript (ES6+)",
+    "react": "React.js",
+    "reactjs": "React.js",
+    "node": "Node.js",
+    "nodejs": "Node.js",
+    "typescript": "TypeScript",
+    "ts": "TypeScript",
+}
+
+_TAXONOMY_SKILL_CATEGORIES = {
+    "sql": "Database",
+    "mongodb": "Database",
+    "neo4j": "Database",
+    "redis": "Database",
+    "python": "Language",
+    "javascript": "Language",
+    "java": "Language",
+    "cpp": "Language",
+    "csharp": "Language",
+    "html_css": "Frontend",
+    "docker": "Tool",
+    "kubernetes": "Tool",
+    "aws": "Tool",
+    "azure": "Tool",
+    "gcp": "Tool",
+    "git": "Tool",
+    "excel": "Tool",
+    "visualization": "Tool",
+    "linux": "Tool",
+}
+
+
+def _skill_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
+
+
+def _skill_aliases() -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+    aliases = {}
+    for taxonomy_id, entry in TAXONOMY.items():
+        canonical = _SKILL_CANONICAL.get(taxonomy_id, entry["name"])
+        category = _TAXONOMY_SKILL_CATEGORIES.get(taxonomy_id, "Other")
+        for alias in [entry["name"], *entry.get("aliases", [])]:
+            aliases[_skill_key(alias)] = (canonical, category)
+    for alias, canonical in _SKILL_CANONICAL.items():
+        category = "Tool" if canonical == "Git & GitHub" else "Language"
+        if canonical == "React.js":
+            category = "Frontend"
+        elif canonical == "Node.js":
+            category = "Backend"
+        aliases[_skill_key(alias)] = (canonical, category)
+        aliases[_skill_key(canonical)] = (canonical, category)
+    return aliases, {canonical: category for canonical, category in aliases.values()}
+
+
+def _profile_item_name(field: str, item: dict) -> str:
+    return str(item.get({
+        "education": "institution",
+        "experience": "company",
+        "projects": "name",
+        "skills": "name",
+        "certifications": "name",
+        "achievements": "title",
+        "languages": "name",
+        "volunteer": "organization",
+    }.get(field, "name"), "") or "").strip()
+
+
+def _dedupe_key(value: str) -> str:
+    return re.sub(r"[\W_]+", "", (value or "").casefold(), flags=re.UNICODE)
+
+
+def _date_parts(value: str) -> tuple[Optional[int], Optional[int]]:
+    value = (value or "").strip()
+    month_names = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    match = re.search(
+        r"\b(January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+(19|20)\d{2}\b",
+        value,
+        re.I,
+    )
+    if match:
+        year = int(re.search(r"(?:19|20)\d{2}", match.group(0)).group(0))
+        month = month_names[match.group(1)[:3].lower()]
+        return year, month
+    year_match = re.search(r"\b((?:19|20)\d{2})\b", value)
+    if year_match:
+        return int(year_match.group(1)), None
+    return None, None
+
+
+def _experience_duration(item: dict) -> tuple[int, bool]:
+    month = (
+        r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+"
+    )
+    year_or_month = rf"(?:{month})?(?:19|20)\d{{2}}"
+    text = " ".join(
+        str(item.get(field) or "")
+        for field in ("start_date", "end_date", "description")
+    )
+    date_range = re.search(
+        rf"(?i)(?P<start>{year_or_month})\s*(?:[-–—]|\bto\b)\s*"
+        rf"(?P<end>Present|Current|Now|{year_or_month})",
+        text,
+    )
+    current = bool(item.get("current")) or bool(
+        re.search(r"\b(present|current|now|ongoing|on going)\b",
+                  " ".join(str(item.get(field) or "") for field in ("company", "end_date", "description")),
+                  re.I)
+    )
+    start = item.get("start_date", "")
+    end = item.get("end_date", "")
+    if date_range:
+        start = date_range.group("start").strip()
+        end = date_range.group("end").strip()
+        item["start_date"] = start[:20]
+        item["end_date"] = end[:20]
+        current = current or bool(re.search(r"\b(present|current|now)\b", end, re.I))
+    if current and not end:
+        end = "Present"
+        item["end_date"] = end
+    start_year, start_month = _date_parts(str(start))
+    if current:
+        end_year, end_month = date.today().year, date.today().month
+    else:
+        end_year, end_month = _date_parts(str(end))
+    if start_year is None or end_year is None:
+        return 0, current
+    if start_month is None or end_month is None:
+        months = (end_year - start_year) * 12 + 1
+    else:
+        months = (end_year - start_year) * 12 + end_month - start_month + 1
+    return max(0, min(months, 600)), current
+
+
+def clean_profile(profile: dict) -> dict:
+    """Canonicalize CV fields, remove parser noise, and deduplicate sections."""
+    from ai_providers import empty_profile, normalize_profile
+
+    canonical = {**empty_profile(), **(profile or {})}
+    canonical["projects"] = [
+        {"name": item.get("name", ""), "url": item.get("url") or item.get("project_url", "")}
+        for item in canonical.get("projects", [])
+        if isinstance(item, dict)
+    ]
+    normalized_experience = []
+    for source_item in canonical.get("experience", []):
+        if not isinstance(source_item, dict):
+            normalized_experience.append(source_item)
+            continue
+        item = dict(source_item)
+        item["duration_months"], item["current"] = _experience_duration(item)
+        normalized_experience.append(item)
+    canonical["experience"] = normalized_experience
+    cleaned = normalize_profile({**canonical, "evidence": []})["profile"]
+
+    def normalized_name(value: str) -> str:
+        value = re.sub(r"\s+", " ", (value or "")).strip()
+        if (
+            re.match(r"^[\s●•*\-−]", value)
+            or "[page" in value.casefold()
+            or "tech stack" in value.casefold()
+            or value.casefold().strip(" :-") == "tech stack"
+            or (field == "projects" and value.endswith((".", ":", ";")))
+            or len(value) < 3
+            or len(value) > 120
+        ):
+            return ""
+        return value
+
+    for field in (
+        "education", "experience", "projects", "skills", "certifications",
+        "achievements", "languages", "volunteer",
+    ):
+        results, seen = [], []
+        for original in cleaned.get(field, []):
+            item = dict(original)
+            if field == "experience":
+                company = item.get("company", "")
+                stripped = re.sub(
+                    r"\s*[-–—]\s*(?:on\s*going|ongoing|present|current)\s*$",
+                    "",
+                    company,
+                    flags=re.I,
+                ).strip()
+                if stripped != company.strip():
+                    item["company"] = stripped
+                    item["current"] = True
+                item["duration_months"], item["current"] = _experience_duration(item)
+            name = normalized_name(_profile_item_name(field, item))
+            if not name:
+                continue
+            if field == "education":
+                institution = item.get("institution", "")
+                if not re.search(
+                    r"\b(university|college|institute|school|academy|polytechnic)\b",
+                    institution,
+                    re.I,
+                ):
+                    continue
+            if field == "skills":
+                aliases, canonical_categories = _skill_aliases()
+                alias = aliases.get(_skill_key(name))
+                if alias:
+                    name, category = alias
+                else:
+                    name = name[:1].upper() + name[1:]
+                    category = canonical_categories.get(name, "Other")
+                item["name"] = name
+                item["category"] = category if category in {
+                    "Language", "Frontend", "Backend", "Database", "Tool", "Other",
+                } else "Other"
+                item["status"] = "claimed"
+            elif field == "volunteer":
+                item["organization"] = name
+            elif field == "education":
+                item["institution"] = name
+            elif field == "experience":
+                item["company"] = name
+            elif field == "achievements":
+                item["title"] = name
+            else:
+                item["name"] = name
+            key = _dedupe_key(name)
+            if any(key == other or key in other or other in key for other in seen):
+                continue
+            seen.append(key)
+            if field == "skills" and len(results) >= 60:
+                continue
+            if field == "projects":
+                item = {"name": item["name"], "url": _normalize_profile_url(item.get("url", ""))}
+            results.append(item)
+        cleaned[field] = results
+
+    for field in ("linkedin", "github", "portfolio"):
+        cleaned[field] = _normalize_profile_url(cleaned.get(field, ""))
+    for item in cleaned["certifications"]:
+        item["credential_url"] = _normalize_profile_url(item.get("credential_url", ""))
+    return cleaned
+
+
 def _merge_profiles(ai_profile: dict, deterministic: dict) -> dict:
-    """Prefer AI values when present; fill gaps from offline parser."""
+    """Use AI lists when valid; fall back to offline lists only when empty."""
     from ai_providers import empty_profile
 
+    ai = clean_profile(ai_profile or {})
+    offline = clean_profile(deterministic or {})
     merged = empty_profile()
-    # Start from AI
-    for k, v in (ai_profile or {}).items():
-        if k in merged:
-            merged[k] = v
-    # Fill scalars from deterministic if AI left them empty
     for field in (
         "name", "email", "phone", "headline", "location", "summary",
         "linkedin", "github", "portfolio",
     ):
-        if not (merged.get(field) or "").strip() and deterministic.get(field):
-            merged[field] = deterministic[field]
-    signatures = {
-        "education": ("institution", "degree", "start_year", "end_year"),
-        "experience": ("company", "title", "start_date"),
-        "projects": ("name",),
-        "skills": ("name",),
-        "certifications": ("name",),
-        "achievements": ("title",),
-        "languages": ("name",),
-    }
-    limits = {
-        "education": 12, "experience": 20, "projects": 20, "skills": 80,
-        "certifications": 30, "achievements": 30, "languages": 20,
-    }
-    for field, signature in signatures.items():
-        existing = list(merged.get(field) or [])
-        seen = {
-            tuple(str(item.get(key, "")).strip().casefold() for key in signature)
-            for item in existing
-            if isinstance(item, dict)
+        merged[field] = offline.get(field) or ai.get(field) or ""
+    for field in (
+        "education", "experience", "projects", "skills", "certifications",
+        "achievements", "languages", "volunteer",
+    ):
+        merged[field] = ai[field] if ai.get(field) else offline.get(field, [])
+    merged["references"] = []
+    preferences = ai.get("preferences") or {}
+    offline_preferences = offline.get("preferences") or {}
+    for key in ("job_types", "work_mode", "locations"):
+        merged["preferences"][key] = preferences.get(key) or offline_preferences.get(key) or (
+            [] if key != "work_mode" else ""
+        )
+    return clean_profile(merged)
+
+
+def _assign_project_links(profile: dict, links: list[str]) -> dict:
+    """Attach document links only when the project title matches their URL."""
+    projects = profile.get("projects", [])
+    for project in projects:
+        project["url"] = ""
+    for url in links:
+        normalized = _normalize_profile_url(url)
+        if not normalized:
+            continue
+        parsed = urlparse(normalized)
+        host = (parsed.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        parts = [part for part in parsed.path.split("/") if part]
+        if host == "linkedin.com":
+            if len(parts) >= 2 and parts[0].lower() == "in":
+                profile["linkedin"] = normalized
+            continue
+        if host == "github.com" and len(parts) == 1:
+            profile["github"] = normalized
+            continue
+
+        link_terms = {
+            token for token in re.split(r"[^a-z0-9]+", host + " " + " ".join(parts))
+            if len(token) > 2
         }
-        for item in deterministic.get(field) or []:
-            if not isinstance(item, dict):
-                continue
-            identity = tuple(
-                str(item.get(key, "")).strip().casefold()
-                for key in signature
-            )
-            if identity in seen or not any(identity):
-                continue
-            if len(existing) >= limits[field]:
-                break
-            existing.append(item)
-            seen.add(identity)
-        merged[field] = existing
-    if deterministic.get("preferences"):
-        preferences = merged["preferences"]
-        deterministic_preferences = deterministic["preferences"]
-        for field in ("job_types", "work_mode", "locations"):
-            if not preferences[field] and deterministic_preferences[field]:
-                preferences[field] = deterministic_preferences[field]
-    return merged
+        best, best_score = None, 0
+        for project in projects:
+            project_terms = {
+                token for token in re.split(r"[^a-z0-9]+", project.get("name", "").casefold())
+                if len(token) > 2
+            }
+            score = len(link_terms & project_terms)
+            if score > best_score:
+                best, best_score = project, score
+        if best and best_score:
+            best["url"] = normalized
+    return clean_profile(profile)
+
+
+def profile_completeness(profile: dict) -> dict:
+    """Measure filled profile sections only; this is not an employability score."""
+    profile = profile or {}
+    preferences = profile.get("preferences") or {}
+
+    def scalar_pct(values: list) -> int:
+        return round(100 * sum(bool(value) for value in values) / len(values)) if values else 0
+
+    def items_pct(items: list, fields: tuple[str, ...]) -> int:
+        if not items:
+            return 0
+        expected = len(items) * len(fields)
+        filled = sum(
+            bool(item.get(field))
+            for item in items
+            if isinstance(item, dict)
+            for field in fields
+        )
+        return round(100 * filled / expected) if expected else 0
+
+    sections = {
+        "Personal Details": scalar_pct([
+            profile.get("name"), profile.get("email"), profile.get("phone"),
+            profile.get("location"),
+        ]),
+        "Career Snapshot": scalar_pct([profile.get("headline"), profile.get("summary")]),
+        "Work Experience": items_pct(profile.get("experience", []), ("company", "title")),
+        "Education": items_pct(profile.get("education", []), ("institution", "degree")),
+        "Key Skills": 100 if profile.get("skills") else 0,
+        "Availability & Job Preferences": scalar_pct([
+            preferences.get("job_types"), preferences.get("work_mode"),
+            preferences.get("locations"),
+        ]),
+        "Training & Certification": items_pct(
+            profile.get("certifications", []), ("name",),
+        ),
+        "Projects": items_pct(profile.get("projects", []), ("name", "url")),
+        "Language Skills": items_pct(profile.get("languages", []), ("name",)),
+        "References": items_pct(profile.get("references", []), ("name", "relationship")),
+        "Club & Volunteer Experience": max(
+            items_pct(profile.get("achievements", []), ("title",)),
+            items_pct(profile.get("volunteer", []), ("organization", "role")),
+        ),
+        "Portfolio & Social Links": scalar_pct([
+            profile.get("linkedin"), profile.get("github"), profile.get("portfolio"),
+        ]),
+    }
+    weights = {
+        "Personal Details": 10,
+        "Career Snapshot": 10,
+        "Work Experience": 15,
+        "Education": 10,
+        "Key Skills": 15,
+        "Availability & Job Preferences": 10,
+        "Training & Certification": 5,
+        "Projects": 15,
+        "Language Skills": 3,
+        "References": 0,
+        "Club & Volunteer Experience": 3,
+        "Portfolio & Social Links": 4,
+    }
+    optional_empty = {
+        "Club & Volunteer Experience"
+    } if not profile.get("achievements") and not profile.get("volunteer") else set()
+    active_weight = sum(
+        weight for name, weight in weights.items()
+        if name not in optional_empty
+    )
+    total = round(
+        sum(weights[name] * pct for name, pct in sections.items())
+        / active_weight
+    ) if active_weight else 0
+    return {"total": total, "sections": sections}
+
+
+def profile_review_summary(profile: dict, evidence: list[dict]) -> dict:
+    """Return only review flags, not source snippets or the stored evidence list."""
+    low_confidence = []
+    for item in evidence:
+        try:
+            if float(item.get("confidence", 0)) < 0.6:
+                field = str(item.get("field", "")).strip()
+                if field and field not in low_confidence:
+                    low_confidence.append(field)
+        except (TypeError, ValueError):
+            continue
+
+    profile = profile or {}
+    preferences = profile.get("preferences") or {}
+    checks = [
+        ("Personal Details", any(profile.get(key) for key in ("name", "email", "phone", "location"))),
+        ("Career Snapshot", any(profile.get(key) for key in ("headline", "summary"))),
+        ("Work Experience", bool(profile.get("experience"))),
+        ("Education", bool(profile.get("education"))),
+        ("Key Skills", bool(profile.get("skills"))),
+        ("Availability & Job Preferences", any(
+            preferences.get(key) for key in ("job_types", "work_mode", "locations")
+        )),
+        ("Training & Certification", bool(profile.get("certifications"))),
+        ("Projects", bool(profile.get("projects"))),
+        ("Language Skills", bool(profile.get("languages"))),
+        ("References", bool(profile.get("references"))),
+        ("Club & Volunteer Experience", bool(profile.get("achievements") or profile.get("volunteer"))),
+        ("Portfolio & Social Links", any(profile.get(key) for key in ("linkedin", "github", "portfolio"))),
+    ]
+    return {
+        "low_confidence_fields": low_confidence,
+        "missing_fields": [name for name, found in checks if not found],
+    }
 
 
 def _cv_name_suggestion(raw_text: str, account_name: str = "") -> str:
@@ -1162,6 +1608,23 @@ def _cv_name_suggestion(raw_text: str, account_name: str = "") -> str:
         ):
             return candidate
     return ""
+
+
+def _profile_value_for_evidence(profile: dict, field: str):
+    value = profile
+    for token in re.findall(r"[A-Za-z_]+|\d+", field.replace(".", ".")):
+        if isinstance(value, dict):
+            value = value.get(token)
+        elif isinstance(value, list) and token.isdigit():
+            index = int(token)
+            value = value[index] if index < len(value) else None
+        else:
+            return None
+        if value is None:
+            return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value) if value not in (None, "") else None
 
 
 @app.post("/api/cv/profile-extract")
@@ -1222,7 +1685,11 @@ async def upload_cv_profile(
     # meaningful, evidence-backed fields; otherwise return an explicit failure.
     extraction_result = None
     ai_error = None
-    redacted_text, _ = E.redact(raw_text, known_names=[identity["name"]])
+    links = parser_info.get("links_found", [])
+    cv_body = raw_text.split("\n\nLINKS FOUND IN DOCUMENT:", 1)[0]
+    redacted_text, _ = E.redact(cv_body, known_names=[identity["name"]])
+    if links:
+        redacted_text = _append_document_links(redacted_text, links)
     from ai_providers import AIExtractionError, extract_cv_profile
 
     try:
@@ -1239,36 +1706,29 @@ async def upload_cv_profile(
             extraction_result["profile"],
             deterministic_profile,
         )
-        for skill in profile.get("skills") or []:
-            if isinstance(skill, dict) and "status" not in skill:
-                skill["status"] = "claimed"
-        # Contact from deterministic wins (PII was redacted before AI)
-        for field in ("phone", "linkedin", "github", "portfolio", "email"):
-            if deterministic_profile.get(field):
-                profile[field] = deterministic_profile[field]
-        if deterministic_profile.get("name") and not profile.get("name"):
-            profile["name"] = deterministic_profile["name"]
-
-        evidence = [
-            item
-            for item in extraction_result.get("evidence") or []
-            if not isinstance(item, dict)
-            or item.get("field") != "name_suggestion"
-        ]
-        if suggested_name:
-            evidence.append({
-                "field": "name_suggestion",
-                "value": suggested_name,
-                "source_snippet": suggested_name,
-                "source": "uploaded_cv",
-                "confidence": 0.6,
-            })
-        seen_fields = {e.get("field") for e in evidence if isinstance(e, dict)}
+        evidence = []
+        for item in extraction_result.get("evidence") or []:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "")
+            value = _profile_value_for_evidence(profile, field)
+            if value:
+                evidence.append({
+                    **item,
+                    "value": value,
+                    "confidence": float(item.get("confidence", 0.85)),
+                    "source": item.get("source", "ai_extraction"),
+                })
+        ai_collections = {
+            "education", "experience", "projects", "skills",
+            "certifications", "achievements", "languages",
+        }
         for item in deterministic_evidence:
-            if item["field"] not in seen_fields or item["field"] in (
-                "phone", "linkedin", "github", "portfolio", "email", "name",
-            ):
-                evidence.append(item)
+            field = str(item.get("field", ""))
+            collection = field.split(".", 1)[0]
+            if collection not in ai_collections or not extraction_result["profile"].get(collection):
+                if field in {"phone", "email", "linkedin", "github", "portfolio", "name"} or collection not in ai_collections:
+                    evidence.append(item)
         method = "cv_ai"
         ai_provider = extraction_result.get("provider", "")
         ai_model = extraction_result.get("model", "")
@@ -1276,10 +1736,7 @@ async def upload_cv_profile(
             "CV processed with AI. Please review and correct your profile before confirming."
         )
     else:
-        profile = deterministic_profile
-        for skill in profile.get("skills") or []:
-            if isinstance(skill, dict) and "status" not in skill:
-                skill["status"] = "claimed"
+        profile = clean_profile(deterministic_profile)
         evidence = deterministic_evidence
         method = "cv_offline"
         ai_provider = ""
@@ -1290,7 +1747,12 @@ async def upload_cv_profile(
         )
 
     profile["name"] = suggested_name or profile.get("name") or identity["name"]
-    profile["email"] = identity["email"]
+    profile["email"] = deterministic_profile.get("email") or identity["email"]
+    for field in ("linkedin", "github", "portfolio"):
+        profile[field] = deterministic_profile.get(field, "")
+    profile = _assign_project_links(profile, links)
+    profile["email"] = deterministic_profile.get("email") or identity["email"]
+    profile = clean_profile(profile)
 
     meaningful_fields = (
         "phone", "headline", "location", "summary", "linkedin", "github",
@@ -1320,6 +1782,9 @@ async def upload_cv_profile(
             u["id"],
             document["id"],
             evidence,
+        )
+        stored_evidence = cv_store.list_extractions(
+            u["id"], document["id"]
         )
 
     except StorageError as ex:
@@ -1380,13 +1845,16 @@ async def upload_cv_profile(
             "status": document["status"],
         },
         "extraction": {
-            **parser_info,
+            "parser": parser_info["parser"],
+            "ocr_used": parser_info["ocr_used"],
+            "ocr_pages": parser_info["ocr_pages"],
             "ai_provider": ai_provider,
             "ai_model": ai_model,
             "ai_error": ai_error,
-            "fields_found": len(evidence),
-            "fields": evidence,
+            "fields_found": len(stored_evidence),
+            **profile_review_summary(profile, stored_evidence),
         },
+        "completeness": profile_completeness(profile),
         "message": message,
     }
 

@@ -156,12 +156,18 @@ def add_extractions(user_id: int, document_id: str, items: Iterable[dict]) -> in
     if not get_document(user_id, document_id):
         raise ValueError("Unknown document")
     m.run("DELETE FROM cv_extractions WHERE document_id=? AND user_id=? AND status='pending_review'", (document_id, user_id))
-    n, now = 0, time.time()
+    n, now, seen = 0, time.time(), set()
     for it in items:
+        field = str(it["field"])[:80]
+        value = str(it.get("value", ""))[:4000]
+        identity = (field, value)
+        if identity in seen:
+            continue
+        seen.add(identity)
         conf = max(0.0, min(1.0, float(it.get("confidence", 0))))
         m.run("INSERT INTO cv_extractions(id,document_id,user_id,field,value,source,source_snippet,source_location,confidence,status,created) "
               "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-              (uuid.uuid4().hex, document_id, user_id, str(it["field"])[:80], str(it.get("value", ""))[:4000],
+              (uuid.uuid4().hex, document_id, user_id, field, value,
                str(it.get("source", "uploaded_cv"))[:40], str(it.get("source_snippet", ""))[:600],
                str(it.get("source_location", ""))[:80], conf, "pending_review", now))
         n += 1

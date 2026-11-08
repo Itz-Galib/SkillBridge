@@ -123,7 +123,6 @@ def test_validation_normalizes_nested_aliases_and_filters_unsupported_values():
             projects=[{
                 "name": "SkillBridge",
                 "project_url": "https://example.test",
-                "technologies": ["React"],
             }],
             skills=[{"name": "Fabricated", "category": "Technical"}],
             evidence=[
@@ -141,7 +140,6 @@ def test_validation_normalizes_nested_aliases_and_filters_unsupported_values():
                 {"field": "experience.0.technologies.0", "source_snippet": "Python"},
                 {"field": "projects.0.name", "source_snippet": "SkillBridge"},
                 {"field": "projects.0.project_url", "source_snippet": "https://example.test"},
-                {"field": "projects.0.technologies.0", "source_snippet": "React"},
                 {"field": "skills.0.name", "source_snippet": "not supported"},
             ],
         ),
@@ -169,7 +167,10 @@ def test_validation_normalizes_nested_aliases_and_filters_unsupported_values():
     assert profile["experience"][0]["current"] is True
     assert profile["experience"][0]["achievements"] == ["Built an API"]
     assert profile["projects"][0]["url"] == "https://example.test"
-    assert profile["projects"][0]["technologies"] == ["React"]
+    assert profile["projects"] == [{
+        "name": "SkillBridge",
+        "url": "https://example.test",
+    }]
     assert profile["skills"] == []
 
 
