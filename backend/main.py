@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS companies(id TEXT PRIMARY KEY, owner_user_id INTEGER 
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, location TEXT NOT NULL DEFAULT 'Remote', employment_type TEXT NOT NULL DEFAULT 'Full-time', skills TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', is_mock INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY, job_id TEXT NOT NULL, candidate_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'submitted', results_shared INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, UNIQUE(job_id, candidate_id));
 CREATE TABLE IF NOT EXISTS company_assessments(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, job_id TEXT, title TEXT NOT NULL, requirements TEXT NOT NULL, questions TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', created REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS candidate_profiles(user_id INTEGER PRIMARY KEY, headline TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', linkedin TEXT NOT NULL DEFAULT '', github TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL DEFAULT '', education TEXT NOT NULL DEFAULT '[]', experience TEXT NOT NULL DEFAULT '[]', projects TEXT NOT NULL DEFAULT '[]', skills TEXT NOT NULL DEFAULT '[]', certifications TEXT NOT NULL DEFAULT '[]', achievements TEXT NOT NULL DEFAULT '[]', languages TEXT NOT NULL DEFAULT '[]', preferences TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS candidate_profiles(user_id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', headline TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', linkedin TEXT NOT NULL DEFAULT '', github TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL DEFAULT '', education TEXT NOT NULL DEFAULT '[]', experience TEXT NOT NULL DEFAULT '[]', projects TEXT NOT NULL DEFAULT '[]', skills TEXT NOT NULL DEFAULT '[]', certifications TEXT NOT NULL DEFAULT '[]', achievements TEXT NOT NULL DEFAULT '[]', languages TEXT NOT NULL DEFAULT '[]', preferences TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_blueprints(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_answer_events(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, question_id TEXT NOT NULL, revision INTEGER NOT NULL, answer_hash TEXT NOT NULL, answer_length INTEGER NOT NULL, created REAL NOT NULL);
 """
@@ -109,6 +109,11 @@ def init_db():
         profile_columns = {
             row["name"] for row in allr("PRAGMA table_info(candidate_profiles)")
         }
+    if "name" not in profile_columns:
+        run(
+            "ALTER TABLE candidate_profiles ADD COLUMN name "
+            "TEXT NOT NULL DEFAULT ''"
+        )
     for column in ("skills", "certifications", "achievements", "languages"):
         if column not in profile_columns:
             run(
@@ -547,8 +552,8 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
         "achievements": [],
         "languages": [],
         "preferences": {
-            "job_types": ["Internship", "Full-time"],
-            "work_mode": "Any",
+            "job_types": [],
+            "work_mode": "",
             "locations": [],
         },
     }
@@ -1068,7 +1073,10 @@ def extract_profile_fields(raw_text: str, identity: Optional[dict] = None):
             profile["languages"].append(item)
             add_evidence("languages", item, 0.55, part)
 
-    return profile, evidence
+    from ai_providers import normalize_profile
+
+    canonical = normalize_profile({**profile, "evidence": []})["profile"]
+    return canonical, evidence
 
 
 def _merge_profiles(ai_profile: dict, deterministic: dict) -> dict:
@@ -1087,16 +1095,73 @@ def _merge_profiles(ai_profile: dict, deterministic: dict) -> dict:
     ):
         if not (merged.get(field) or "").strip() and deterministic.get(field):
             merged[field] = deterministic[field]
-    # Fill list fields if AI returned nothing
-    for field in (
-        "education", "experience", "projects", "skills",
-        "certifications", "achievements", "languages",
-    ):
-        if not merged.get(field) and deterministic.get(field):
-            merged[field] = deterministic[field]
-    if not merged.get("preferences") and deterministic.get("preferences"):
-        merged["preferences"] = deterministic["preferences"]
+    signatures = {
+        "education": ("institution", "degree", "start_year", "end_year"),
+        "experience": ("company", "title", "start_date"),
+        "projects": ("name",),
+        "skills": ("name",),
+        "certifications": ("name",),
+        "achievements": ("title",),
+        "languages": ("name",),
+    }
+    limits = {
+        "education": 12, "experience": 20, "projects": 20, "skills": 80,
+        "certifications": 30, "achievements": 30, "languages": 20,
+    }
+    for field, signature in signatures.items():
+        existing = list(merged.get(field) or [])
+        seen = {
+            tuple(str(item.get(key, "")).strip().casefold() for key in signature)
+            for item in existing
+            if isinstance(item, dict)
+        }
+        for item in deterministic.get(field) or []:
+            if not isinstance(item, dict):
+                continue
+            identity = tuple(
+                str(item.get(key, "")).strip().casefold()
+                for key in signature
+            )
+            if identity in seen or not any(identity):
+                continue
+            if len(existing) >= limits[field]:
+                break
+            existing.append(item)
+            seen.add(identity)
+        merged[field] = existing
+    if deterministic.get("preferences"):
+        preferences = merged["preferences"]
+        deterministic_preferences = deterministic["preferences"]
+        for field in ("job_types", "work_mode", "locations"):
+            if not preferences[field] and deterministic_preferences[field]:
+                preferences[field] = deterministic_preferences[field]
     return merged
+
+
+def _cv_name_suggestion(raw_text: str, account_name: str = "") -> str:
+    """Return a short, explicit name-like CV heading for candidate review."""
+    non_name_headings = {
+        "cv", "resume", "curriculum vitae", "profile", "professional profile",
+        "summary", "contact", "skills", "education", "experience", "projects",
+        "certifications", "achievements", "languages", "work experience",
+    }
+    for line in (raw_text or "").splitlines()[:8]:
+        candidate = re.sub(r"\s+", " ", line).strip(" \t|,;")
+        if (
+            1 <= len(candidate.split()) <= 5
+            and len(candidate) <= 80
+            and re.fullmatch(r"[A-Za-z][A-Za-z .'\-]*", candidate)
+            and candidate.casefold() not in non_name_headings
+            and not re.search(
+                r"\b(engineer|developer|analyst|scientist|intern|designer|manager|"
+                r"consultant|architect|specialist|officer|objective|experience)\b",
+                candidate,
+                re.I,
+            )
+            and candidate.casefold() != account_name.strip().casefold()
+        ):
+            return candidate
+    return ""
 
 
 @app.post("/api/cv/profile-extract")
@@ -1129,7 +1194,9 @@ async def upload_cv_profile(
     filename = file.filename or "cv"
 
     # Parse first. Do not store files that fail basic validation/parsing.
-    file_bytes = await file.read()
+    file_bytes = await file.read(5_000_001)
+    if len(file_bytes) > 5_000_000:
+        raise HTTPException(413, "CV file must be 5 MB or smaller")
 
     raw_text, parser_info = read_profile_cv(filename, file_bytes)
 
@@ -1141,9 +1208,18 @@ async def upload_cv_profile(
         raw_text,
         identity=identity,
     )
+    suggested_name = _cv_name_suggestion(raw_text, identity["name"])
+    if suggested_name:
+        deterministic_evidence.append({
+            "field": "name_suggestion",
+            "value": suggested_name,
+            "source_snippet": suggested_name,
+            "source": "uploaded_cv",
+            "confidence": 0.6,
+        })
 
-    # Always try AI, but NEVER fail the upload if providers are down.
-    # Offline extraction still produces an editable draft.
+    # Keep extraction available offline when the deterministic parser finds
+    # meaningful, evidence-backed fields; otherwise return an explicit failure.
     extraction_result = None
     ai_error = None
     redacted_text, _ = E.redact(raw_text, known_names=[identity["name"]])
@@ -1173,7 +1249,20 @@ async def upload_cv_profile(
         if deterministic_profile.get("name") and not profile.get("name"):
             profile["name"] = deterministic_profile["name"]
 
-        evidence = list(extraction_result.get("evidence") or [])
+        evidence = [
+            item
+            for item in extraction_result.get("evidence") or []
+            if not isinstance(item, dict)
+            or item.get("field") != "name_suggestion"
+        ]
+        if suggested_name:
+            evidence.append({
+                "field": "name_suggestion",
+                "value": suggested_name,
+                "source_snippet": suggested_name,
+                "source": "uploaded_cv",
+                "confidence": 0.6,
+            })
         seen_fields = {e.get("field") for e in evidence if isinstance(e, dict)}
         for item in deterministic_evidence:
             if item["field"] not in seen_fields or item["field"] in (
@@ -1199,6 +1288,23 @@ async def upload_cv_profile(
             "AI providers were unavailable, so your profile was built with the offline parser. "
             "Please review carefully and fill any missing fields before confirming."
         )
+
+    profile["name"] = suggested_name or profile.get("name") or identity["name"]
+    profile["email"] = identity["email"]
+
+    meaningful_fields = (
+        "phone", "headline", "location", "summary", "linkedin", "github",
+        "portfolio", "education", "experience", "projects", "skills",
+        "certifications", "achievements", "languages",
+    )
+    if not any(profile.get(field) for field in meaningful_fields):
+        detail = (
+            "The CV text was read, but no supported profile information could be extracted. "
+            "Please try another CV or create your profile manually."
+        )
+        if ai_error:
+            detail += f" AI extraction status: {ai_error}"
+        raise HTTPException(422, detail)
 
     import cv_store
     from storage import StorageError

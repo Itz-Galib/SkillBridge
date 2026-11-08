@@ -1,8 +1,8 @@
 """Initial hiring workflow APIs for SkillBridge PRD."""
 import json, time, uuid, os, re, secrets, csv, io
-from typing import Optional, List, Literal
+from typing import Annotated, Optional, List, Literal
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from main import current_user, one, allr, run, audit, QBYID, db, DATABASE_URL, COOLDOWN_HOURS, MAX_ATTEMPTS_90D
 from content import RESOURCES, JOB
 from urllib.parse import urlparse
@@ -60,52 +60,75 @@ class CompanyAssessmentCreate(BaseModel):
     job_id: Optional[str] = None
 
 
-class EducationItem(BaseModel):
-    institution: str = Field(min_length=2, max_length=160)
+class ProfileModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+Text100 = Annotated[str, Field(max_length=100)]
+Text160 = Annotated[str, Field(max_length=160)]
+
+
+class EducationItem(ProfileModel):
+    institution: str = Field(default="", max_length=160)
     degree: str = Field(default="", max_length=160)
     field: str = Field(default="", max_length=160)
+    location: str = Field(default="", max_length=160)
     start_year: str = Field(default="", max_length=10)
     end_year: str = Field(default="", max_length=10)
+    grade: str = Field(default="", max_length=80)
     details: str = Field(default="", max_length=1000)
 
-class ExperienceItem(BaseModel):
-    company: str = Field(min_length=2, max_length=160)
-    title: str = Field(min_length=2, max_length=160)
+class ExperienceItem(ProfileModel):
+    company: str = Field(default="", max_length=160)
+    title: str = Field(default="", max_length=160)
+    location: str = Field(default="", max_length=160)
     employment_type: str = Field(default="", max_length=60)
     start_date: str = Field(default="", max_length=20)
     end_date: str = Field(default="", max_length=20)
     current: bool = False
     description: str = Field(default="", max_length=2000)
+    achievements: List[Text160] = Field(default_factory=list, max_length=30)
+    technologies: List[Text160] = Field(default_factory=list, max_length=30)
 
-class ProjectItem(BaseModel):
-    name: str = Field(min_length=2, max_length=160)
+class ProjectItem(ProfileModel):
+    name: str = Field(default="", max_length=160)
     description: str = Field(default="", max_length=2000)
-    technologies: List[str] = Field(default_factory=list, max_length=30)
+    role: str = Field(default="", max_length=160)
+    technologies: List[Text160] = Field(default_factory=list, max_length=30)
     url: str = Field(default="", max_length=300)
+    start_date: str = Field(default="", max_length=40)
+    end_date: str = Field(default="", max_length=40)
 
-class SkillItem(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+class SkillItem(ProfileModel):
+    name: str = Field(default="", max_length=100)
     category: str = Field(default="", max_length=60)
     status: Literal["claimed"] = "claimed"
 
-class CertificationItem(BaseModel):
-    name: str = Field(min_length=1, max_length=180)
+class CertificationItem(ProfileModel):
+    name: str = Field(default="", max_length=180)
     issuer: str = Field(default="", max_length=160)
     issue_date: str = Field(default="", max_length=40)
     expiry_date: str = Field(default="", max_length=40)
     credential_id: str = Field(default="", max_length=120)
     credential_url: str = Field(default="", max_length=300)
 
-class AchievementItem(BaseModel):
-    title: str = Field(min_length=1, max_length=180)
+class AchievementItem(ProfileModel):
+    title: str = Field(default="", max_length=180)
     description: str = Field(default="", max_length=1000)
     date: str = Field(default="", max_length=40)
 
-class LanguageItem(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+class LanguageItem(ProfileModel):
+    name: str = Field(default="", max_length=100)
     proficiency: str = Field(default="", max_length=80)
 
-class CandidateProfileUpdate(BaseModel):
+class CandidatePreferences(ProfileModel):
+    job_types: List[Literal["Internship", "Full-time", "Part-time", "Contract", "Temporary"]] = Field(default_factory=list, max_length=5)
+    work_mode: Literal["", "Any", "Remote", "Hybrid", "On-site"] = ""
+    locations: List[Text100] = Field(default_factory=list, max_length=10)
+
+class CandidateProfileUpdate(ProfileModel):
+    name: str = Field(default="", max_length=120)
+    email: str = Field(default="", max_length=254)
     headline: str = Field(default="", max_length=180)
     phone: str = Field(default="", max_length=40)
     location: str = Field(default="", max_length=160)
@@ -120,7 +143,7 @@ class CandidateProfileUpdate(BaseModel):
     certifications: List[CertificationItem] = Field(default_factory=list, max_length=30)
     achievements: List[AchievementItem] = Field(default_factory=list, max_length=30)
     languages: List[LanguageItem] = Field(default_factory=list, max_length=20)
-    preferences: dict = Field(default_factory=dict)
+    preferences: CandidatePreferences = Field(default_factory=CandidatePreferences)
 
 class CandidateProfileDraftInput(CandidateProfileUpdate):
     method: Optional[str] = None
@@ -129,72 +152,34 @@ class CandidateProfileDraftInput(CandidateProfileUpdate):
 
 def _profile_payload(body):
     data = body.model_dump(exclude={"method", "document_id"})
-
-    preferences = data.get("preferences") or {}
-
-    allowed_types = {
-        "Internship",
-        "Full-time",
-        "Part-time",
-        "Contract",
-        "Temporary",
-    }
-
-    allowed_modes = {
-        "Any",
-        "Remote",
-        "Hybrid",
-        "On-site",
-    }
-
-    preferences["job_types"] = [
-        x for x in preferences.get("job_types", [])
-        if x in allowed_types
-    ][:5]
-
-    mode = preferences.get("work_mode", "Any")
-    preferences["work_mode"] = (
-        mode if mode in allowed_modes else "Any"
-    )
-
-    preferences["locations"] = [
-        str(x)[:100]
-        for x in preferences.get("locations", [])[:10]
-        if str(x).strip()
+    data["preferences"]["locations"] = [
+        value.strip() for value in data["preferences"]["locations"]
+        if value.strip()
     ]
-
-    data["preferences"] = preferences
 
     return data
 
 
 def _decode_profile_json(raw):
     profile = json.loads(raw or "{}")
+    from ai_providers import empty_profile, normalize_profile
 
-    profile.setdefault("headline", "")
-    profile.setdefault("phone", "")
-    profile.setdefault("location", "")
-    profile.setdefault("summary", "")
-    profile.setdefault("linkedin", "")
-    profile.setdefault("github", "")
-    profile.setdefault("portfolio", "")
-    profile.setdefault("education", [])
-    profile.setdefault("experience", [])
-    profile.setdefault("projects", [])
-    profile.setdefault("skills", [])
-    profile.setdefault("certifications", [])
-    profile.setdefault("achievements", [])
-    profile.setdefault("languages", [])
-    profile.setdefault(
-        "preferences",
-        {
-            "job_types": ["Internship", "Full-time"],
-            "work_mode": "Any",
+    canonical = {**empty_profile(), **profile}
+    preferences = canonical.get("preferences")
+    if preferences == {
+        "job_types": ["Internship", "Full-time"],
+        "work_mode": "Any",
+        "locations": [],
+    }:
+        canonical["preferences"] = {
+            "job_types": [],
+            "work_mode": "",
             "locations": [],
-        },
-    )
-
-    return profile
+        }
+    for skill in canonical.get("skills", []):
+        if isinstance(skill, dict):
+            skill["status"] = "claimed"
+    return normalize_profile({**canonical, "evidence": []})["profile"]
 
 
 @router.get("/api/candidate/profile/status")
@@ -261,15 +246,14 @@ def get_candidate_profile_draft(user=Depends(current_user)):
             user["id"], draft["document_id"]
         )
 
+    profile = _decode_profile_json(draft["profile_json"])
+    profile["name"] = profile.get("name") or user["name"]
+    profile["email"] = user["email"]
     return {
         "status": draft["status"],
         "method": draft["method"],
         "document_id": draft["document_id"],
-        "profile": {
-            **_decode_profile_json(draft["profile_json"]),
-            "name": user["name"],
-            "email": user["email"],
-        },
+        "profile": profile,
         "extraction": extraction,
     }
 
@@ -316,6 +300,15 @@ def save_candidate_profile_draft(
     )
 
     profile = _profile_payload(body)
+    profile["name"] = profile.get("name") or user["name"]
+    profile["email"] = user["email"]
+
+    if document_id:
+        import cv_store
+
+        if not cv_store.get_document(user["id"], document_id):
+            raise HTTPException(422, "The selected CV document does not belong to this account")
+
     now = time.time()
 
     run(
@@ -355,6 +348,10 @@ def save_candidate_profile_draft(
 def confirm_candidate_profile(user=Depends(current_user)):
     require_role(user, "candidate")
 
+    existing = one(
+        "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+        (user["id"],),
+    )
     draft = one(
         """
         SELECT *
@@ -364,26 +361,78 @@ def confirm_candidate_profile(user=Depends(current_user)):
         (user["id"],),
     )
 
+    if existing:
+        if draft and draft["status"] == "confirmed":
+            return {
+                "ok": True,
+                "status": "confirmed",
+                "message": "Candidate profile is already confirmed.",
+            }
+        raise HTTPException(409, "Profile is already confirmed")
+
     if not draft:
         raise HTTPException(404, "Profile draft not found")
 
     if draft["status"] != "draft":
         raise HTTPException(409, "Profile draft is not awaiting confirmation")
 
-    profile = _decode_profile_json(draft["profile_json"])
+    try:
+        profile = CandidateProfileUpdate.model_validate(
+            _decode_profile_json(draft["profile_json"])
+        ).model_dump()
+    except ValidationError as exc:
+        raise HTTPException(
+            422,
+            detail={
+                "message": "The profile contains invalid fields.",
+                "errors": exc.errors(),
+            },
+        ) from exc
+    profile["name"] = profile["name"].strip() or user["name"]
+    profile["email"] = user["email"]
+
+    required_fields = {
+        "education": ("institution",),
+        "experience": ("company", "title"),
+        "projects": ("name",),
+        "skills": ("name",),
+        "certifications": ("name",),
+        "achievements": ("title",),
+        "languages": ("name",),
+    }
+    incomplete = []
+    for collection, fields in required_fields.items():
+        for index, item in enumerate(profile[collection]):
+            missing = [
+                field for field in fields
+                if not str(item.get(field) or "").strip()
+            ]
+            if missing:
+                incomplete.append({
+                    "field": f"{collection}[{index}]",
+                    "missing": missing,
+                })
+    if incomplete:
+        raise HTTPException(
+            422,
+            detail={
+                "message": "Complete or remove the listed profile entries before confirming.",
+                "fields": incomplete,
+            },
+        )
 
     # Require some meaningful profile information before publication.
     has_content = any([
-        profile.get("headline", "").strip(),
-        profile.get("summary", "").strip(),
-        profile.get("location", "").strip(),
-        profile.get("education"),
-        profile.get("experience"),
-        profile.get("projects"),
-        profile.get("skills"),
-        profile.get("certifications"),
-        profile.get("achievements"),
-        profile.get("languages"),
+        profile["headline"].strip(),
+        profile["summary"].strip(),
+        profile["location"].strip(),
+        profile["education"],
+        profile["experience"],
+        profile["projects"],
+        profile["skills"],
+        profile["certifications"],
+        profile["achievements"],
+        profile["languages"],
     ])
 
     if not has_content:
@@ -412,20 +461,31 @@ def confirm_candidate_profile(user=Depends(current_user)):
         ).fetchone()
 
         if current:
+            current_draft = conn.execute(
+                "SELECT status FROM candidate_profile_drafts WHERE user_id=?",
+                (user["id"],),
+            ).fetchone()
+            if current_draft and current_draft["status"] == "confirmed":
+                return {
+                    "ok": True,
+                    "status": "confirmed",
+                    "message": "Candidate profile is already confirmed.",
+                }
             raise HTTPException(409, "Profile is already confirmed")
 
         conn.execute(
             """
             INSERT INTO candidate_profiles(
-                user_id, headline, phone, location, summary,
+                user_id, name, headline, phone, location, summary,
                 linkedin, github, portfolio, education,
                 experience, projects, skills, certifications,
                 achievements, languages, preferences, updated
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user["id"],
+                profile["name"],
                 profile["headline"].strip(),
                 profile["phone"].strip(),
                 profile["location"].strip(),
@@ -469,11 +529,13 @@ def get_candidate_profile(user=Depends(current_user)):
     result = {
         "user": {"name": user["name"], "email": user["email"]},
         "profile": {
+            "name": user["name"],
+            "email": user["email"],
             "headline": "", "phone": "", "location": "", "summary": "",
             "linkedin": "", "github": "", "portfolio": "",
             "education": [], "experience": [], "projects": [],
             "skills": [], "certifications": [], "achievements": [], "languages": [],
-            "preferences": {"job_types": ["Internship", "Full-time"], "work_mode": "Any", "locations": []},
+            "preferences": {"job_types": [], "work_mode": "", "locations": []},
             "updated": None,
         },
         "cv": {"uploaded": bool(cv and cv["extracted"]), "source": cv["source"] if cv else None,
@@ -488,8 +550,19 @@ def get_candidate_profile(user=Depends(current_user)):
             "certifications", "achievements", "languages", "preferences"
         ):
             p[key] = json.loads(p[key] or ("{}" if key == "preferences" else "[]"))
+        p["name"] = p.get("name") or user["name"]
+        if p["preferences"] == {
+            "job_types": ["Internship", "Full-time"],
+            "work_mode": "Any",
+            "locations": [],
+        }:
+            p["preferences"] = {
+                "job_types": [],
+                "work_mode": "",
+                "locations": [],
+            }
         result["profile"].update({k: p[k] for k in (
-            "headline", "phone", "location", "summary", "linkedin", "github",
+            "name", "headline", "phone", "location", "summary", "linkedin", "github",
             "portfolio", "education", "experience", "projects", "skills",
             "certifications", "achievements", "languages", "preferences", "updated"
         )})
@@ -498,20 +571,15 @@ def get_candidate_profile(user=Depends(current_user)):
 @router.put("/api/candidate/profile")
 def update_candidate_profile(body: CandidateProfileUpdate, user=Depends(current_user)):
     require_role(user, "candidate")
-    preferences = body.preferences if isinstance(body.preferences, dict) else {}
-    allowed_types = {"Internship", "Full-time", "Part-time", "Contract", "Temporary"}
-    allowed_modes = {"Any", "Remote", "Hybrid", "On-site"}
-    preferences["job_types"] = [x for x in preferences.get("job_types", []) if x in allowed_types][:5]
-    preferences["work_mode"] = preferences.get("work_mode", "Any") if preferences.get("work_mode", "Any") in allowed_modes else "Any"
-    preferences["locations"] = [str(x)[:100] for x in preferences.get("locations", [])[:10] if str(x).strip()]
-    run("""INSERT INTO candidate_profiles(user_id,headline,phone,location,summary,linkedin,github,portfolio,education,experience,projects,skills,certifications,achievements,languages,preferences,updated)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(user_id) DO UPDATE SET headline=excluded.headline,phone=excluded.phone,location=excluded.location,
+    preferences = _profile_payload(body)["preferences"]
+    run("""INSERT INTO candidate_profiles(user_id,name,headline,phone,location,summary,linkedin,github,portfolio,education,experience,projects,skills,certifications,achievements,languages,preferences,updated)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,headline=excluded.headline,phone=excluded.phone,location=excluded.location,
            summary=excluded.summary,linkedin=excluded.linkedin,github=excluded.github,portfolio=excluded.portfolio,
            education=excluded.education,experience=excluded.experience,projects=excluded.projects,
            skills=excluded.skills,certifications=excluded.certifications,achievements=excluded.achievements,
            languages=excluded.languages,preferences=excluded.preferences,updated=excluded.updated""",
-        (user["id"],body.headline.strip(),body.phone.strip(),body.location.strip(),body.summary.strip(),
+        (user["id"],body.name.strip() or user["name"],body.headline.strip(),body.phone.strip(),body.location.strip(),body.summary.strip(),
          body.linkedin.strip(),body.github.strip(),body.portfolio.strip(),
          json.dumps([x.model_dump() for x in body.education]),json.dumps([x.model_dump() for x in body.experience]),
          json.dumps([x.model_dump() for x in body.projects]),

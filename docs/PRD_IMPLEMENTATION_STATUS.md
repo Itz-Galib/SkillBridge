@@ -10,13 +10,18 @@
 - Idempotent synthetic demo seed for candidate, recruiter, admin and three explicitly mock jobs.
 - Existing skill-assessment journey remains available to candidates.
 
+## Delivered in `feature/ocr-creation-for-user-profile`
+- PDF/DOCX CV parsing retains OCR fallback, private file storage and owner-scoped extraction evidence.
+- Groq extraction validates the configured model and falls back to Gemini using the shared canonical profile schema.
+- Candidates can edit a private draft, keep a CV name separate from account identity, and explicitly confirm before profile creation.
+- Provider failures use the deterministic parser only when it finds profile information; unusable extraction returns a clear error.
+
 ## Next implementation slices
 1. Add Alembic migrations, authorization tests, rate limits, email verification and structured error handling.
-2. Build normalized CV profile editing, OCR fallback and extraction confidence.
-3. Add admin score-review queue, immutable official results and candidate appeals.
-4. Add a DeepSeek provider adapter, PII-redaction tests and optional pgvector RAG.
-5. Add payment-provider abstraction and idempotent webhook handling for paid retakes.
-6. Add safe isolated code execution, backups, observability, accessibility and privacy/legal review.
+2. Add admin score-review queue, immutable official results and candidate appeals.
+3. Add PII-redaction tests and optional pgvector RAG.
+4. Add payment-provider abstraction and idempotent webhook handling for paid retakes.
+5. Add safe isolated code execution, backups, observability, accessibility and privacy/legal review.
 
 ## Safety and correctness decisions
 - Integrity events are review signals, not proof of cheating or automatic failure.

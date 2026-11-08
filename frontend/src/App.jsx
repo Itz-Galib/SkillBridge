@@ -2332,6 +2332,8 @@ function PublicPassport({ id }) {
 }
 
 const emptyCandidateProfile = {
+  name: "",
+  email: "",
   headline: "",
   phone: "",
   location: "",
@@ -2347,10 +2349,110 @@ const emptyCandidateProfile = {
   achievements: [],
   languages: [],
   preferences: {
-    job_types: ["Internship", "Full-time"],
-    work_mode: "Any",
+    job_types: [],
+    work_mode: "",
     locations: [],
   },
+};
+const normalizeCandidateProfile = (profile = {}) => {
+  const { updated, ...profileFields } = profile;
+  const normalizeList = (key, defaults, mapAliases = (item) => item) =>
+    Array.isArray(profileFields[key])
+      ? profileFields[key]
+          .filter((item) => item && typeof item === "object" && !Array.isArray(item))
+          .map((item) => ({ ...defaults, ...mapAliases(item) }))
+      : [];
+  return {
+    ...emptyCandidateProfile,
+    ...profileFields,
+    education: normalizeList(
+      "education",
+      {
+        degree: "",
+        field: "",
+        institution: "",
+        location: "",
+        start_year: "",
+        end_year: "",
+        grade: "",
+        details: "",
+      },
+      ({ field_of_study, start_date, end_date, graduation_year, description, source_snippet, ...item }) => ({
+        ...item,
+        field: item.field ?? field_of_study ?? "",
+        start_year: item.start_year ?? start_date ?? "",
+        end_year: item.end_year ?? end_date ?? graduation_year ?? "",
+        details: item.details ?? description ?? "",
+      }),
+    ),
+    experience: normalizeList(
+      "experience",
+      {
+        title: "",
+        company: "",
+        location: "",
+        employment_type: "",
+        start_date: "",
+        end_date: "",
+        current: false,
+        description: "",
+        achievements: [],
+        technologies: [],
+      },
+      ({ job_title, is_current, source_snippet, ...item }) => ({
+        ...item,
+        title: item.title ?? job_title ?? "",
+        current: item.current ?? is_current ?? false,
+        achievements: Array.isArray(item.achievements) ? item.achievements : [],
+        technologies: Array.isArray(item.technologies) ? item.technologies : [],
+      }),
+    ),
+    projects: normalizeList(
+      "projects",
+      {
+        name: "",
+        description: "",
+        role: "",
+        technologies: [],
+        url: "",
+        start_date: "",
+        end_date: "",
+      },
+      ({ project_url, source_snippet, ...item }) => ({
+        ...item,
+        url: item.url ?? project_url ?? "",
+        technologies: Array.isArray(item.technologies) ? item.technologies : [],
+      }),
+    ),
+    skills: normalizeList(
+      "skills",
+      { name: "", category: "", status: "claimed" },
+      ({ source_snippet, ...item }) => ({ ...item, status: "claimed" }),
+    ),
+    certifications: normalizeList("certifications", {
+      name: "",
+      issuer: "",
+      issue_date: "",
+      expiry_date: "",
+      credential_id: "",
+      credential_url: "",
+    }),
+    achievements: normalizeList("achievements", {
+      title: "",
+      description: "",
+      date: "",
+    }),
+    languages: normalizeList("languages", { name: "", proficiency: "" }),
+    preferences: {
+      job_types: Array.isArray(profileFields.preferences?.job_types)
+        ? profileFields.preferences.job_types
+        : [],
+      work_mode: profileFields.preferences?.work_mode || "",
+      locations: Array.isArray(profileFields.preferences?.locations)
+        ? profileFields.preferences.locations
+        : [],
+    },
+  };
 };
 function CandidateProfileEditor({ onSaved, draftMode = false }) {
   const [p, setP] = useState(emptyCandidateProfile),
@@ -2380,14 +2482,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
 
       const profileData = r.profile || r.draft || {};
 
-      setP({
-        ...emptyCandidateProfile,
-        ...profileData,
-        preferences: {
-          ...emptyCandidateProfile.preferences,
-          ...(profileData.preferences || {}),
-        },
-      });
+      setP(normalizeCandidateProfile(profileData));
 
       setCv(r.cv || null);
     } catch (e) {
@@ -2474,14 +2569,14 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
     <div className="profile-layout">
       <aside className="profile-side-card">
         <div className="avatar-circle">
-          {(account.name || "C")
+          {(p.name || account.name || "C")
             .split(" ")
             .map((x) => x[0])
             .join("")
             .slice(0, 2)
             .toUpperCase()}
         </div>
-        <h2>{account.name}</h2>
+        <h2>{p.name || account.name}</h2>
         <p className="muted">{p.headline || "Add a professional headline"}</p>
         <p className="muted">{account.email}</p>
         <div className="completion-row">
@@ -2553,8 +2648,26 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
           </div>
           <div className="form-grid">
             <label>
-              Full name
-              <input disabled value={account.name || ""} />
+              Profile name
+              <input
+                value={p.name || account.name || ""}
+                onChange={(e) => set("name", e.target.value)}
+                maxLength={120}
+              />
+              <small className="muted">
+                Account name: {account.name || ""}. Editing this profile name
+                does not change your sign-in identity.
+              </small>
+              {evidence.some((entry) => entry.field === "name_suggestion") && (
+                <small className="muted">
+                  Your CV lists “
+                  {
+                    evidence.find((entry) => entry.field === "name_suggestion")
+                      .source_snippet
+                  }
+                  ” as a suggested profile name.
+                </small>
+              )}
             </label>
             <label>
               Professional headline
@@ -2637,8 +2750,10 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                   institution: "",
                   degree: "",
                   field: "",
+                  location: "",
                   start_year: "",
                   end_year: "",
+                  grade: "",
                   details: "",
                 })
               }
@@ -2662,8 +2777,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Institution
                   <input
-                    required
-                    value={x.institution}
+                    value={x.institution || ""}
                     onChange={(e) =>
                       item("education", i, "institution", e.target.value)
                     }
@@ -2672,7 +2786,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Degree
                   <input
-                    value={x.degree}
+                    value={x.degree || ""}
                     onChange={(e) =>
                       item("education", i, "degree", e.target.value)
                     }
@@ -2681,16 +2795,25 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Field of study
                   <input
-                    value={x.field}
+                    value={x.field || ""}
                     onChange={(e) =>
                       item("education", i, "field", e.target.value)
                     }
                   />
                 </label>
                 <label>
+                  Location
+                  <input
+                    value={x.location || ""}
+                    onChange={(e) =>
+                      item("education", i, "location", e.target.value)
+                    }
+                  />
+                </label>
+                <label>
                   Start year
                   <input
-                    value={x.start_year}
+                    value={x.start_year || ""}
                     onChange={(e) =>
                       item("education", i, "start_year", e.target.value)
                     }
@@ -2699,9 +2822,18 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   End year / expected
                   <input
-                    value={x.end_year}
+                    value={x.end_year || ""}
                     onChange={(e) =>
                       item("education", i, "end_year", e.target.value)
+                    }
+                  />
+                </label>
+                <label>
+                  Grade
+                  <input
+                    value={x.grade || ""}
+                    onChange={(e) =>
+                      item("education", i, "grade", e.target.value)
                     }
                   />
                 </label>
@@ -2710,7 +2842,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 Details
                 <textarea
                   rows={2}
-                  value={x.details}
+                  value={x.details || ""}
                   onChange={(e) =>
                     item("education", i, "details", e.target.value)
                   }
@@ -2737,11 +2869,14 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 add("experience", {
                   company: "",
                   title: "",
+                  location: "",
                   employment_type: "",
                   start_date: "",
                   end_date: "",
                   current: false,
                   description: "",
+                  achievements: [],
+                  technologies: [],
                 })
               }
             >
@@ -2764,8 +2899,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Company
                   <input
-                    required
-                    value={x.company}
+                    value={x.company || ""}
                     onChange={(e) =>
                       item("experience", i, "company", e.target.value)
                     }
@@ -2774,17 +2908,25 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Role / title
                   <input
-                    required
-                    value={x.title}
+                    value={x.title || ""}
                     onChange={(e) =>
                       item("experience", i, "title", e.target.value)
                     }
                   />
                 </label>
                 <label>
+                  Location
+                  <input
+                    value={x.location || ""}
+                    onChange={(e) =>
+                      item("experience", i, "location", e.target.value)
+                    }
+                  />
+                </label>
+                <label>
                   Employment type
                   <input
-                    value={x.employment_type}
+                    value={x.employment_type || ""}
                     onChange={(e) =>
                       item("experience", i, "employment_type", e.target.value)
                     }
@@ -2793,7 +2935,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Start date
                   <input
-                    value={x.start_date}
+                    value={x.start_date || ""}
                     onChange={(e) =>
                       item("experience", i, "start_date", e.target.value)
                     }
@@ -2803,7 +2945,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                   End date
                   <input
                     disabled={x.current}
-                    value={x.end_date}
+                    value={x.end_date || ""}
                     onChange={(e) =>
                       item("experience", i, "end_date", e.target.value)
                     }
@@ -2824,9 +2966,38 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 Description
                 <textarea
                   rows={3}
-                  value={x.description}
+                  value={x.description || ""}
                   onChange={(e) =>
                     item("experience", i, "description", e.target.value)
+                  }
+                />
+              </label>
+              <label>
+                Achievements, one per line
+                <textarea
+                  rows={2}
+                  value={(x.achievements || []).join("\n")}
+                  onChange={(e) =>
+                    item(
+                      "experience",
+                      i,
+                      "achievements",
+                      e.target.value.split("\n").map((value) => value.trim()).filter(Boolean),
+                    )
+                  }
+                />
+              </label>
+              <label>
+                Technologies, comma-separated
+                <input
+                  value={(x.technologies || []).join(", ")}
+                  onChange={(e) =>
+                    item(
+                      "experience",
+                      i,
+                      "technologies",
+                      e.target.value.split(",").map((value) => value.trim()).filter(Boolean),
+                    )
                   }
                 />
               </label>
@@ -2851,8 +3022,11 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 add("projects", {
                   name: "",
                   description: "",
+                  role: "",
                   technologies: [],
                   url: "",
+                  start_date: "",
+                  end_date: "",
                 })
               }
             >
@@ -2875,8 +3049,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Project name
                   <input
-                    required
-                    value={x.name}
+                    value={x.name || ""}
                     onChange={(e) =>
                       item("projects", i, "name", e.target.value)
                     }
@@ -2885,8 +3058,33 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Repository / demo URL
                   <input
-                    value={x.url}
+                    value={x.url || ""}
                     onChange={(e) => item("projects", i, "url", e.target.value)}
+                  />
+                </label>
+                <label>
+                  Role
+                  <input
+                    value={x.role || ""}
+                    onChange={(e) => item("projects", i, "role", e.target.value)}
+                  />
+                </label>
+                <label>
+                  Start date
+                  <input
+                    value={x.start_date || ""}
+                    onChange={(e) =>
+                      item("projects", i, "start_date", e.target.value)
+                    }
+                  />
+                </label>
+                <label>
+                  End date
+                  <input
+                    value={x.end_date || ""}
+                    onChange={(e) =>
+                      item("projects", i, "end_date", e.target.value)
+                    }
                   />
                 </label>
               </div>
@@ -2894,7 +3092,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 Description
                 <textarea
                   rows={3}
-                  value={x.description}
+                  value={x.description || ""}
                   onChange={(e) =>
                     item("projects", i, "description", e.target.value)
                   }
@@ -2956,9 +3154,8 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Skill
                   <input
-                    required
                     maxLength={100}
-                    value={x.name}
+                    value={x.name || ""}
                     onChange={(e) => item("skills", i, "name", e.target.value)}
                   />
                 </label>
@@ -2966,7 +3163,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                   Category
                   <input
                     maxLength={60}
-                    value={x.category}
+                    value={x.category || ""}
                     onChange={(e) =>
                       item("skills", i, "category", e.target.value)
                     }
@@ -3027,7 +3224,6 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                   <label key={key}>
                     {label}
                     <input
-                      required={key === "name"}
                       maxLength={key === "credential_url" ? 300 : 180}
                       value={x[key] || ""}
                       onChange={(e) =>
@@ -3075,9 +3271,8 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Title
                   <input
-                    required
                     maxLength={180}
-                    value={x.title}
+                    value={x.title || ""}
                     onChange={(e) =>
                       item("achievements", i, "title", e.target.value)
                     }
@@ -3087,7 +3282,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                   Date
                   <input
                     maxLength={40}
-                    value={x.date}
+                    value={x.date || ""}
                     onChange={(e) =>
                       item("achievements", i, "date", e.target.value)
                     }
@@ -3099,7 +3294,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <textarea
                   rows={2}
                   maxLength={1000}
-                  value={x.description}
+                  value={x.description || ""}
                   onChange={(e) =>
                     item("achievements", i, "description", e.target.value)
                   }
@@ -3143,9 +3338,8 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 <label>
                   Language
                   <input
-                    required
                     maxLength={100}
-                    value={x.name}
+                    value={x.name || ""}
                     onChange={(e) =>
                       item("languages", i, "name", e.target.value)
                     }
@@ -3155,7 +3349,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                   Proficiency
                   <input
                     maxLength={80}
-                    value={x.proficiency}
+                    value={x.proficiency || ""}
                     onChange={(e) =>
                       item("languages", i, "proficiency", e.target.value)
                     }
@@ -3179,7 +3373,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
           <label>
             Preferred work mode
             <select
-              value={p.preferences.work_mode || "Any"}
+            value={p.preferences.work_mode || ""}
               onChange={(e) =>
                 set("preferences", {
                   ...p.preferences,
@@ -3187,6 +3381,7 @@ function CandidateProfileEditor({ onSaved, draftMode = false }) {
                 })
               }
             >
+              <option value="">Not specified</option>
               <option>Any</option>
               <option>Remote</option>
               <option>Hybrid</option>
@@ -3282,6 +3477,7 @@ function CandidateProfileOnboarding({ onSaved }) {
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [extractionNotice, setExtractionNotice] = useState("");
 
   const loadStatus = async () => {
     try {
@@ -3317,8 +3513,8 @@ function CandidateProfileOnboarding({ onSaved }) {
           experience: [],
           projects: [],
           preferences: {
-            job_types: ["Internship", "Full-time"],
-            work_mode: "Any",
+            job_types: [],
+            work_mode: "",
             locations: [],
           },
         },
@@ -3346,12 +3542,17 @@ function CandidateProfileOnboarding({ onSaved }) {
       const form = new FormData();
       form.append("file", file);
 
-      await api("/cv/profile-extract", {
+      const result = await api("/cv/profile-extract", {
         method: "POST",
         form,
       });
 
-      setMethod("cv");
+      setMethod(result.method || "cv");
+      setExtractionNotice(
+        result.extraction?.ai_error
+          ? `AI extraction was unavailable (${result.extraction.ai_error}). The offline parser prepared a draft; review it carefully.`
+          : result.message || "",
+      );
       setStatus("draft");
     } catch (e) {
       setError(e.message || "Could not extract your CV");
@@ -3381,15 +3582,20 @@ function CandidateProfileOnboarding({ onSaved }) {
         <div className="portal-panel">
           <span className="eyebrow">PROFILE REVIEW</span>
           <h2>
-            {method === "cv"
+            {method.startsWith("cv")
               ? "Review your extracted profile"
               : "Create your profile"}
           </h2>
           <p>
-            {method === "cv"
+            {method === "cv" || method.startsWith("cv_")
               ? "We extracted information from your CV. Please check every field and correct anything that is inaccurate."
               : "Fill in your information. You can review everything before creating your profile."}
           </p>
+          {extractionNotice && (
+            <p className={method === "cv_offline" ? "muted" : "success-note"} role="status">
+              {extractionNotice}
+            </p>
+          )}
           <span className="status-pill">Draft · Not published</span>
         </div>
 

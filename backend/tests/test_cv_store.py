@@ -34,7 +34,7 @@ def test_cv_text_extraction_stays_private_until_profile_confirmation(monkeypatch
 
     uid, headers = _user("profile-draft@example.com")
     cv_text = (
-        "Rafi Ahmed\n"
+        "CV Name\n"
         "Email: rafi@example.com | Phone: +880 1712-345678\n"
         "Junior Software Engineer\n"
         "Skills: Python\n"
@@ -54,9 +54,37 @@ def test_cv_text_extraction_stays_private_until_profile_confirmation(monkeypatch
                 "linkedin": "",
                 "github": "",
                 "portfolio": "",
-                "education": [],
-                "experience": [],
-                "projects": [],
+                "education": [{
+                    "degree": "BSc",
+                    "field": "Computer Science",
+                    "institution": "North University",
+                    "location": "Dhaka",
+                    "start_year": "2020",
+                    "end_year": "2024",
+                    "grade": "3.8",
+                    "details": "Computer science studies",
+                }],
+                "experience": [{
+                    "title": "Software Intern",
+                    "company": "ABC Ltd",
+                    "location": "Dhaka",
+                    "employment_type": "Internship",
+                    "start_date": "2023",
+                    "end_date": "2024",
+                    "current": False,
+                    "description": "Built an API",
+                    "achievements": ["Improved response times"],
+                    "technologies": ["Python", "FastAPI"],
+                }],
+                "projects": [{
+                    "name": "SkillBridge",
+                    "description": "Candidate profile app",
+                    "role": "Developer",
+                    "technologies": ["React"],
+                    "url": "https://example.test",
+                    "start_date": "2024",
+                    "end_date": "2025",
+                }],
                 "skills": [{"name": "Python", "category": "Programming"}],
                 "certifications": [
                     {"name": "Python Certificate", "issuer": "Example Institute"}
@@ -104,6 +132,15 @@ def test_cv_text_extraction_stays_private_until_profile_confirmation(monkeypatch
     draft = client.get("/api/candidate/profile/draft", headers=headers)
     assert draft.status_code == 200
     assert draft.json()["profile"]["email"] == "profile-draft@example.com"
+    assert draft.json()["profile"]["name"] == "CV Name"
+    assert draft.json()["profile"]["email"] == "profile-draft@example.com"
+    assert any(
+        entry["field"] == "name_suggestion"
+        and entry["source_snippet"] == "CV Name"
+        for entry in draft.json()["extraction"]
+    )
+    assert draft.json()["profile"]["experience"][0]["title"] == "Software Intern"
+    assert draft.json()["profile"]["projects"][0]["url"] == "https://example.test"
     assert draft.json()["extraction"]
 
     edited = draft.json()["profile"]
@@ -120,14 +157,143 @@ def test_cv_text_extraction_stays_private_until_profile_confirmation(monkeypatch
         headers=headers,
     )
     assert confirmed.status_code == 200, confirmed.text
+    repeated = client.post(
+        "/api/candidate/profile/confirm",
+        json={},
+        headers=headers,
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert main.one(
+        "SELECT COUNT(*) AS count FROM candidate_profiles WHERE user_id=?",
+        (uid,),
+    )["count"] == 1
 
-    profile = client.get("/api/candidate/profile", headers=headers).json()["profile"]
+    confirmed_response = client.get("/api/candidate/profile", headers=headers).json()
+    profile = confirmed_response["profile"]
+    assert profile["name"] == "CV Name"
+    assert confirmed_response["user"]["name"] == "Rafi Ahmed"
     assert profile["skills"] == [
         {"name": "Python", "category": "Technical", "status": "claimed"}
     ]
     assert profile["certifications"][0]["name"] == "Python Certificate"
     assert profile["achievements"][0]["title"] == "Hackathon finalist"
     assert profile["languages"][0]["name"] == "English"
+    assert profile["education"][0]["field"] == "Computer Science"
+    assert profile["education"][0]["grade"] == "3.8"
+    assert profile["experience"][0]["achievements"] == ["Improved response times"]
+    assert profile["experience"][0]["technologies"] == ["Python", "FastAPI"]
+    assert profile["projects"][0]["role"] == "Developer"
+
+    updated_profile = {key: value for key, value in profile.items() if key != "updated"}
+    updated_profile["name"] = "Reviewed Profile Name"
+    update = client.put(
+        "/api/candidate/profile",
+        json=updated_profile,
+        headers=headers,
+    )
+    assert update.status_code == 200, update.text
+    updated = client.get("/api/candidate/profile", headers=headers).json()
+    assert updated["profile"]["name"] == "Reviewed Profile Name"
+    assert updated["user"]["name"] == "Rafi Ahmed"
+    assert updated["profile"]["experience"][0]["technologies"] == ["Python", "FastAPI"]
+
+
+def test_provider_failures_use_private_deterministic_draft_when_meaningful(monkeypatch, caplog):
+    import ai_providers
+
+    uid, headers = _user("offline-draft@example.com")
+    cv_text = (
+        "Rafi Ahmed\n"
+        "Skills\n"
+        "Python, SQL, React\n"
+        "Built dashboards for internship projects."
+    )
+
+    def fail_extract(*args, **kwargs):
+        raise ai_providers.AIExtractionError(
+            "All configured AI providers failed. groq returned HTTP 401"
+        )
+
+    monkeypatch.setattr(ai_providers, "extract_cv_profile", fail_extract)
+    response = client.post(
+        "/api/cv/profile-extract",
+        files={"file": ("profile.txt", cv_text.encode("utf-8"), "text/plain")},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["method"] == "cv_offline"
+    assert response.json()["profile"]["skills"]
+    assert response.json()["extraction"]["ai_error"]
+    assert main.one(
+        "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+        (uid,),
+    ) is None
+    assert "Rafi Ahmed" not in caplog.text
+    assert "rafi@example.com" not in caplog.text
+
+
+def test_unusable_cv_does_not_create_success_shaped_draft(monkeypatch):
+    import ai_providers
+
+    uid, headers = _user("empty-extraction@example.com")
+    def fail_extract(*args, **kwargs):
+        raise ai_providers.AIExtractionError("All providers unavailable")
+
+    monkeypatch.setattr(ai_providers, "extract_cv_profile", fail_extract)
+    cv_text = (
+        "A general document describing unrelated topics with enough words to "
+        "pass basic text extraction but containing no candidate profile facts."
+    )
+    response = client.post(
+        "/api/cv/profile-extract",
+        files={"file": ("profile.txt", cv_text.encode("utf-8"), "text/plain")},
+        headers=headers,
+    )
+    assert response.status_code == 422
+    assert "no supported profile information" in response.text.lower()
+    assert main.one(
+        "SELECT user_id FROM candidate_profile_drafts WHERE user_id=?",
+        (uid,),
+    ) is None
+    assert main.one(
+        "SELECT id FROM cv_documents WHERE user_id=?",
+        (uid,),
+    ) is None
+
+
+def test_incomplete_nested_draft_is_editable_but_cannot_be_confirmed():
+    uid, headers = _user("incomplete-profile@example.com")
+    saved = client.put(
+        "/api/candidate/profile/draft",
+        json={"experience": [{"title": "", "company": ""}]},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+
+    rejected = client.post(
+        "/api/candidate/profile/confirm",
+        json={},
+        headers=headers,
+    )
+    assert rejected.status_code == 422
+    assert "experience[0]" in rejected.text
+    assert main.one(
+        "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+        (uid,),
+    ) is None
+
+    fixed = client.put(
+        "/api/candidate/profile/draft",
+        json={"headline": "Software Engineer", "experience": []},
+        headers=headers,
+    )
+    assert fixed.status_code == 200, fixed.text
+    confirmed = client.post(
+        "/api/candidate/profile/confirm",
+        json={},
+        headers=headers,
+    )
+    assert confirmed.status_code == 200, confirmed.text
 
 
 def test_local_storage_roundtrip_and_traversal():
