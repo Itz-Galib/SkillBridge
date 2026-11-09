@@ -1,13 +1,27 @@
 """Initial hiring workflow APIs for SkillBridge PRD."""
-import json, time, uuid, os, re, secrets, csv, io
-from typing import Optional, List
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel, Field
+import json, time, uuid, os, re, secrets, csv, io, logging
+from typing import Annotated, Optional, List, Literal
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from main import current_user, one, allr, run, audit, QBYID, db, DATABASE_URL, COOLDOWN_HOURS, MAX_ATTEMPTS_90D
 from content import RESOURCES, JOB
 from urllib.parse import urlparse
 
 router = APIRouter(tags=["hiring"])
+log = logging.getLogger("skillbridge.enterprise")
+# Candidate profile drafts are private until the candidate confirms.
+run("""
+CREATE TABLE IF NOT EXISTS candidate_profile_drafts (
+    user_id INTEGER PRIMARY KEY,
+    profile_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    method TEXT NOT NULL DEFAULT 'manual',
+    document_id TEXT,
+    created REAL NOT NULL,
+    updated REAL NOT NULL,
+    confirmed_at REAL
+)
+""")
 
 def role_of(user):
     row = one("SELECT role FROM user_roles WHERE user_id=?", (user["id"],))
@@ -47,30 +61,90 @@ class CompanyAssessmentCreate(BaseModel):
     job_id: Optional[str] = None
 
 
-class EducationItem(BaseModel):
-    institution: str = Field(min_length=2, max_length=160)
+class ProfileModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+Text100 = Annotated[str, Field(max_length=100)]
+Text160 = Annotated[str, Field(max_length=160)]
+
+
+class EducationItem(ProfileModel):
+    institution: str = Field(default="", max_length=160)
     degree: str = Field(default="", max_length=160)
     field: str = Field(default="", max_length=160)
+    location: str = Field(default="", max_length=160)
     start_year: str = Field(default="", max_length=10)
     end_year: str = Field(default="", max_length=10)
+    grade: str = Field(default="", max_length=80)
     details: str = Field(default="", max_length=1000)
 
-class ExperienceItem(BaseModel):
-    company: str = Field(min_length=2, max_length=160)
-    title: str = Field(min_length=2, max_length=160)
+class ExperienceItem(ProfileModel):
+    company: str = Field(default="", max_length=160)
+    title: str = Field(default="", max_length=160)
+    location: str = Field(default="", max_length=160)
     employment_type: str = Field(default="", max_length=60)
     start_date: str = Field(default="", max_length=20)
     end_date: str = Field(default="", max_length=20)
     current: bool = False
+    duration_months: int = Field(default=0, ge=0, le=600)
     description: str = Field(default="", max_length=2000)
+    achievements: List[Text160] = Field(default_factory=list, max_length=30)
+    technologies: List[Text160] = Field(default_factory=list, max_length=30)
 
-class ProjectItem(BaseModel):
-    name: str = Field(min_length=2, max_length=160)
-    description: str = Field(default="", max_length=2000)
-    technologies: List[str] = Field(default_factory=list, max_length=30)
+class ProjectItem(ProfileModel):
+    name: str = Field(default="", max_length=160)
     url: str = Field(default="", max_length=300)
+    description: str = Field(default="", max_length=2000)
+    role: str = Field(default="", max_length=160)
+    technologies: List[Text160] = Field(default_factory=list, max_length=30)
+    start_date: str = Field(default="", max_length=40)
+    end_date: str = Field(default="", max_length=40)
 
-class CandidateProfileUpdate(BaseModel):
+class SkillItem(ProfileModel):
+    name: str = Field(default="", max_length=100)
+    category: str = Field(default="", max_length=60)
+    status: Literal["claimed"] = "claimed"
+
+class CertificationItem(ProfileModel):
+    name: str = Field(default="", max_length=180)
+    issuer: str = Field(default="", max_length=160)
+    issue_date: str = Field(default="", max_length=40)
+    expiry_date: str = Field(default="", max_length=40)
+    credential_id: str = Field(default="", max_length=120)
+    credential_url: str = Field(default="", max_length=300)
+
+class AchievementItem(ProfileModel):
+    title: str = Field(default="", max_length=180)
+    description: str = Field(default="", max_length=1000)
+    date: str = Field(default="", max_length=40)
+
+class LanguageItem(ProfileModel):
+    name: str = Field(default="", max_length=100)
+    proficiency: str = Field(default="", max_length=80)
+
+class ReferenceItem(ProfileModel):
+    name: str = Field(default="", max_length=120)
+    relationship: str = Field(default="", max_length=80)
+    email: str = Field(default="", max_length=254)
+    phone: str = Field(default="", max_length=40)
+
+class VolunteerItem(ProfileModel):
+    organization: str = Field(default="", max_length=120)
+    role: str = Field(default="", max_length=120)
+    start_date: str = Field(default="", max_length=20)
+    end_date: str = Field(default="", max_length=20)
+    description: str = Field(default="", max_length=1000)
+
+class CandidatePreferences(ProfileModel):
+    job_types: List[Literal["Internship", "Full-time", "Part-time", "Contract", "Temporary"]] = Field(default_factory=list, max_length=5)
+    work_mode: Literal["", "Any", "Remote", "Hybrid", "On-site"] = ""
+    locations: List[Text100] = Field(default_factory=list, max_length=10)
+    show_photo_to_employers: bool = False
+
+class CandidateProfileUpdate(ProfileModel):
+    name: str = Field(default="", max_length=120)
+    email: str = Field(default="", max_length=254)
     headline: str = Field(default="", max_length=180)
     phone: str = Field(default="", max_length=40)
     location: str = Field(default="", max_length=160)
@@ -81,8 +155,443 @@ class CandidateProfileUpdate(BaseModel):
     education: List[EducationItem] = Field(default_factory=list, max_length=12)
     experience: List[ExperienceItem] = Field(default_factory=list, max_length=20)
     projects: List[ProjectItem] = Field(default_factory=list, max_length=20)
-    preferences: dict = Field(default_factory=dict)
+    skills: List[SkillItem] = Field(default_factory=list, max_length=80)
+    certifications: List[CertificationItem] = Field(default_factory=list, max_length=30)
+    achievements: List[AchievementItem] = Field(default_factory=list, max_length=30)
+    languages: List[LanguageItem] = Field(default_factory=list, max_length=20)
+    references: List[ReferenceItem] = Field(default_factory=list, max_length=20)
+    volunteer: List[VolunteerItem] = Field(default_factory=list, max_length=20)
+    preferences: CandidatePreferences = Field(default_factory=CandidatePreferences)
 
+class CandidateProfileDraftInput(CandidateProfileUpdate):
+    method: Optional[str] = None
+    document_id: Optional[str] = None
+
+
+def _profile_payload(body):
+    data = body.model_dump(exclude={"method", "document_id"})
+    data["preferences"]["locations"] = [
+        value.strip() for value in data["preferences"]["locations"]
+        if value.strip()
+    ]
+
+    return data
+
+
+def _decode_profile_json(raw):
+    profile = json.loads(raw or "{}")
+    from ai_providers import empty_profile, normalize_profile
+
+    canonical = {**empty_profile(), **profile}
+    canonical["projects"] = [
+        {"name": item.get("name", ""), "url": item.get("url") or item.get("project_url", "")}
+        for item in canonical.get("projects", [])
+        if isinstance(item, dict)
+    ]
+    preferences = canonical.get("preferences")
+    show_photo_to_employers = (
+        bool(preferences.get("show_photo_to_employers", False))
+        if isinstance(preferences, dict) else False
+    )
+    if isinstance(preferences, dict):
+        canonical["preferences"] = {
+            key: preferences.get(key, default)
+            for key, default in (
+                ("job_types", []),
+                ("work_mode", ""),
+                ("locations", []),
+            )
+        }
+        preferences = canonical["preferences"]
+    if preferences == {
+        "job_types": ["Internship", "Full-time"],
+        "work_mode": "Any",
+        "locations": [],
+    }:
+        canonical["preferences"] = {
+            "job_types": [],
+            "work_mode": "",
+            "locations": [],
+        }
+    for skill in canonical.get("skills", []):
+        if isinstance(skill, dict):
+            skill["status"] = "claimed"
+    normalized = normalize_profile({**canonical, "evidence": []})["profile"]
+    normalized["preferences"]["show_photo_to_employers"] = show_photo_to_employers
+    return normalized
+
+
+@router.get("/api/candidate/profile/status")
+def candidate_profile_status(user=Depends(current_user)):
+    require_role(user, "candidate")
+
+    # Existing profiles created before this feature are already confirmed.
+    existing = one(
+        "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+        (user["id"],),
+    )
+
+    if existing:
+        return {
+            "status": "confirmed",
+            "method": "existing",
+        }
+
+    draft = one(
+        """
+        SELECT status, method
+        FROM candidate_profile_drafts
+        WHERE user_id=?
+        """,
+        (user["id"],),
+    )
+
+    if not draft:
+        return {
+            "status": "not_created",
+            "method": None,
+        }
+
+    return {
+        "status": draft["status"],
+        "method": draft["method"],
+    }
+
+
+@router.get("/api/candidate/profile/draft")
+def get_candidate_profile_draft(user=Depends(current_user)):
+    require_role(user, "candidate")
+
+    draft = one(
+        """
+        SELECT profile_json, status, method, document_id
+        FROM candidate_profile_drafts
+        WHERE user_id=?
+        """,
+        (user["id"],),
+    )
+
+    if not draft:
+        raise HTTPException(404, "Profile draft not found")
+
+    if draft["status"] != "draft":
+        raise HTTPException(409, "This profile draft is no longer editable")
+
+    extraction = []
+    if draft["document_id"]:
+        import cv_store
+
+        extraction = cv_store.list_extractions(
+            user["id"], draft["document_id"]
+        )
+
+    profile = _decode_profile_json(draft["profile_json"])
+    profile["name"] = profile.get("name") or user["name"]
+    profile["email"] = profile.get("email") or user["email"]
+    from main import profile_completeness, profile_review_summary
+    review = profile_review_summary(profile, extraction)
+    return {
+        "status": draft["status"],
+        "method": draft["method"],
+        "document_id": draft["document_id"],
+        "profile": profile,
+        "extraction": review,
+        "completeness": profile_completeness(profile),
+    }
+
+
+@router.put("/api/candidate/profile/draft")
+def save_candidate_profile_draft(
+    body: CandidateProfileDraftInput,
+    user=Depends(current_user),
+):
+    require_role(user, "candidate")
+
+    # Never allow a draft request to overwrite an already confirmed profile.
+    existing = one(
+        "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+        (user["id"],),
+    )
+
+    if existing:
+        raise HTTPException(
+            409,
+            "Your profile is already confirmed. Use the profile update endpoint.",
+        )
+
+    previous = one(
+        """
+        SELECT method, document_id
+        FROM candidate_profile_drafts
+        WHERE user_id=?
+        """,
+        (user["id"],),
+    )
+
+    method = body.method or (
+        previous["method"] if previous else "manual"
+    )
+
+    if method not in ("manual", "cv", "cv_ai", "cv_offline"):
+        raise HTTPException(422, "Method must be manual or cv")
+
+    document_id = (
+        body.document_id
+        if body.document_id is not None
+        else (previous["document_id"] if previous else None)
+    )
+
+    profile = _profile_payload(body)
+    profile["name"] = profile.get("name") or user["name"]
+    profile["email"] = profile.get("email") or user["email"]
+
+    if document_id:
+        import cv_store
+
+        if not cv_store.get_document(user["id"], document_id):
+            raise HTTPException(422, "The selected CV document does not belong to this account")
+
+    now = time.time()
+
+    run(
+        """
+        INSERT INTO candidate_profile_drafts(
+            user_id, profile_json, status, method,
+            document_id, created, updated
+        )
+        VALUES (?, ?, 'draft', ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            profile_json=excluded.profile_json,
+            status='draft',
+            method=excluded.method,
+            document_id=excluded.document_id,
+            updated=excluded.updated
+        """,
+        (
+            user["id"],
+            json.dumps(profile),
+            method,
+            document_id,
+            now,
+            now,
+        ),
+    )
+
+    audit(user["id"], "candidate_profile_draft_saved", method)
+
+    extraction = []
+    if document_id:
+        import cv_store
+
+        extraction = cv_store.list_extractions(user["id"], document_id)
+    from main import profile_completeness, profile_review_summary
+    return {
+        "ok": True,
+        "status": "draft",
+        "method": method,
+        "completeness": profile_completeness(profile),
+        "extraction": profile_review_summary(profile, extraction),
+    }
+
+
+@router.post("/api/candidate/profile/confirm")
+def confirm_candidate_profile(user=Depends(current_user)):
+    require_role(user, "candidate")
+
+    existing = one(
+        "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+        (user["id"],),
+    )
+    draft = one(
+        """
+        SELECT *
+        FROM candidate_profile_drafts
+        WHERE user_id=?
+        """,
+        (user["id"],),
+    )
+
+    if existing:
+        if draft and draft["status"] == "confirmed":
+            saved_profile = dict(one(
+                "SELECT * FROM candidate_profiles WHERE user_id=?",
+                (user["id"],),
+            ))
+            for key in ("skills", "experience", "projects"):
+                saved_profile[key] = json.loads(saved_profile[key] or "[]")
+            from main import sync_skill_journey
+            sync_skill_journey(user["id"], saved_profile)
+            return {
+                "ok": True,
+                "status": "confirmed",
+                "message": "Candidate profile is already confirmed.",
+            }
+        raise HTTPException(409, "Profile is already confirmed")
+
+    if not draft:
+        raise HTTPException(404, "Profile draft not found")
+
+    if draft["status"] != "draft":
+        raise HTTPException(409, "Profile draft is not awaiting confirmation")
+
+    try:
+        profile = CandidateProfileUpdate.model_validate(
+            _decode_profile_json(draft["profile_json"])
+        ).model_dump()
+    except ValidationError as exc:
+        raise HTTPException(
+            422,
+            detail={
+                "message": "The profile contains invalid fields.",
+                "errors": exc.errors(),
+            },
+        ) from exc
+    profile["name"] = profile["name"].strip() or user["name"]
+    profile["email"] = profile.get("email") or user["email"]
+
+    required_fields = {
+        "education": ("institution",),
+        "experience": ("company", "title"),
+        "projects": ("name",),
+        "skills": ("name",),
+        "certifications": ("name",),
+        "achievements": ("title",),
+        "languages": ("name",),
+        "references": ("name",),
+        "volunteer": ("organization",),
+    }
+    incomplete = []
+    for collection, fields in required_fields.items():
+        for index, item in enumerate(profile[collection]):
+            missing = [
+                field for field in fields
+                if not str(item.get(field) or "").strip()
+            ]
+            if missing:
+                incomplete.append({
+                    "field": f"{collection}[{index}]",
+                    "missing": missing,
+                })
+    if incomplete:
+        raise HTTPException(
+            422,
+            detail={
+                "message": "Complete or remove the listed profile entries before confirming.",
+                "fields": incomplete,
+            },
+        )
+
+    # Require some meaningful profile information before publication.
+    has_content = any([
+        profile["headline"].strip(),
+        profile["summary"].strip(),
+        profile["location"].strip(),
+        profile["education"],
+        profile["experience"],
+        profile["projects"],
+        profile["skills"],
+        profile["certifications"],
+        profile["achievements"],
+        profile["languages"],
+        profile["volunteer"],
+    ])
+
+    if not has_content:
+        raise HTTPException(
+            422,
+            "Please add some profile information before confirming.",
+        )
+
+    now = time.time()
+
+    # Save the confirmed profile and update draft status in one transaction.
+    from main import db, DATABASE_URL
+
+    with db() as conn:
+        if DATABASE_URL:
+            conn.execute(
+                "SELECT id FROM users WHERE id=? FOR UPDATE",
+                (user["id"],),
+            ).fetchone()
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+
+        current = conn.execute(
+            "SELECT user_id FROM candidate_profiles WHERE user_id=?",
+            (user["id"],),
+        ).fetchone()
+
+        if current:
+            current_draft = conn.execute(
+                "SELECT status FROM candidate_profile_drafts WHERE user_id=?",
+                (user["id"],),
+            ).fetchone()
+            if current_draft and current_draft["status"] == "confirmed":
+                return {
+                    "ok": True,
+                    "status": "confirmed",
+                    "message": "Candidate profile is already confirmed.",
+                }
+            raise HTTPException(409, "Profile is already confirmed")
+
+        conn.execute(
+            """
+            INSERT INTO candidate_profiles(
+                user_id, name, headline, phone, location, summary,
+                linkedin, github, portfolio, education,
+                experience, projects, skills, certifications,
+                achievements, languages, email, profile_references,
+                volunteer, preferences, updated
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
+                profile["name"],
+                profile["headline"].strip(),
+                profile["phone"].strip(),
+                profile["location"].strip(),
+                profile["summary"].strip(),
+                profile["linkedin"].strip(),
+                profile["github"].strip(),
+                profile["portfolio"].strip(),
+                json.dumps(profile["education"]),
+                json.dumps(profile["experience"]),
+                json.dumps([
+                    {"name": item["name"], "url": item["url"]}
+                    for item in profile["projects"]
+                ]),
+                json.dumps(profile["skills"]),
+                json.dumps(profile["certifications"]),
+                json.dumps(profile["achievements"]),
+                json.dumps(profile["languages"]),
+                profile["email"].strip(),
+                json.dumps(profile["references"]),
+                json.dumps(profile["volunteer"]),
+                json.dumps(profile["preferences"]),
+                now,
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE candidate_profile_drafts
+            SET status='confirmed', confirmed_at=?, updated=?
+            WHERE user_id=?
+            """,
+            (now, now, user["id"]),
+        )
+
+    audit(user["id"], "candidate_profile_confirmed", draft["method"])
+    from main import sync_skill_journey, avatar_metadata
+    sync_skill_journey(user["id"], profile)
+
+    return {
+        "ok": True,
+        "status": "confirmed",
+        "message": "Candidate profile created successfully.",
+        **avatar_metadata(user["id"]),
+    }
 @router.get("/api/candidate/profile")
 def get_candidate_profile(user=Depends(current_user)):
     require_role(user, "candidate")
@@ -91,10 +600,14 @@ def get_candidate_profile(user=Depends(current_user)):
     result = {
         "user": {"name": user["name"], "email": user["email"]},
         "profile": {
+            "name": user["name"],
+            "email": user["email"],
             "headline": "", "phone": "", "location": "", "summary": "",
             "linkedin": "", "github": "", "portfolio": "",
             "education": [], "experience": [], "projects": [],
-            "preferences": {"job_types": ["Internship", "Full-time"], "work_mode": "Any", "locations": []},
+            "skills": [], "certifications": [], "achievements": [], "languages": [],
+            "references": [], "volunteer": [],
+            "preferences": {"job_types": [], "work_mode": "", "locations": []},
             "updated": None,
         },
         "cv": {"uploaded": bool(cv and cv["extracted"]), "source": cv["source"] if cv else None,
@@ -102,38 +615,182 @@ def get_candidate_profile(user=Depends(current_user)):
                "extracted_skills": json.loads(cv["extracted"]) if cv and cv["extracted"] else [],
                "redaction": json.loads(cv["redaction"]) if cv and cv["redaction"] else {}},
     }
+    from main import avatar_metadata
+    result.update(avatar_metadata(user["id"]))
     if row:
         p = dict(row)
-        for key in ("education", "experience", "projects", "preferences"):
+        for key in (
+            "education", "experience", "projects", "skills",
+            "certifications", "achievements", "languages", "preferences",
+            "profile_references", "volunteer",
+        ):
             p[key] = json.loads(p[key] or ("{}" if key == "preferences" else "[]"))
-        result["profile"].update({k: p[k] for k in ("headline","phone","location","summary","linkedin","github","portfolio","education","experience","projects","preferences","updated")})
+        p["references"] = p.pop("profile_references", [])
+        p["projects"] = [
+            {"name": item.get("name", ""), "url": item.get("url") or item.get("project_url", "")}
+            for item in p["projects"]
+            if isinstance(item, dict)
+        ]
+        p["name"] = p.get("name") or user["name"]
+        p["email"] = p.get("email") or user["email"]
+        if p["preferences"] == {
+            "job_types": ["Internship", "Full-time"],
+            "work_mode": "Any",
+            "locations": [],
+        }:
+            p["preferences"] = {
+                "job_types": [],
+                "work_mode": "",
+                "locations": [],
+            }
+        result["profile"].update({k: p[k] for k in (
+            "name", "email", "headline", "phone", "location", "summary", "linkedin", "github",
+            "portfolio", "education", "experience", "projects", "skills",
+            "certifications", "achievements", "languages", "references",
+            "volunteer", "preferences", "updated"
+        )})
+    else:
+        result["profile"]["email"] = user["email"]
+        result["profile"]["references"] = []
+        result["profile"]["volunteer"] = []
+    from main import profile_completeness
+    result["completeness"] = profile_completeness(result["profile"])
     return result
 
 @router.put("/api/candidate/profile")
 def update_candidate_profile(body: CandidateProfileUpdate, user=Depends(current_user)):
     require_role(user, "candidate")
-    preferences = body.preferences if isinstance(body.preferences, dict) else {}
-    allowed_types = {"Internship", "Full-time", "Part-time", "Contract", "Temporary"}
-    allowed_modes = {"Any", "Remote", "Hybrid", "On-site"}
-    preferences["job_types"] = [x for x in preferences.get("job_types", []) if x in allowed_types][:5]
-    preferences["work_mode"] = preferences.get("work_mode", "Any") if preferences.get("work_mode", "Any") in allowed_modes else "Any"
-    preferences["locations"] = [str(x)[:100] for x in preferences.get("locations", [])[:10] if str(x).strip()]
-    run("""INSERT INTO candidate_profiles(user_id,headline,phone,location,summary,linkedin,github,portfolio,education,experience,projects,preferences,updated)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(user_id) DO UPDATE SET headline=excluded.headline,phone=excluded.phone,location=excluded.location,
+    profile = _profile_payload(body)
+    preferences = profile["preferences"]
+    run("""INSERT INTO candidate_profiles(user_id,name,email,headline,phone,location,summary,linkedin,github,portfolio,education,experience,projects,skills,certifications,achievements,languages,profile_references,volunteer,preferences,updated)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,headline=excluded.headline,phone=excluded.phone,location=excluded.location,
            summary=excluded.summary,linkedin=excluded.linkedin,github=excluded.github,portfolio=excluded.portfolio,
            education=excluded.education,experience=excluded.experience,projects=excluded.projects,
-           preferences=excluded.preferences,updated=excluded.updated""",
-        (user["id"],body.headline.strip(),body.phone.strip(),body.location.strip(),body.summary.strip(),
+           skills=excluded.skills,certifications=excluded.certifications,achievements=excluded.achievements,
+           email=excluded.email,languages=excluded.languages,profile_references=excluded.profile_references,
+           volunteer=excluded.volunteer,preferences=excluded.preferences,updated=excluded.updated""",
+        (user["id"],profile["name"].strip() or user["name"],profile["email"].strip() or user["email"],body.headline.strip(),body.phone.strip(),body.location.strip(),body.summary.strip(),
          body.linkedin.strip(),body.github.strip(),body.portfolio.strip(),
          json.dumps([x.model_dump() for x in body.education]),json.dumps([x.model_dump() for x in body.experience]),
-         json.dumps([x.model_dump() for x in body.projects]),json.dumps(preferences),time.time()))
+         json.dumps([{"name": x.name, "url": x.url} for x in body.projects]),
+         json.dumps([x.model_dump() for x in body.skills]),
+         json.dumps([x.model_dump() for x in body.certifications]),
+         json.dumps([x.model_dump() for x in body.achievements]),
+         json.dumps([x.model_dump() for x in body.languages]),
+         json.dumps([x.model_dump() for x in body.references]),
+         json.dumps([x.model_dump() for x in body.volunteer]),
+         json.dumps(preferences),time.time()))
     audit(user["id"], "candidate_profile_updated")
-    return {"ok": True, "updated": time.time()}
+    from main import avatar_metadata, profile_completeness, sync_skill_journey
+    sync_skill_journey(user["id"], profile)
+    return {
+        "ok": True,
+        "updated": time.time(),
+        "completeness": profile_completeness(profile),
+        **avatar_metadata(user["id"]),
+    }
+
+
+def _process_candidate_avatar(data: bytes) -> bytes:
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    try:
+        with Image.open(io.BytesIO(data)) as opened:
+            if opened.format not in {"PNG", "JPEG", "WEBP"}:
+                raise HTTPException(415, "Upload a PNG, JPEG or WebP image")
+            if opened.width * opened.height > 16_000_000:
+                raise HTTPException(413, "Image dimensions too large (max 16 megapixels)")
+            opened.load()
+            image = ImageOps.exif_transpose(opened)
+            if image.mode in {"RGBA", "LA"} or (
+                image.mode == "P" and "transparency" in image.info
+            ):
+                image = image.convert("RGBA")
+            else:
+                image = image.convert("RGB")
+            image = ImageOps.fit(
+                image,
+                (512, 512),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            output = io.BytesIO()
+            image.save(output, format="WEBP", quality=85, method=6)
+            return output.getvalue()
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise HTTPException(415, "The uploaded file is not a valid supported image") from exc
+
+
+@router.post("/api/candidate/avatar")
+async def upload_candidate_avatar(file: UploadFile = File(...), user=Depends(current_user)):
+    require_role(user, "candidate")
+    data = await file.read(2 * 1024 * 1024 + 1)
+    if len(data) > 2 * 1024 * 1024:
+        raise HTTPException(413, "File too large (max 2 MB)")
+    processed = _process_candidate_avatar(data)
+    key = f"avatars/{user['id']}/{uuid.uuid4().hex}.webp"
+    from storage import StorageError, get_storage
+    storage = get_storage()
+    try:
+        storage.put(key, processed, "image/webp")
+    except StorageError as exc:
+        raise HTTPException(503, "Could not store the profile photo, please try again") from exc
+
+    old = one("SELECT storage_key FROM candidate_avatars WHERE user_id=?", (user["id"],))
+    updated = time.time()
+    run(
+        """INSERT INTO candidate_avatars(user_id,storage_key,content_type,updated)
+           VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+           storage_key=excluded.storage_key,content_type=excluded.content_type,
+           updated=excluded.updated""",
+        (user["id"], key, "image/webp", updated),
+    )
+    if old and old["storage_key"] != key:
+        try:
+            storage.delete(old["storage_key"])
+        except StorageError as exc:
+            log.error("Replaced avatar could not be deleted; orphaned key %s: %s", old["storage_key"], exc)
+    return {"ok": True, "has_avatar": True, "avatar_updated": updated}
+
+
+@router.get("/api/candidate/avatar")
+def get_candidate_avatar(user=Depends(current_user)):
+    require_role(user, "candidate")
+    avatar = one(
+        "SELECT storage_key,content_type FROM candidate_avatars WHERE user_id=?",
+        (user["id"],),
+    )
+    if not avatar:
+        raise HTTPException(404, "No profile photo is set")
+    from storage import StorageError, get_storage
+    try:
+        image = get_storage().get(avatar["storage_key"])
+    except StorageError as exc:
+        raise HTTPException(503, "Could not load the profile photo, please try again") from exc
+    return Response(content=image, media_type=avatar["content_type"], headers={"Cache-Control": "private, no-store"})
+
+
+@router.delete("/api/candidate/avatar")
+def delete_candidate_avatar(user=Depends(current_user)):
+    require_role(user, "candidate")
+    avatar = one("SELECT storage_key FROM candidate_avatars WHERE user_id=?", (user["id"],))
+    if avatar:
+        from storage import StorageError, get_storage
+        try:
+            get_storage().delete(avatar["storage_key"])
+        except StorageError as exc:
+            raise HTTPException(503, "Could not remove the profile photo, please try again") from exc
+        run("DELETE FROM candidate_avatars WHERE user_id=?", (user["id"],))
+    return {"ok": True, "has_avatar": False, "avatar_updated": None}
+
 
 @router.get("/api/enterprise/me")
 def enterprise_me(user=Depends(current_user)):
-    return {"user":{"id":user["id"],"name":user["name"],"email":user["email"]},"role":role_of(user)}
+    from main import avatar_metadata
+    return {"user":{"id":user["id"],"name":user["name"],"email":user["email"]},"role":role_of(user), **avatar_metadata(user["id"])}
 
 @router.get("/api/jobs")
 def public_jobs():

@@ -8,3 +8,6 @@ psycopg[binary]==3.2.4
 spacy==3.8.5
 meilisearch==0.36.0
 neo4j==5.27.0
+PyMuPDF==1.25.3
+pytesseract==0.3.13
+Pillow==11.1.0
