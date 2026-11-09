@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api.js";
+import Avatar from "./Avatar.jsx";
 
 const EMPTY_PROFILE = {
   name: "",
@@ -20,7 +21,7 @@ const EMPTY_PROFILE = {
   languages: [],
   references: [],
   volunteer: [],
-  preferences: { job_types: [], work_mode: "", locations: [] },
+  preferences: { job_types: [], work_mode: "", locations: [], show_photo_to_employers: false },
 };
 
 const SECTIONS = [
@@ -72,7 +73,7 @@ function Field({ label, value, onChange, flagged, type = "text", multiline = fal
   );
 }
 
-function CandidateProfileWorkspace({ onSaved, draftMode = false }) {
+function CandidateProfileWorkspace({ onSaved, ownerKey, draftMode = false }) {
   const [profile, setProfile] = useState(EMPTY_PROFILE);
   const [method, setMethod] = useState("");
   const [review, setReview] = useState({ low_confidence_fields: [], missing_fields: [] });
@@ -82,6 +83,12 @@ function CandidateProfileWorkspace({ onSaved, draftMode = false }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [hasAvatar, setHasAvatar] = useState(false);
+  const [avatarUpdated, setAvatarUpdated] = useState(null);
+  const [avatarPreview, setAvatarPreview] = useState(null);
+  const [avatarBusy, setAvatarBusy] = useState(false);
+  const [avatarError, setAvatarError] = useState("");
+  const avatarInput = useRef(null);
 
   useEffect(() => {
     let active = true;
@@ -90,6 +97,8 @@ function CandidateProfileWorkspace({ onSaved, draftMode = false }) {
         const result = await api(draftMode ? "/candidate/profile/draft" : "/candidate/profile");
         if (!active) return;
         const data = result.profile || result.draft || {};
+        setHasAvatar(!!result.has_avatar);
+        setAvatarUpdated(result.avatar_updated || null);
         setProfile({
           ...EMPTY_PROFILE,
           ...data,
@@ -113,6 +122,10 @@ function CandidateProfileWorkspace({ onSaved, draftMode = false }) {
     return () => { active = false; };
   }, [draftMode]);
 
+  useEffect(() => () => {
+    if (avatarPreview) URL.revokeObjectURL(avatarPreview);
+  }, [avatarPreview]);
+
   const update = (key, value) => setProfile((old) => ({ ...old, [key]: value }));
   const updateItem = (key, index, field, value) => setProfile((old) => ({
     ...old,
@@ -120,6 +133,52 @@ function CandidateProfileWorkspace({ onSaved, draftMode = false }) {
   }));
   const addItem = (key) => update(key, [...(profile[key] || []), { ...DEFAULTS[key] }]);
   const removeItem = (key, index) => update(key, profile[key].filter((_, current) => current !== index));
+
+  const selectAvatar = (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    setAvatarError("");
+    if (!file) return;
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+      setAvatarError("Choose a PNG, JPEG or WebP image.");
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setAvatarError("Photo must be 2 MB or smaller.");
+      return;
+    }
+    setAvatarPreview(URL.createObjectURL(file));
+    setAvatarBusy(true);
+    const form = new FormData();
+    form.append("file", file);
+    api("/candidate/avatar", { method: "POST", form })
+      .then(async (result) => {
+        setHasAvatar(result.has_avatar);
+        setAvatarUpdated(result.avatar_updated);
+        setAvatarPreview(null);
+        await onSaved?.();
+      })
+      .catch((uploadError) => {
+        setAvatarError(uploadError.message || "Could not upload the photo.");
+      })
+      .finally(() => setAvatarBusy(false));
+  };
+
+  const removeAvatar = async () => {
+    setAvatarError("");
+    setAvatarBusy(true);
+    try {
+      const result = await api("/candidate/avatar", { method: "DELETE" });
+      setHasAvatar(result.has_avatar);
+      setAvatarUpdated(result.avatar_updated);
+      setAvatarPreview(null);
+      await onSaved?.();
+    } catch (removeError) {
+      setAvatarError(removeError.message || "Could not remove the photo.");
+    } finally {
+      setAvatarBusy(false);
+    }
+  };
 
   const save = async (confirm = false) => {
     setBusy(true);
@@ -293,6 +352,18 @@ function CandidateProfileWorkspace({ onSaved, draftMode = false }) {
           ...profile.preferences,
           locations: value.split(",").map((item) => item.trim()).filter(Boolean),
         }), "preferences", "preferences.locations")}
+        <label className="check inline-check">
+          <input
+            type="checkbox"
+            checked={!!profile.preferences.show_photo_to_employers}
+            onChange={(event) => update("preferences", {
+              ...profile.preferences,
+              show_photo_to_employers: event.target.checked,
+            })}
+          />
+          Show my photo to employers
+        </label>
+        <small className="muted">Off by default. Your photo remains private unless you opt in.</small>
       </>
     ),
     certifications: collectionEditor("certifications", "certifications", "Certification", [
@@ -404,7 +475,39 @@ function CandidateProfileWorkspace({ onSaved, draftMode = false }) {
   return (
     <div className="profile-layout">
       <aside className="profile-side-card">
-        <div className="avatar-circle">{(profile.name || "C").split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</div>
+        <input
+          ref={avatarInput}
+          className="avatar-file-input"
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          onChange={selectAvatar}
+        />
+        <button
+          type="button"
+          className="avatar-circle avatar-trigger"
+          aria-label={hasAvatar ? "Change profile photo" : "Upload profile photo"}
+          onClick={() => avatarInput.current?.click()}
+        >
+          <Avatar
+            name={profile.name}
+            hasAvatar={hasAvatar}
+            updated={avatarUpdated}
+            ownerKey={ownerKey || profile.email}
+            previewUrl={avatarPreview}
+            className="profile-avatar-image"
+          />
+        </button>
+        <div className="avatar-controls">
+          <button type="button" className="btn ghost sm" disabled={avatarBusy} onClick={() => avatarInput.current?.click()}>
+            {avatarBusy ? "Saving photo…" : hasAvatar ? "Change photo" : "Upload photo"}
+          </button>
+          {hasAvatar && (
+            <button type="button" className="text-danger" disabled={avatarBusy} onClick={removeAvatar}>
+              Remove
+            </button>
+          )}
+          {avatarError && <p className="err" role="alert">{avatarError}</p>}
+        </div>
         <h2>{profile.name || "Candidate profile"}</h2>
         <p className="muted">{profile.headline || "Add a professional headline"}</p>
         <div className="completion-row"><span>Profile completeness</span><strong>{completeness.total}%</strong></div>

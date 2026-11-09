@@ -41,7 +41,7 @@ function formatApiError(detail, statusText) {
   return statusText;
 }
 
-export async function api(path, { method = "GET", body, form } = {}) {
+export async function api(path, { method = "GET", body, form, responseType } = {}) {
   const headers = {};
   const t = getToken();
   if (t) headers.Authorization = "Bearer " + t;
@@ -50,6 +50,7 @@ export async function api(path, { method = "GET", body, form } = {}) {
   else if (body !== undefined) { headers["Content-Type"] = "application/json"; payload = JSON.stringify(body); }
   const res = await fetch(API_BASE + "/api" + path, { method, headers, body: payload });
   let data = null;
+  if (res.ok && responseType === "blob") return res.blob();
   try { data = await res.json(); } catch { /* empty */ }
   if (!res.ok) {
     const err = new Error(formatApiError(data?.detail, res.statusText));

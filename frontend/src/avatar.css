@@ -1,0 +1,72 @@
+.avatar-small,
+.topbar-avatar {
+  overflow: hidden;
+}
+
+.avatar-small img,
+.topbar-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.avatar-fallback {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+}
+
+.avatar-trigger {
+  padding: 0;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.profile-avatar-image {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  border-radius: inherit;
+}
+
+.profile-avatar-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.avatar-file-input {
+  display: none;
+}
+
+.avatar-controls {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.avatar-controls .err {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.profile-journey-skills li {
+  padding: 8px 0;
+}
+
+.reanalyse-cv summary {
+  cursor: pointer;
+  color: #315ce8;
+  font-weight: 700;
+}
+
+.reanalyse-content {
+  margin-top: 16px;
+}

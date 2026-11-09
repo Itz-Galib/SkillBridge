@@ -1,13 +1,14 @@
 """Initial hiring workflow APIs for SkillBridge PRD."""
-import json, time, uuid, os, re, secrets, csv, io
+import json, time, uuid, os, re, secrets, csv, io, logging
 from typing import Annotated, Optional, List, Literal
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from main import current_user, one, allr, run, audit, QBYID, db, DATABASE_URL, COOLDOWN_HOURS, MAX_ATTEMPTS_90D
 from content import RESOURCES, JOB
 from urllib.parse import urlparse
 
 router = APIRouter(tags=["hiring"])
+log = logging.getLogger("skillbridge.enterprise")
 # Candidate profile drafts are private until the candidate confirms.
 run("""
 CREATE TABLE IF NOT EXISTS candidate_profile_drafts (
@@ -139,6 +140,7 @@ class CandidatePreferences(ProfileModel):
     job_types: List[Literal["Internship", "Full-time", "Part-time", "Contract", "Temporary"]] = Field(default_factory=list, max_length=5)
     work_mode: Literal["", "Any", "Remote", "Hybrid", "On-site"] = ""
     locations: List[Text100] = Field(default_factory=list, max_length=10)
+    show_photo_to_employers: bool = False
 
 class CandidateProfileUpdate(ProfileModel):
     name: str = Field(default="", max_length=120)
@@ -187,6 +189,20 @@ def _decode_profile_json(raw):
         if isinstance(item, dict)
     ]
     preferences = canonical.get("preferences")
+    show_photo_to_employers = (
+        bool(preferences.get("show_photo_to_employers", False))
+        if isinstance(preferences, dict) else False
+    )
+    if isinstance(preferences, dict):
+        canonical["preferences"] = {
+            key: preferences.get(key, default)
+            for key, default in (
+                ("job_types", []),
+                ("work_mode", ""),
+                ("locations", []),
+            )
+        }
+        preferences = canonical["preferences"]
     if preferences == {
         "job_types": ["Internship", "Full-time"],
         "work_mode": "Any",
@@ -200,7 +216,9 @@ def _decode_profile_json(raw):
     for skill in canonical.get("skills", []):
         if isinstance(skill, dict):
             skill["status"] = "claimed"
-    return normalize_profile({**canonical, "evidence": []})["profile"]
+    normalized = normalize_profile({**canonical, "evidence": []})["profile"]
+    normalized["preferences"]["show_photo_to_employers"] = show_photo_to_employers
+    return normalized
 
 
 @router.get("/api/candidate/profile/status")
@@ -395,6 +413,14 @@ def confirm_candidate_profile(user=Depends(current_user)):
 
     if existing:
         if draft and draft["status"] == "confirmed":
+            saved_profile = dict(one(
+                "SELECT * FROM candidate_profiles WHERE user_id=?",
+                (user["id"],),
+            ))
+            for key in ("skills", "experience", "projects"):
+                saved_profile[key] = json.loads(saved_profile[key] or "[]")
+            from main import sync_skill_journey
+            sync_skill_journey(user["id"], saved_profile)
             return {
                 "ok": True,
                 "status": "confirmed",
@@ -557,11 +583,14 @@ def confirm_candidate_profile(user=Depends(current_user)):
         )
 
     audit(user["id"], "candidate_profile_confirmed", draft["method"])
+    from main import sync_skill_journey, avatar_metadata
+    sync_skill_journey(user["id"], profile)
 
     return {
         "ok": True,
         "status": "confirmed",
         "message": "Candidate profile created successfully.",
+        **avatar_metadata(user["id"]),
     }
 @router.get("/api/candidate/profile")
 def get_candidate_profile(user=Depends(current_user)):
@@ -586,6 +615,8 @@ def get_candidate_profile(user=Depends(current_user)):
                "extracted_skills": json.loads(cv["extracted"]) if cv and cv["extracted"] else [],
                "redaction": json.loads(cv["redaction"]) if cv and cv["redaction"] else {}},
     }
+    from main import avatar_metadata
+    result.update(avatar_metadata(user["id"]))
     if row:
         p = dict(row)
         for key in (
@@ -651,16 +682,114 @@ def update_candidate_profile(body: CandidateProfileUpdate, user=Depends(current_
          json.dumps([x.model_dump() for x in body.volunteer]),
          json.dumps(preferences),time.time()))
     audit(user["id"], "candidate_profile_updated")
-    from main import profile_completeness
+    from main import avatar_metadata, profile_completeness, sync_skill_journey
+    sync_skill_journey(user["id"], profile)
     return {
         "ok": True,
         "updated": time.time(),
         "completeness": profile_completeness(profile),
+        **avatar_metadata(user["id"]),
     }
+
+
+def _process_candidate_avatar(data: bytes) -> bytes:
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    try:
+        with Image.open(io.BytesIO(data)) as opened:
+            if opened.format not in {"PNG", "JPEG", "WEBP"}:
+                raise HTTPException(415, "Upload a PNG, JPEG or WebP image")
+            opened.load()
+            image = ImageOps.exif_transpose(opened)
+            if image.mode in {"RGBA", "LA"} or (
+                image.mode == "P" and "transparency" in image.info
+            ):
+                image = image.convert("RGBA")
+            else:
+                image = image.convert("RGB")
+            image = ImageOps.fit(
+                image,
+                (512, 512),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            output = io.BytesIO()
+            image.save(output, format="WEBP", quality=85, method=6)
+            return output.getvalue()
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise HTTPException(415, "The uploaded file is not a valid supported image") from exc
+
+
+@router.post("/api/candidate/avatar")
+async def upload_candidate_avatar(file: UploadFile = File(...), user=Depends(current_user)):
+    require_role(user, "candidate")
+    data = await file.read(2 * 1024 * 1024 + 1)
+    if len(data) > 2 * 1024 * 1024:
+        raise HTTPException(413, "File too large (max 2 MB)")
+    processed = _process_candidate_avatar(data)
+    key = f"avatars/{user['id']}/{uuid.uuid4().hex}.webp"
+    from storage import StorageError, get_storage
+    storage = get_storage()
+    try:
+        storage.put(key, processed, "image/webp")
+    except StorageError as exc:
+        raise HTTPException(503, "Could not store the profile photo, please try again") from exc
+
+    old = one("SELECT storage_key FROM candidate_avatars WHERE user_id=?", (user["id"],))
+    updated = time.time()
+    run(
+        """INSERT INTO candidate_avatars(user_id,storage_key,content_type,updated)
+           VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+           storage_key=excluded.storage_key,content_type=excluded.content_type,
+           updated=excluded.updated""",
+        (user["id"], key, "image/webp", updated),
+    )
+    if old and old["storage_key"] != key:
+        try:
+            storage.delete(old["storage_key"])
+        except StorageError as exc:
+            log.error("Replaced avatar could not be deleted: %s", exc)
+            raise HTTPException(503, "Photo was updated, but the previous photo could not be removed") from exc
+    return {"ok": True, "has_avatar": True, "avatar_updated": updated}
+
+
+@router.get("/api/candidate/avatar")
+def get_candidate_avatar(user=Depends(current_user)):
+    require_role(user, "candidate")
+    avatar = one(
+        "SELECT storage_key,content_type FROM candidate_avatars WHERE user_id=?",
+        (user["id"],),
+    )
+    if not avatar:
+        raise HTTPException(404, "No profile photo is set")
+    from storage import StorageError, get_storage
+    try:
+        image = get_storage().get(avatar["storage_key"])
+    except StorageError as exc:
+        raise HTTPException(503, "Could not load the profile photo, please try again") from exc
+    return Response(content=image, media_type=avatar["content_type"], headers={"Cache-Control": "private, no-store"})
+
+
+@router.delete("/api/candidate/avatar")
+def delete_candidate_avatar(user=Depends(current_user)):
+    require_role(user, "candidate")
+    avatar = one("SELECT storage_key FROM candidate_avatars WHERE user_id=?", (user["id"],))
+    if avatar:
+        from storage import StorageError, get_storage
+        try:
+            get_storage().delete(avatar["storage_key"])
+        except StorageError as exc:
+            raise HTTPException(503, "Could not remove the profile photo, please try again") from exc
+        run("DELETE FROM candidate_avatars WHERE user_id=?", (user["id"],))
+    return {"ok": True, "has_avatar": False, "avatar_updated": None}
+
 
 @router.get("/api/enterprise/me")
 def enterprise_me(user=Depends(current_user)):
-    return {"user":{"id":user["id"],"name":user["name"],"email":user["email"]},"role":role_of(user)}
+    from main import avatar_metadata
+    return {"user":{"id":user["id"],"name":user["name"],"email":user["email"]},"role":role_of(user), **avatar_metadata(user["id"])}
 
 @router.get("/api/jobs")
 def public_jobs():

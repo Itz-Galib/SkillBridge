@@ -1,5 +1,5 @@
 """Tests for CV document storage + extraction drafts (SQLite + local storage; S3 via moto)."""
-import os, sys, tempfile, importlib
+import os, sys, tempfile, importlib, json, base64
 
 _TMP = tempfile.mkdtemp(prefix="sb_test_")
 os.environ["DB_PATH"] = os.path.join(_TMP, "test.db")
@@ -11,6 +11,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import ExifTags, Image
+from PIL.TiffImagePlugin import IFDRational
+import io
 
 import main
 import cv_store
@@ -399,6 +402,158 @@ def test_account_deletion_removes_files():
     assert client.delete("/api/me", headers=h).status_code == 200
     assert not storage.get_storage().exists(key)
     assert main.one("SELECT 1 FROM cv_documents WHERE user_id=?", (uid,)) is None
+
+
+def test_profile_skills_sync_to_journey_and_blueprint_without_cv():
+    uid, headers = _user("profile-skills@example.com")
+    skills = [
+        {"name": "Python", "category": "Language"},
+        {"name": "SQL", "category": "Database"},
+        {"name": "React.js", "category": "Frontend"},
+        {"name": "Git & GitHub", "category": "Tool"},
+    ]
+    saved = client.put(
+        "/api/candidate/profile/draft",
+        json={"summary": "Python and SQL projects.", "skills": skills},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+    confirmed = client.post("/api/candidate/profile/confirm", json={}, headers=headers)
+    assert confirmed.status_code == 200, confirmed.text
+
+    state = client.get("/api/state", headers=headers).json()
+    assert state["from_profile"] is True
+    assert state["profile_skills"] == ["Python", "SQL", "React.js", "Git & GitHub"]
+    assert set(state["confirmed"]) == {"python", "sql"}
+    assert state["not_assessable_yet"] == ["React.js", "Git & GitHub"]
+    profile_view = main.one("SELECT * FROM profiles WHERE user_id=?", (uid,))
+    assert profile_view["source"] == "profile"
+    assert json.loads(profile_view["redaction"]) == {
+        "email": 0, "phone": 0, "url": 0, "address": 0, "name": 0,
+    }
+
+    blueprint = client.post("/api/assessment/blueprint", headers=headers)
+    assert blueprint.status_code == 200, blueprint.text
+
+    profile = client.get("/api/candidate/profile", headers=headers).json()["profile"]
+    profile["skills"] = [
+        skill for skill in profile["skills"] if skill["name"] != "SQL"
+    ] + [{"name": "Statistics", "category": "Other", "status": "claimed"}]
+    profile.pop("updated", None)
+    updated = client.put("/api/candidate/profile", json=profile, headers=headers)
+    assert updated.status_code == 200, updated.text
+    state = client.get("/api/state", headers=headers).json()
+    assert set(state["confirmed"]) == {"python", "statistics"}
+    assert state["not_assessable_yet"] == ["React.js", "Git & GitHub"]
+
+    added = client.put("/api/skills", json={"skills": ["visualization"]}, headers=headers)
+    assert added.status_code == 200, added.text
+    saved_profile = client.get("/api/candidate/profile", headers=headers).json()["profile"]
+    assert {
+        (skill["name"], skill["status"]) for skill in saved_profile["skills"]
+    } >= {("Data Visualization", "claimed")}
+    assert set(client.get("/api/state", headers=headers).json()["confirmed"]) == {
+        "python", "statistics", "visualization",
+    }
+
+
+def _image_bytes(image_format, exif=None):
+    image = Image.new("RGB", (20, 40), color=(60, 120, 180))
+    data = io.BytesIO()
+    if exif is None:
+        image.save(data, format=image_format)
+    else:
+        image.save(data, format=image_format, exif=exif)
+    return data.getvalue()
+
+
+def test_avatar_upload_validation_privacy_replacement_and_account_deletion():
+    uid, headers = _user("avatar-owner@example.com")
+    other_uid, other_headers = _user("avatar-other@example.com")
+    exif = Image.Exif()
+    exif[0x010F] = "private camera metadata"
+    gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+    gps[1] = "N"
+    gps[2] = (IFDRational(40, 1), IFDRational(0, 1), IFDRational(0, 1))
+    gps[3] = "W"
+    gps[4] = (IFDRational(73, 1), IFDRational(0, 1), IFDRational(0, 1))
+    png = _image_bytes("PNG", exif=exif)
+    assert Image.open(io.BytesIO(png)).getexif().get_ifd(ExifTags.IFD.GPSInfo)
+    upload = client.post(
+        "/api/candidate/avatar",
+        files={"file": ("profile.png", png, "image/png")},
+        headers=headers,
+    )
+    assert upload.status_code == 200, upload.text
+    row = main.one("SELECT * FROM candidate_avatars WHERE user_id=?", (uid,))
+    first_key = row["storage_key"]
+    stored = storage.get_storage().get(first_key)
+    result = Image.open(io.BytesIO(stored))
+    assert result.format == "WEBP"
+    assert result.size == (512, 512)
+    assert not result.getexif()
+    assert upload.json()["has_avatar"] is True
+    exported = client.get("/api/me/export", headers=headers).json()["candidate_avatar"]
+    assert base64.b64decode(exported["data_base64"]) == stored
+
+    denied = client.get("/api/candidate/avatar", headers=other_headers)
+    assert denied.status_code == 404
+    assert client.get("/api/state", headers=headers).json()["has_avatar"] is True
+    assert client.get("/api/candidate/profile", headers=headers).json()["has_avatar"] is True
+    assert client.get("/api/enterprise/me", headers=headers).json()["has_avatar"] is True
+
+    for filename, payload, content_type in (
+        ("bad.gif", _image_bytes("GIF"), "image/gif"),
+        ("renamed.png", b"not an image", "image/png"),
+    ):
+        rejected = client.post(
+            "/api/candidate/avatar",
+            files={"file": (filename, payload, content_type)},
+            headers=headers,
+        )
+        assert rejected.status_code == 415
+    too_large = client.post(
+        "/api/candidate/avatar",
+        files={"file": ("large.png", b"x" * (3 * 1024 * 1024), "image/png")},
+        headers=headers,
+    )
+    assert too_large.status_code == 413
+
+    replacement = client.post(
+        "/api/candidate/avatar",
+        files={"file": ("replacement.png", _image_bytes("PNG"), "image/png")},
+        headers=headers,
+    )
+    assert replacement.status_code == 200, replacement.text
+    second_key = main.one(
+        "SELECT storage_key FROM candidate_avatars WHERE user_id=?", (uid,)
+    )["storage_key"]
+    assert second_key != first_key
+    assert not storage.get_storage().exists(first_key)
+
+    assert client.delete("/api/me", headers=headers).status_code == 200
+    assert not storage.get_storage().exists(second_key)
+    assert main.one("SELECT 1 FROM candidate_avatars WHERE user_id=?", (uid,)) is None
+
+
+def test_avatar_remove_clears_storage_and_metadata():
+    uid, headers = _user("avatar-remove@example.com")
+    uploaded = client.post(
+        "/api/candidate/avatar",
+        files={"file": ("profile.webp", _image_bytes("WEBP"), "image/webp")},
+        headers=headers,
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    key = main.one(
+        "SELECT storage_key FROM candidate_avatars WHERE user_id=?", (uid,)
+    )["storage_key"]
+    removed = client.delete("/api/candidate/avatar", headers=headers)
+    assert removed.status_code == 200
+    assert removed.json() == {
+        "ok": True, "has_avatar": False, "avatar_updated": None,
+    }
+    assert not storage.get_storage().exists(key)
+    assert main.one("SELECT 1 FROM candidate_avatars WHERE user_id=?", (uid,)) is None
 
 
 def test_s3_backend_roundtrip(monkeypatch):

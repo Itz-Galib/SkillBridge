@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, t
 CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY, job_id TEXT NOT NULL, candidate_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'submitted', results_shared INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, UNIQUE(job_id, candidate_id));
 CREATE TABLE IF NOT EXISTS company_assessments(id TEXT PRIMARY KEY, company_id TEXT NOT NULL, job_id TEXT, title TEXT NOT NULL, requirements TEXT NOT NULL, questions TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS candidate_profiles(user_id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', headline TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', linkedin TEXT NOT NULL DEFAULT '', github TEXT NOT NULL DEFAULT '', portfolio TEXT NOT NULL DEFAULT '', education TEXT NOT NULL DEFAULT '[]', experience TEXT NOT NULL DEFAULT '[]', projects TEXT NOT NULL DEFAULT '[]', skills TEXT NOT NULL DEFAULT '[]', certifications TEXT NOT NULL DEFAULT '[]', achievements TEXT NOT NULL DEFAULT '[]', languages TEXT NOT NULL DEFAULT '[]', profile_references TEXT NOT NULL DEFAULT '[]', volunteer TEXT NOT NULL DEFAULT '[]', preferences TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS candidate_avatars(user_id INTEGER PRIMARY KEY, storage_key TEXT NOT NULL, content_type TEXT NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_blueprints(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_answer_events(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, question_id TEXT NOT NULL, revision INTEGER NOT NULL, answer_hash TEXT NOT NULL, answer_length INTEGER NOT NULL, created REAL NOT NULL);
 """
@@ -250,9 +251,97 @@ def latest_done(uid, kind=None):
     return one(q, (uid, kind) if kind else (uid,))
 
 
+def profile_skill_entries(profile):
+    """Return profile skill names and the taxonomy IDs their names explicitly match."""
+    entries = []
+    for skill in profile.get("skills", []) or []:
+        name = skill.get("name", "").strip() if isinstance(skill, dict) else str(skill).strip()
+        if not name:
+            continue
+        matches = E.rule_extract(name)
+        taxonomy_id = matches[0]["id"] if matches else None
+        entries.append({
+            "name": name,
+            "id": taxonomy_id if taxonomy_id in TESTABLE else None,
+            "taxonomy_id": taxonomy_id,
+        })
+    return entries
+
+
+def sync_skill_journey(user_id, profile):
+    """Rebuild the CV/assessment view from the candidate's confirmed profile."""
+    skill_entries = profile_skill_entries(profile)
+    confirmed = list(dict.fromkeys(
+        entry["id"] for entry in skill_entries if entry["id"]
+    ))
+    extracted = [
+        {
+            "id": skill_id,
+            "name": TAXONOMY[skill_id]["name"],
+            "evidence": next(
+                entry["name"] for entry in skill_entries if entry["id"] == skill_id
+            )[:160],
+            "status": "claimed",
+        }
+        for skill_id in confirmed
+    ]
+
+    experience = profile.get("experience", []) or []
+    projects = profile.get("projects", []) or []
+    evidence = [
+        "Candidate profile evidence with claimed skills",
+        str(profile.get("summary") or ""),
+        *[
+            str(item.get("description") or "")
+            for item in experience if isinstance(item, dict)
+        ],
+        *[
+            str(item.get("name") or "")
+            for item in projects if isinstance(item, dict)
+        ],
+        "Skills: " + ", ".join(entry["name"] for entry in skill_entries),
+    ]
+    text = "\n".join(line for line in evidence if line)
+    redacted, counts = E.redact(text, [str(profile.get("name") or "")])
+    run(
+        """INSERT INTO profiles(user_id,redacted,redaction,extracted,source,confirmed)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET redacted=excluded.redacted,
+           redaction=excluded.redaction,extracted=excluded.extracted,
+           source=excluded.source,confirmed=excluded.confirmed""",
+        (
+            user_id,
+            redacted,
+            json.dumps(counts),
+            json.dumps(extracted),
+            "profile",
+            json.dumps(confirmed),
+        ),
+    )
+    return skill_entries, confirmed
+
+
+def avatar_metadata(user_id):
+    avatar = one(
+        "SELECT updated FROM candidate_avatars WHERE user_id=?",
+        (user_id,),
+    )
+    return {
+        "has_avatar": bool(avatar),
+        "avatar_updated": avatar["updated"] if avatar else None,
+    }
+
+
 @app.get("/api/state")
 def state(u=Depends(current_user)):
     prof = one("SELECT * FROM profiles WHERE user_id=?", (u["id"],))
+    candidate_profile = one(
+        "SELECT skills FROM candidate_profiles WHERE user_id=?", (u["id"],)
+    )
+    skill_entries = []
+    if candidate_profile:
+        profile_skills = json.loads(candidate_profile["skills"] or "[]")
+        skill_entries = profile_skill_entries({"skills": profile_skills})
     atts = allr("SELECT id,kind,status,result,finished FROM attempts WHERE user_id=? ORDER BY started", (u["id"],))
     pp = allr("SELECT id,created,revoked FROM passports WHERE user_id=? ORDER BY created DESC", (u["id"],))
     return {
@@ -260,6 +349,13 @@ def state(u=Depends(current_user)):
         "consented": bool(one("SELECT 1 FROM consents WHERE user_id=? AND version=?", (u["id"], CONSENT_VERSION))),
         "has_cv": bool(prof and prof["extracted"]),
         "confirmed": json.loads(prof["confirmed"]) if prof and prof["confirmed"] else None,
+        "profile_skills": [entry["name"] for entry in skill_entries],
+        "profile_skill_items": skill_entries,
+        "from_profile": bool(candidate_profile),
+        "not_assessable_yet": [
+            entry["name"] for entry in skill_entries if not entry["id"]
+        ],
+        **avatar_metadata(u["id"]),
         "attempts": [{"id": a["id"], "kind": a["kind"], "status": a["status"], "overall": (json.loads(a["result"])["overall"] if a["result"] else None)} for a in atts],
         "passports": [{"id": p["id"], "created": p["created"], "revoked": bool(p["revoked"])} for p in pp],
     }
@@ -283,6 +379,19 @@ def export_data(u=Depends(current_user)):
         d[t] = [dict(r) for r in allr(f"SELECT * FROM {t} WHERE user_id=?", (u["id"],))]
     cp = one("SELECT * FROM candidate_profiles WHERE user_id=?", (u["id"],))
     d["candidate_profile"] = dict(cp) if cp else None
+    avatar = one("SELECT * FROM candidate_avatars WHERE user_id=?", (u["id"],))
+    d["candidate_avatar"] = None
+    if avatar:
+        from storage import StorageError, get_storage
+        try:
+            avatar_data = get_storage().get(avatar["storage_key"])
+        except StorageError as ex:
+            log.error("Avatar export failed: %s", ex)
+            raise HTTPException(503, "Could not export the profile photo, please try again")
+        d["candidate_avatar"] = {
+            **dict(avatar),
+            "data_base64": base64.b64encode(avatar_data).decode("ascii"),
+        }
     import cv_store
     d["cv_documents"] = cv_store.list_documents(u["id"])
     d["cv_extractions"] = cv_store.list_extractions(u["id"])
@@ -297,6 +406,15 @@ def delete_me(u=Depends(current_user)):
     for i in ids: run("DELETE FROM events WHERE attempt_id=?", (i,))
     import cv_store
     cv_store.delete_user_documents(u["id"])   # removes the stored CV files and extraction drafts too
+    avatar = one("SELECT storage_key FROM candidate_avatars WHERE user_id=?", (u["id"],))
+    if avatar:
+        from storage import StorageError, get_storage
+        try:
+            get_storage().delete(avatar["storage_key"])
+        except StorageError as ex:
+            log.error("Avatar storage deletion failed: %s", ex)
+            raise HTTPException(503, "Could not remove the profile photo, please try again")
+        run("DELETE FROM candidate_avatars WHERE user_id=?", (u["id"],))
     for t in (
     "consents",
     "profiles",
@@ -1898,7 +2016,36 @@ class Confirm(BaseModel):
 def confirm_skills(b: Confirm, u=Depends(current_user)):
     need_consent(u)
     ids = [s for s in dict.fromkeys(b.skills) if s in TAXONOMY]
-    run("INSERT INTO profiles(user_id,confirmed) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET confirmed=excluded.confirmed", (u["id"], json.dumps(ids)))
+    candidate_profile = one(
+        "SELECT * FROM candidate_profiles WHERE user_id=?", (u["id"],)
+    )
+    if candidate_profile:
+        profile = dict(candidate_profile)
+        for key in ("skills", "experience", "projects"):
+            profile[key] = json.loads(profile[key] or "[]")
+        existing_ids = {
+            entry["taxonomy_id"] for entry in profile_skill_entries(profile)
+            if entry["taxonomy_id"]
+        }
+        for skill_id in ids:
+            if skill_id not in existing_ids:
+                profile["skills"].append({
+                    "name": TAXONOMY[skill_id]["name"],
+                    "category": "Other",
+                    "status": "claimed",
+                })
+                existing_ids.add(skill_id)
+        run(
+            "UPDATE candidate_profiles SET skills=?,updated=? WHERE user_id=?",
+            (json.dumps(profile["skills"]), time.time(), u["id"]),
+        )
+        _, ids = sync_skill_journey(u["id"], profile)
+    else:
+        run(
+            """INSERT INTO profiles(user_id,confirmed) VALUES (?,?)
+               ON CONFLICT(user_id) DO UPDATE SET confirmed=excluded.confirmed""",
+            (u["id"], json.dumps(ids)),
+        )
     return {"confirmed": ids}
 
 # ------------------------------------------------------------------ GraphRAG assessment blueprint

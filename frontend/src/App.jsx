@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import { api, getToken, setToken } from "./api.js";
 import { LangCtx, useT } from "./i18n.js";
 import CandidateProfileWorkspace from "./CandidateProfileWorkspace.jsx";
+import Avatar from "./Avatar.jsx";
 
 const SAMPLE_CV = `Sadia Rahman
 House 14, Road 3, Mirpur, Dhaka
@@ -501,6 +502,10 @@ function Profile({ st, onDone }) {
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
 
+  useEffect(() => {
+    if (st.from_profile) setSel(st.confirmed || []);
+  }, [st.from_profile, st.confirmed]);
+
   const analyse = async () => {
     setErr(null);
     setBusy(true);
@@ -518,11 +523,15 @@ function Profile({ st, onDone }) {
     }
   };
   const confirm = async () => {
+    setErr(null);
+    setBusy(true);
     try {
       await api("/skills", { method: "PUT", body: { skills: sel } });
-      onDone();
+      await onDone();
     } catch (e) {
       setErr(e);
+    } finally {
+      setBusy(false);
     }
   };
   const toggle = (id) =>
@@ -531,45 +540,75 @@ function Profile({ st, onDone }) {
   return (
     <section>
       <h2>{t("profileTitle")}</h2>
-      {st.confirmed && !res && (
+      {st.confirmed && !res && !st.from_profile && (
         <p className="note">
           {t("claimed")}: {st.confirmed.join(", ") || "-"}
         </p>
       )}
-      <div className="card">
-        <p>{t("cvHelp")}</p>
-        <textarea
-          rows={8}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          placeholder={t("cvPaste")}
-        />
-        <div className="row">
-          <input
-            type="file"
-            accept=".pdf,.docx,.txt,.md"
-            onChange={(e) => setFile(e.target.files[0] || null)}
-          />
-          <button
-            type="button"
-            className="btn ghost"
-            onClick={() => {
-              setText(SAMPLE_CV);
-              setFile(null);
-            }}
-          >
-            {t("sampleCv")}
+      {st.from_profile && !res && (
+        <div className="card profile-journey-skills">
+          <h3>Skills from your profile</h3>
+          <p className="note">These skills are claimed until verified. Update your profile to change these.</p>
+          <ul className="skills">
+            {(st.profile_skill_items || []).map((skill, index) => (
+              <li key={`${skill.name}-${index}`}>
+                <label className="check">
+                  <input type="checkbox" checked={skill.id ? sel.includes(skill.id) : true} disabled />
+                  <strong>{skill.name}</strong>
+                  <span className="chip chip-mid">{t("claimed")}</span>
+                  {!skill.id && <span className="chip">Not assessable yet</span>}
+                </label>
+              </li>
+            ))}
+          </ul>
+          {!st.profile_skill_items?.length && (
+            <p className="muted">No skills are listed yet. Add them to your profile to begin.</p>
+          )}
+          {!!st.not_assessable_yet?.length && (
+            <p className="muted">
+              Not assessable yet: {st.not_assessable_yet.join(", ")}. These skills remain in your profile.
+            </p>
+          )}
+          <button className="btn" onClick={confirm} disabled={busy || !sel.length}>
+            {busy ? "Confirming…" : "Confirm skills"}
           </button>
-          <button
-            className="btn"
-            onClick={analyse}
-            disabled={busy || (!text && !file)}
-          >
-            {t("analyse")}
-          </button>
+          <Err e={err} />
         </div>
-        <Err e={err} />
-      </div>
+      )}
+      {st.from_profile && !res ? (
+        <details className="card reanalyse-cv">
+          <summary>Re-analyse a different CV</summary>
+          <div className="reanalyse-content">
+            <p>{t("cvHelp")}</p>
+            <textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder={t("cvPaste")} />
+            <div className="row">
+              <input type="file" accept=".pdf,.docx,.txt,.md" onChange={(e) => setFile(e.target.files[0] || null)} />
+              <button type="button" className="btn ghost" onClick={() => { setText(SAMPLE_CV); setFile(null); }}>
+                {t("sampleCv")}
+              </button>
+              <button className="btn" onClick={analyse} disabled={busy || (!text && !file)}>
+                {t("analyse")}
+              </button>
+            </div>
+            <Err e={err} />
+          </div>
+        </details>
+      ) : (
+        <div className="card">
+          <p>{t("cvHelp")}</p>
+          <textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder={t("cvPaste")} />
+          <div className="row">
+            <input type="file" accept=".pdf,.docx,.txt,.md" onChange={(e) => setFile(e.target.files[0] || null)} />
+            <button type="button" className="btn ghost" onClick={() => { setText(SAMPLE_CV); setFile(null); }}>
+              {t("sampleCv")}
+            </button>
+            <button className="btn" onClick={analyse} disabled={busy || (!text && !file)}>
+              {t("analyse")}
+            </button>
+          </div>
+          <Err e={err} />
+        </div>
+      )}
 
       {res && (
         <>
@@ -2332,7 +2371,7 @@ function PublicPassport({ id }) {
   );
 }
 
-function CandidateProfileOnboarding({ onSaved }) {
+function CandidateProfileOnboarding({ onSaved, ownerKey }) {
   const [status, setStatus] = useState("loading");
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -2430,12 +2469,13 @@ function CandidateProfileOnboarding({ onSaved }) {
   if (status === "draft") {
     return (
       <CandidateProfileWorkspace
-          draftMode={true}
-          onSaved={async () => {
-            setStatus("confirmed");
-            await onSaved?.();
-          }}
-        />
+        draftMode={true}
+        ownerKey={ownerKey}
+        onSaved={async () => {
+          setStatus("confirmed");
+          await onSaved?.();
+        }}
+      />
     );
   }
 
@@ -2452,7 +2492,7 @@ function CandidateProfileOnboarding({ onSaved }) {
           <span className="status-pill">Confirmed</span>
         </div>
 
-        <CandidateProfileWorkspace onSaved={onSaved} />
+        <CandidateProfileWorkspace ownerKey={ownerKey} onSaved={onSaved} />
       </section>
     );
   }
@@ -2718,7 +2758,7 @@ function CandidateApplications() {
 function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
   const [section, setSection] = useState("overview");
   const [journeyView, setJourneyView] = useState(
-    st.confirmed ? "gap" : "profile",
+    st.from_profile ? "profile" : st.confirmed ? "gap" : "profile",
   );
   useEffect(() => {
     api("/candidate/profile/status")
@@ -2764,14 +2804,13 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
           </span>
         </div>
         <div className="sidebar-profile">
-          <div className="avatar-small">
-            {(st.user?.name || "C")
-              .split(" ")
-              .map((x) => x[0])
-              .join("")
-              .slice(0, 2)
-              .toUpperCase()}
-          </div>
+          <Avatar
+            name={st.user?.name}
+            hasAvatar={st.has_avatar}
+            updated={st.avatar_updated}
+            ownerKey={st.user?.email}
+            className="avatar-small"
+          />
           <div>
             <strong>{st.user?.name}</strong>
             <small>Candidate account</small>
@@ -2827,9 +2866,13 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
                 <option value="bn">বাংলা</option>
               </select>
             </div>
-            <div className="topbar-avatar">
-              {(st.user?.name || "C")[0]?.toUpperCase()}
-            </div>
+            <Avatar
+              name={st.user?.name}
+              hasAvatar={st.has_avatar}
+              updated={st.avatar_updated}
+              ownerKey={st.user?.email}
+              className="topbar-avatar"
+            />
             <button className="candidate-logout" onClick={onLogout}>
               Sign out
             </button>
@@ -2968,6 +3011,7 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
               </div>
 
               <CandidateProfileOnboarding
+                ownerKey={st.user?.email}
                 onSaved={async () => {
                   await refresh();
                 }}
