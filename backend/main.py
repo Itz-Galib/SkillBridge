@@ -120,13 +120,39 @@ def init_db():
             "ALTER TABLE candidate_profiles ADD COLUMN name "
             "TEXT NOT NULL DEFAULT ''"
         )
-    for column in ("email", "profile_references", "volunteer"):
+    # Add every candidate_profiles column that may predate the CV-profile schema
+    # (e.g. a table created before these columns existed). Idempotent per column.
+    profile_text_columns = {
+        "email": "",
+        "headline": "",
+        "phone": "",
+        "location": "",
+        "summary": "",
+        "linkedin": "",
+        "github": "",
+        "portfolio": "",
+        "education": "[]",
+        "experience": "[]",
+        "projects": "[]",
+        "skills": "[]",
+        "certifications": "[]",
+        "achievements": "[]",
+        "languages": "[]",
+        "profile_references": "[]",
+        "volunteer": "[]",
+        "preferences": "{}",
+    }
+    for column, default in profile_text_columns.items():
         if column not in profile_columns:
-            default = "" if column == "email" else "[]"
             run(
                 f"ALTER TABLE candidate_profiles ADD COLUMN {column} "
                 f"TEXT NOT NULL DEFAULT '{default}'"
             )
+    if "updated" not in profile_columns:
+        run(
+            "ALTER TABLE candidate_profiles ADD COLUMN updated "
+            "REAL NOT NULL DEFAULT 0"
+        )
     import cv_store  # CV document + extraction-draft tables (imported here to avoid a circular import)
     cv_store.ensure_schema()
 
