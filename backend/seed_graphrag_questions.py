@@ -2,105 +2,195 @@
 
 Run from backend/: python seed_graphrag_questions.py
 Safe to re-run: fixed IDs + ON CONFLICT DO NOTHING. Does not create users or touch candidate data.
+
+Layout: 10 questions per fundamental topic (DSA, OOP, Networking, Coding, Database,
+Critical Thinking) and 10 per CV skill (Python, Git, AI & Machine Learning, SQL). The
+surplus over the per-topic quotas is what lets the retake filter serve fresh questions
+without repeating anything the candidate has already seen.
 """
 import json
+import os
 import time
+
+try:
+    from dotenv import load_dotenv
+    for _candidate in (os.path.join(os.path.dirname(__file__), "..", ".env"),
+                       os.path.join(os.path.dirname(__file__), ".env")):
+        if os.path.exists(_candidate):
+            load_dotenv(_candidate)
+except ImportError:
+    pass
 
 ACTOR = "SkillBridge synthetic GraphRAG demo seed"
 NOW = time.time()
 
-# Fundamentals: exact topic/difficulty matrix (25 questions).
+# Fundamentals: 10 per topic. Difficulty spread is 4 Easy / 3 Medium / 3 Hard.
+# Tuple: (topic, category_id, difficulty, type, prompt, answer, options,
+#         explanation, reference, rubric, seconds)
 FUNDAMENTALS = [
-# DSA (5): 2 Easy, 2 Medium, 1 Hard
-("DSA","CAT-02","Easy","MCQ","Which data structure follows LIFO order?","Stack",["Queue","Stack","Tree","Graph"],"A stack removes the most recently added item first.","", "Recognize stack behavior.",60),
+# DSA (10)
+("DSA","CAT-02","Easy","MCQ","Which data structure follows LIFO order?","Stack",["Queue","Stack","Tree","Graph"],"A stack removes the most recently added item first.","","Recognize stack behavior.",60),
 ("DSA","CAT-02","Easy","MCQ","Which data structure is commonly used for breadth-first search in a graph?","Queue",["Stack","Queue","Heap","Hash map"],"BFS explores nodes level by level using a queue.","","Explain the queue-based BFS traversal.",60),
+("DSA","CAT-02","Easy","MCQ","What is the worst-case time complexity of binary search on a sorted array of n elements?","O(log n)",["O(1)","O(log n)","O(n)","O(n log n)"],"Binary search halves the search space each step.","","Know binary search complexity.",60),
+("DSA","CAT-02","Easy","MCQ","Which structure gives O(1) average-case lookup by key?","Hash table",["Linked list","Hash table","Queue","Stack"],"A hash table maps keys to buckets for constant average lookup.","","Identify constant-time keyed access.",60),
 ("DSA","CAT-02","Medium","Coding","Coding problem: Given an array of integers, return the first pair of indices whose values sum to target. Explain the data structure you use.","Use a hash map to store previously seen values and their indices; for each value x, check whether target-x is present.","","","Expected O(n) time and O(n) space; handle no solution explicitly.","Award marks for correct complement lookup, indices and complexity.",150),
 ("DSA","CAT-02","Medium","Explanation","Explain how a balanced binary search tree keeps search efficient, and compare its expected search time with an unbalanced tree.","A balanced BST keeps height O(log n), so search/insert/delete are O(log n); a skewed tree can reach O(n).","","","Mention rotations or balancing invariant and worst-case contrast.","Award marks for invariant and complexity.",120),
-("DSA","CAT-02","Hard","MCQ","A directed acyclic graph has 8 vertices and 10 edges. Which algorithm can produce a valid topological ordering in O(V+E)?","Kahn's algorithm",["Dijkstra's algorithm","Kahn's algorithm","Kruskal's algorithm","Binary search"],"Kahn's algorithm repeatedly removes zero-indegree vertices.","","Recognize DAG ordering and complexity.",90),
-# OOP (4): 2 Easy, 1 Medium, 1 Hard
+("DSA","CAT-02","Medium","MCQ","Which traversal visits the root before its left and right subtrees?","Pre-order",["In-order","Pre-order","Post-order","Level-order"],"Pre-order is root-left-right.","","Distinguish tree traversal orders.",90),
+("DSA","CAT-02","Medium","MCQ","A directed acyclic graph has 8 vertices and 10 edges. Which algorithm can produce a valid topological ordering in O(V+E)?","Kahn's algorithm",["Dijkstra's algorithm","Kahn's algorithm","Kruskal's algorithm","Binary search"],"Kahn's algorithm repeatedly removes zero-indegree vertices.","","Recognize DAG ordering and complexity.",90),
+("DSA","CAT-02","Hard","Coding","Coding problem: Implement a function that returns the k largest elements from a list using a min-heap, and state the complexity.","import heapq\ndef k_largest(values, k):\n    return heapq.nlargest(k, values)","","","Expected O(n log k) time using a bounded min-heap.","Score heap usage and complexity.",180),
+("DSA","CAT-02","Hard","Scenario-Based","Scenario: A social feed must return the most recent posts first, but posts also need constant-time insertion and deletion of expired items. Which data structure(s) would you combine and why?","Use a hash map (post id -> node) plus a doubly linked list ordered by recency; this gives O(1) insert, delete and access for an LRU-like feed.","","","Look for hash map + ordered list reasoning and O(1) operations.","Score structure choice and complexity reasoning.",150),
+# OOP (10)
 ("OOP","CAT-05","Easy","MCQ","In object oriented programming, which concept hides internal state and exposes controlled operations?","Encapsulation",["Inheritance","Encapsulation","Compilation","Recursion"],"Encapsulation bundles state and behavior behind a public interface.","","Identify core OOP concepts.",60),
 ("OOP","CAT-05","Easy","Explanation","Explain inheritance in object oriented programming and give a simple example.","A child class reuses or extends behavior from a parent class, e.g. class SavingsAccount(Account).","","","","Explain parent/child relationship and reuse.",90),
+("OOP","CAT-05","Easy","MCQ","Which OOP principle lets one method name behave differently across subclasses?","Polymorphism",["Encapsulation","Polymorphism","Serialization","Recursion"],"Polymorphism lets a shared interface dispatch to subclass behavior.","","Identify polymorphism.",60),
+("OOP","CAT-05","Easy","MCQ","What is a class in object oriented programming?","A blueprint that defines attributes and methods for its instances",["A compiled binary","A blueprint that defines attributes and methods for its instances","A database table","A function with no parameters"],"A class is a template for creating objects.","","Define class vs instance.",60),
 ("OOP","CAT-05","Medium","Scenario-Based","Scenario: A payment service supports card, mobile wallet and bank transfer. New payment methods should be added without changing checkout logic. Which OOP design would you use and why?","Define a PaymentMethod interface/abstract class with pay(); implement CardPayment, WalletPayment and BankTransfer. Checkout depends on the abstraction (polymorphism / strategy).","","","Look for abstraction, polymorphism and open/closed design.","Score design choice, extensibility and reasoning.",120),
+("OOP","CAT-05","Medium","MCQ","Which term describes the relationship where one class is composed of instances of another and the parts cannot outlive the whole?","Composition",["Aggregation","Composition","Inheritance","Instantiation"],"Composition implies ownership and shared lifetime.","","Distinguish composition from aggregation.",90),
+("OOP","CAT-05","Medium","Explanation","Explain the difference between an abstract class and an interface in most object oriented languages.","An abstract class can carry state and partial implementation and is extended by inheritance; an interface defines a contract with no state and can be implemented by multiple types.","","","Mention state/implementation vs contract.","Score clarity and language awareness.",120),
 ("OOP","CAT-05","Hard","MCQ","Which statement best describes the Liskov Substitution Principle?","A subtype should be usable wherever its base type is expected without breaking correctness.",["Every class must have one method","A subtype should be usable wherever its base type is expected without breaking correctness.","Subclasses must expose all fields publicly","Inheritance should replace composition in every case"],"LSP is about behavioral substitutability.","","Check understanding of SOLID and substitutability.",90),
-# Networking (4): 2 Easy, 1 Medium, 1 Hard
+("OOP","CAT-05","Hard","Explanation","Explain the Single Responsibility Principle and why a class that both fetches data and renders HTML violates it.","A class should have one reason to change. Mixing data access and presentation couples two independent reasons to change, making the class harder to test and maintain.","","","Identify the two responsibilities and the benefit of separation.","Score principle statement and application.",150),
+("OOP","CAT-05","Hard","Scenario-Based","Scenario: You inherit a codebase where a god object holds 40 fields and 60 methods, and every change breaks an unrelated test. Explain how you would refactor it safely.","Map responsibilities, extract cohesive classes behind interfaces, move callers incrementally, keep tests green at each step, add characterization tests first, and remove the god object last.","","","Prioritize safety, small reversible steps and test coverage.","Score refactoring strategy and risk control.",150),
+# Networking (10)
 ("Networking","CAT-08","Easy","MCQ","Which transport protocol provides reliable, ordered byte delivery?","TCP",["UDP","TCP","ARP","ICMP"],"TCP provides connection-oriented reliable ordered delivery.","","Distinguish TCP from UDP.",60),
 ("Networking","CAT-08","Easy","MCQ","What is the primary purpose of DNS in computer networking?","Translate domain names to IP addresses",["Encrypt database rows","Translate domain names to IP addresses","Assign process IDs","Compress HTTP responses"],"DNS resolves names to records such as IP addresses.","","Know DNS resolution.",60),
+("Networking","CAT-08","Easy","MCQ","Which address is used to send a packet to every host on the local subnet?","Broadcast address",["Loopback address","Broadcast address","Multicast address","Unicast address"],"Broadcast delivers to all hosts on a subnet.","","Identify addressing modes.",60),
+("Networking","CAT-08","Easy","MCQ","On which OSI layer does HTTP operate?","Application layer",["Network layer","Transport layer","Application layer","Data link layer"],"HTTP is an application-layer protocol.","","Place protocols in the OSI model.",60),
 ("Networking","CAT-08","Medium","Scenario-Based","Scenario: Users can reach your service by IP address but not by hostname. Which networking component would you investigate first, and what checks would you perform?","Investigate DNS: verify resolver configuration, query the hostname with dig/nslookup, inspect A/AAAA records, TTL and authoritative nameserver health.","","","Troubleshooting should isolate name resolution before application code.","Score diagnosis and practical checks.",120),
+("Networking","CAT-08","Medium","MCQ","Which HTTP status code means the client is not authenticated?","401",["200","301","401","500"],"401 Unauthorized indicates missing or invalid credentials.","","Know common HTTP status codes.",90),
+("Networking","CAT-08","Medium","Explanation","Explain the difference between a proxy and a reverse proxy.","A proxy forwards client requests to external servers on the client's behalf; a reverse proxy sits in front of servers, forwarding inbound requests and often doing load balancing, caching or TLS termination.","","","Clarify direction and common responsibilities.","Score definitions and use cases.",120),
 ("Networking","CAT-08","Hard","Explanation","Explain the TCP three-way handshake and why a service behind a firewall may accept SYN packets but never establish a connection.","Client sends SYN; server responds SYN-ACK; client returns ACK. A firewall, routing issue or dropped return packet can prevent completion.","","","Describe sequence and a plausible network failure.","Score protocol accuracy and diagnosis.",120),
-# Coding (5): 2 Easy, 2 Medium, 1 Hard
+("Networking","CAT-08","Hard","MCQ","A host cannot reach the internet but can ping the gateway. Which layer is most likely at fault?","Network / routing layer",["Application layer","Network / routing layer","Presentation layer","Session layer"],"Reaching the gateway but not beyond points to routing or network-layer configuration.","","Isolate network-layer reachability.",90),
+("Networking","CAT-08","Hard","Scenario-Based","Scenario: A REST API behind a load balancer returns intermittent 502 errors under burst traffic. Describe how you would diagnose the root cause.","Check upstream health and capacity, request timeouts, connection pool exhaustion, keep-alive settings, backend CPU/memory and logs correlated by request id, then tune timeouts/pooling or scale.","","","Focus on load-balancer to upstream path and resource limits.","Score systematic diagnosis.",150),
+# Coding (10)
 ("Coding","CAT-03","Easy","Coding","Coding problem: Write a function that returns the number of vowels in a string. State its time complexity.","def count_vowels(s):\n    return sum(ch.lower() in 'aeiou' for ch in s)","","","Expected O(n) time and O(1) extra space.","Score correctness, case handling and complexity.",90),
 ("Coding","CAT-03","Easy","MCQ","What is the time complexity of accessing an element by index in a Python list?","O(1)",["O(1)","O(log n)","O(n)","O(n log n)"],"Array-backed list indexing is constant time.","","Check basic coding complexity.",60),
+("Coding","CAT-03","Easy","Coding","Coding problem: Write a function that returns the maximum value in a list of integers.","def max_value(values):\n    return max(values)","","","Handle empty input explicitly; O(n) expected.","Score correctness and edge handling.",90),
+("Coding","CAT-03","Easy","MCQ","Which Python keyword defines a function?","def",["func","def","lambda","define"],"Python uses def to define named functions.","","Basic Python syntax.",60),
 ("Coding","CAT-03","Medium","Coding","Coding problem: Given a string, return True if it is a palindrome after lowercasing and removing non-alphanumeric characters.","def is_palindrome(s):\n    t = ''.join(c.lower() for c in s if c.isalnum())\n    return t == t[::-1]","","","Normalize then compare from both ends or reverse.","Score normalization and comparison.",120),
 ("Coding","CAT-03","Medium","Scenario-Based","Scenario: An API endpoint becomes slow only when a customer has thousands of records. Describe how you would reproduce, profile and fix the issue.","Reproduce with representative data; inspect query count and timings; profile hot paths; add pagination/indexes or batch queries; add regression test and measure.","","","Should identify data-volume sensitivity and evidence-led optimization.","Score diagnosis, measurement and safe fix.",150),
+("Coding","CAT-03","Medium","MCQ","Which of the following is true about a pure function?","It always returns the same output for the same input and has no side effects",["It always returns the same output for the same input and has no side effects","It must modify global state","It must be async","It cannot call other functions"],"Pure functions are deterministic and side-effect free.","","Recognize functional properties.",90),
 ("Coding","CAT-03","Hard","Coding","Coding problem: Given a list of intervals, merge all overlapping intervals and return the merged list. Describe complexity.","Sort intervals by start; scan once, extending the last merged interval when overlap exists. Complexity O(n log n) time and O(n) output space.","","","Expected sort + linear sweep; handle empty input.","Score algorithm, edge cases and complexity.",180),
-# Database (5): 2 Easy, 1 Medium, 2 Hard
+("Coding","CAT-03","Hard","Coding","Coding problem: Given a binary tree root, return its maximum depth. State the complexity.","def max_depth(node):\n    if not node: return 0\n    return 1 + max(max_depth(node.left), max_depth(node.right))","","","Recursive or iterative traversal; O(n) time, O(h) space.","Score traversal and complexity.",150),
+("Coding","CAT-03","Medium","Explanation","Explain time complexity versus space complexity and how you trade one for the other with a concrete example.","Time measures steps, space measures memory. Example: caching results (memoization) trades extra memory for fewer repeated computations.","","","Demonstrate a real trade-off with an example.","Score definition and example.",120),
+# Database (10)
 ("Database","CAT-01","Easy","MCQ","In SQL, which clause filters individual rows before GROUP BY aggregation?","WHERE",["HAVING","WHERE","ORDER BY","DISTINCT"],"WHERE filters rows before grouping; HAVING filters groups.","","Basic SQL clause semantics.",60),
 ("Database","CAT-01","Easy","SQL","SQL task: Return the names of customers who live in Dhaka, sorted alphabetically.","SELECT name FROM customers WHERE city = 'Dhaka' ORDER BY name","","","Expected SQL uses WHERE and ORDER BY.","Run against the built-in customers table.",90),
+("Database","CAT-01","Easy","MCQ","Which SQL statement removes all rows from a table but keeps the table structure?","TRUNCATE",["DROP","TRUNCATE","DELETE FROM","ALTER"],"TRUNCATE removes all rows quickly while preserving the table.","","Distinguish table removal vs row removal.",60),
+("Database","CAT-01","Easy","MCQ","What does a primary key guarantee in a relational table?","Uniqueness and non-nullability of each row",["Uniqueness and non-nullability of each row","Sorted order","Foreign references","Automatic indexing only"],"A primary key uniquely and non-nullably identifies each row.","","Know primary key properties.",60),
 ("Database","CAT-01","Medium","Explanation","Explain the difference between an INNER JOIN and a LEFT JOIN, including what happens when there is no matching row.","INNER JOIN returns only matching pairs. LEFT JOIN preserves every left-side row and fills right-side columns with NULL when no match exists.","","","Use a concrete unmatched-row explanation.","Score correctness and example.",90),
+("Database","CAT-01","Medium","SQL","SQL task: Return each city and the number of customers in that city, ordered by city.","SELECT city, COUNT(*) AS customer_count FROM customers GROUP BY city ORDER BY city","","","Expected GROUP BY and COUNT.","Compare query results on generated SQL datasets.",120),
+("Database","CAT-01","Hard","Scenario-Based","Scenario (SQL): A report query became slow after the orders table grew tenfold. Describe how you would diagnose and improve it without guessing indexes.","Inspect query plan and timings; check predicates, join keys and cardinality; identify scans/sorts; test a targeted index; compare execution plans and write/read trade-offs.","","","Use EXPLAIN and measurement; avoid indiscriminate indexes.","Score diagnosis and validation.",120),
 ("Database","CAT-01","Hard","SQL","SQL task: For each customer, return customer name and total completed order amount. Include customers with no completed orders as zero; sort highest total first then name.","SELECT c.name, COALESCE(SUM(CASE WHEN o.status = 'completed' THEN o.amount ELSE 0 END), 0) AS total FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.id, c.name ORDER BY total DESC, c.name","","","Expected LEFT JOIN, conditional sum, COALESCE and deterministic ordering.","Compare query results on generated SQL datasets.",180),
 ("Database","CAT-01","Hard","SQL","SQL task: Return the second-highest distinct order amount among completed orders. Return NULL if it does not exist.","SELECT MAX(amount) FROM orders WHERE status = 'completed' AND amount < (SELECT MAX(amount) FROM orders WHERE status = 'completed')","","","Expected distinct second-highest value using MAX below the maximum.","Compare query results on generated SQL datasets.",150),
-# Critical thinking (2): 1 Medium, 1 Hard
+("Database","CAT-01","Hard","Explanation","Explain how a database transaction and an appropriate isolation level help prevent inconsistent updates when two users purchase the last item in stock.","Use an atomic conditional update or row lock within a transaction; choose isolation/locking to prevent lost updates or overselling; handle serialization/deadlock retries and commit/rollback.","","","Explain concurrency control and atomicity.","Score correctness and practical safeguards.",150),
+# Critical Thinking (10)
+("Critical Thinking","CAT-06","Easy","MCQ","Which is the best first step when debugging an unfamiliar system failure?","Reproduce the failure and gather evidence",["Immediately rewrite the code","Reproduce the failure and gather evidence","Blame the last deploy","Restart everything"],"Evidence gathering before acting avoids blind fixes.","","Prioritize evidence-led debugging.",60),
+("Critical Thinking","CAT-06","Easy","MCQ","A metric dropped suddenly. Before reporting a business decline, what should you verify first?","Data freshness and pipeline status",["Data freshness and pipeline status","Marketing spend","Office location","Brand colors"],"Pipeline failures can masquerade as business changes.","","Separate data quality from real change.",60),
+("Critical Thinking","CAT-06","Easy","Explanation","Explain why a checklist of verification steps is useful in incident response.","A checklist reduces omissions under stress, ensures consistency and evidence capture, and lets the team progress without relying on memory.","","","Link checklist to reliability under pressure.","Score reasoning clarity.",90),
 ("Critical Thinking","CAT-06","Medium","Scenario-Based","Scenario: A dashboard shows sales 18% lower than yesterday, but the database ingestion job also failed overnight. What would you verify before reporting a business decline?","Check data freshness and ingestion status, compare source totals and time windows, inspect late-arriving records, validate filters, then communicate a data-quality caveat.","","","Do not assume business change until pipeline freshness is verified.","Score evidence checks and communication.",120),
+("Critical Thinking","CAT-06","Medium","MCQ","Two team members disagree on a root cause with equal evidence. What is the most sound next step?","Design a test that distinguishes the two hypotheses",["Design a test that distinguishes the two hypotheses","Choose the senior member's view","Deploy both fixes","Escalate without data"],"A discriminating experiment resolves ambiguity with evidence.","","Favor falsifiable comparison.",90),
+("Critical Thinking","CAT-06","Medium","Scenario-Based","Scenario: A customer reports a bug you cannot reproduce. Describe your next steps.","Collect version, environment, steps, logs and a screen recording; try the exact environment; add logging or a reproduction hook; keep the customer informed.","","","Gather contextual evidence rather than dismissing the report.","Score methodical reproduction effort.",120),
 ("Critical Thinking","CAT-06","Hard","Explanation","A team can ship either a quick patch that hides an intermittent error or spend a day finding the root cause. Explain how you would decide under a high-impact production incident.","Assess user impact and risk, mitigate safely with rollback/feature flag if needed, preserve evidence, communicate, investigate root cause, then verify permanent fix and prevention.","","","Balance immediate mitigation with root-cause analysis and auditability.","Score prioritization, safety and reasoning.",150),
+("Critical Thinking","CAT-06","Hard","Scenario-Based","Scenario: A manager wants a metric that inflates a feature's impact, and the data can technically be sliced to support it. How do you respond?","Decline misleading framing; explain the correct measurement and its limitations; offer an honest, pre-registered analysis and document assumptions.","","","Prioritize honesty and defensibility over a favorable number.","Score integrity and clear reasoning.",150),
+("Critical Thinking","CAT-06","Hard","MCQ","Which is the strongest sign that a correlation is not causation?","A plausible confounder explains both variables",["The sample is large","The p-value is small","A plausible confounder explains both variables","The chart uses a trend line"],"Confounders undermine causal claims from correlation.","","Recognize causal reasoning limits.",90),
+("Critical Thinking","CAT-06","Hard","Explanation","Explain the difference between precision and recall in evaluation, and give an example where you would prioritize one over the other.","Precision is the fraction of retrieved items that are relevant; recall is the fraction of relevant items retrieved. Prioritize recall for medical screening and precision for spam filtering.","","","Define both and justify the trade-off with examples.","Score definitions and trade-off reasoning.",150),
 ]
 
-# Five questions per skill: 1 Easy, 2 Medium, 2 Hard.
+# Ten questions per skill: 2 Easy, 4 Medium, 4 Hard (so a retake never repeats).
+# Tuple: (skill, difficulty, type, prompt, answer, options, explanation, reference, rubric, seconds)
 CV_QUESTIONS = [
-# Python
+# Python (10): 2E / 4M / 4H
 ("Python","Easy","MCQ","What does the Python expression [x*x for x in range(3)] produce?","[0, 1, 4]",["[1, 4, 9]","[0, 1, 4]","[0, 1, 2]","An error"],"A list comprehension squares 0, 1 and 2.","","Basic Python comprehension.",60),
+("Python","Easy","MCQ","Which Python built-in aggregates elements position-wise from multiple iterables?","zip",["zip","filter","map","reduce"],"zip pairs elements position-wise.","","Basic built-in function knowledge.",60),
+("Python","Medium","MCQ","Which of these Python types is immutable?","tuple",["list","dict","set","tuple"],"Tuples cannot be modified after creation.","","Identify immutable types.",90),
+("Python","Medium","Coding","Coding problem (Python): Return the sum of all even numbers in a list.","def sum_even(values):\n    return sum(v for v in values if v % 2 == 0)","","","Use a generator and modulo test; O(n).","Score correctness and clarity.",90),
 ("Python","Medium","Coding","Coding problem (Python): Given a list of integers, return the first non-repeating value, or None if every value repeats.","from collections import Counter\ndef first_unique(values):\n    counts = Counter(values)\n    return next((v for v in values if counts[v] == 1), None)","","","Use frequency counting and preserve original order.","Score correctness and O(n) expected complexity.",120),
 ("Python","Medium","Scenario-Based","Scenario (Python): A pandas DataFrame contains duplicate customer rows and inconsistent whitespace in email addresses. Describe a safe cleaning sequence and how you would verify it.","Preserve raw input; normalize email with strip/lower; identify duplicate keys; inspect conflicts before dropping; deduplicate by documented rule; compare row counts and sample records.","","","Mention reproducibility and avoid blind duplicate deletion.","Score safe data cleaning and validation.",120),
 ("Python","Hard","Coding","Coding problem (Python): Implement a generator that yields batches of at most k items from an iterable without loading the entire iterable into memory.","def batches(items, k):\n    if k <= 0: raise ValueError('k must be positive')\n    batch = []\n    for item in items:\n        batch.append(item)\n        if len(batch) == k:\n            yield batch\n            batch = []\n    if batch: yield batch","","","Streaming generator; validate k and yield final partial batch.","Score laziness, boundaries and memory behavior.",180),
 ("Python","Hard","Explanation","A Python API has rising memory use under load. Explain how you would investigate whether the cause is retained references, unbounded caching or large DataFrame copies.","Reproduce and profile; inspect heap/object growth with tracemalloc; review cache bounds and global references; inspect DataFrame copy patterns; test streaming/chunking and confirm memory under load.","","","Evidence-led investigation with measurable verification.","Score diagnostic approach and safe remediation.",150),
-# Git
+("Python","Hard","Scenario-Based","Scenario (Python): A Celery/async task occasionally leaves a job stuck in a half-done state after a crash. How would you make the pipeline idempotent and recoverable?","Design idempotent steps with a status field, use a state machine, wrap transitions in transactions, add a heartbeat/timeout, and a reaper that re-queues or fails stuck jobs safely.","","","Idempotency and safe recovery are the core requirements.","Score design for crash safety.",150),
+("Python","Hard","Coding","Coding problem (Python): Implement a thread-safe rate limiter using a sliding window that allows at most N calls per second. Explain your locking strategy.","from collections import deque\nimport threading, time\nclass RateLimiter:\n    def __init__(self, n):\n        self.n = n\n        self.calls = deque()\n        self.lock = threading.Lock()\n    def allow(self):\n        now = time.monotonic()\n        with self.lock:\n            while self.calls and now - self.calls[0] >= 1:\n                self.calls.popleft()\n            if len(self.calls) < self.n:\n                self.calls.append(now)\n                return True\n            return False","","","Thread safety, window eviction and boundary checks are required.","Score locking, correctness and complexity.",180),
+# Git (10): 2E / 4M / 4H
 ("Git","Easy","MCQ","Which Git command creates a local commit from staged changes?","git commit",["git push","git commit","git fetch","git clone"],"git commit records staged changes in local history.","","Basic Git workflow.",60),
+("Git","Easy","MCQ","Which Git command shows the state of the working tree and staging area?","git status",["git status","git log","git diff","git show"],"git status summarizes tracked changes and staging.","","Basic repository inspection.",60),
+("Git","Medium","MCQ","Which Git command switches to an existing branch?","git checkout",["git checkout","git init","git remote","git config"],"git checkout (or git switch) changes the active branch.","","Basic branching.",90),
+("Git","Medium","Coding","Git command task: Show the command to view the last five commits in one line each.","git log --oneline -5","","","Expected a compact log command.","Score command correctness.",90),
 ("Git","Medium","Scenario-Based","Scenario (Git): Two developers changed the same lines in a shared branch and a merge reports conflicts. Describe a safe resolution workflow.","Inspect status and conflict markers; understand both changes; edit intended result; run tests; git add resolved files; complete merge/rebase; review diff and push.","","","No blind acceptance of ours/theirs; test the merged result.","Score safe conflict resolution.",120),
-("Git","Medium","Coding","Git command task: Show the commands to create a feature branch named feature/report, stage only report.py, and create a commit with message Add report export.","git switch -c feature/report\ngit add report.py\ngit commit -m \"Add report export\"","","","Commands should create the branch, stage only the requested file and commit it.","Score command order and scope.",90),
+("Git","Medium","MCQ","Which Git command discards unstaged changes to a single file?","git checkout -- <file>",["git checkout -- <file>","git commit --amend","git push --force","git reset --hard"],"git checkout -- <file> restores the file from the index/HEAD.","","Understand discarding local changes.",90),
 ("Git","Hard","Scenario-Based","Scenario (Git): A secret API key was committed and pushed to a public repository. What steps do you take immediately and afterward?","Revoke/rotate the exposed key immediately; notify owners; audit usage; remove from current code and history if appropriate; force-push coordinated rewrite; invalidate caches/forks where possible; add secret scanning and prevention.","","","History rewrite alone does not make a leaked secret safe.","Score incident response and prevention.",150),
 ("Git","Hard","Explanation","Explain how you would use interactive rebase to clean up a feature branch before review, and identify when not to rewrite history.","Use rebase -i to squash/reword/reorder commits and resolve conflicts; run tests. Avoid rewriting shared/public history without coordination; prefer merge commits when history preservation is required.","","","Discuss shared branch safety.","Score workflow and collaboration.",120),
-# AI & Machine Learning
+("Git","Hard","MCQ","A branch has diverged and you want to replay your unpushed commits on top of the updated remote branch. Which command rewrites your local commits onto the new base?","git rebase",["git rebase","git clone","git tag","git stash"],"git rebase replays local commits onto a new base.","","Understand rebase vs merge.",90),
+("Git","Hard","Coding","Git command task: Show the commands to use git bisect to find the commit that introduced a regression, given a known good and bad commit.","git bisect start\ngit bisect bad HEAD\ngit bisect good <good-commit>\n# test each checkout, then:\ngit bisect good | git bisect bad\ngit bisect reset","","","Expected bisect start, bad/good markers and reset.","Score command sequence.",120),
+# AI & Machine Learning (10): 2E / 4M / 4H
 ("AI & Machine Learning","Easy","MCQ","In supervised machine learning, what does the training dataset contain?","Examples with input features and target labels",["Only unlabelled inputs","Examples with input features and target labels","Only model weights","Only evaluation metrics"],"Supervised learning uses labelled examples.","","Basic supervised-learning concept.",60),
+("AI & Machine Learning","Easy","MCQ","Which term describes a model performing well on training data but poorly on new data?","Overfitting",["Underfitting","Overfitting","Normalization","Batching"],"Overfitting memorizes training data at the cost of generalization.","","Recognize overfitting.",60),
+("AI & Machine Learning","Medium","MCQ","What is a feature in machine learning?","An individual measurable input variable",["An individual measurable input variable","The final prediction","A loss value","A hyperparameter only"],"Features are the input variables the model uses.","","Basic ML vocabulary.",90),
+("AI & Machine Learning","Medium","Explanation","Explain why a separate validation set is important during training.","The validation set gives an unbiased estimate of generalization and is used to tune hyperparameters without leaking test-set information.","","","Mention unbiased evaluation and avoiding leakage.","Score clarity.",90),
 ("AI & Machine Learning","Medium","Scenario-Based","Scenario (AI/ML): A model has 99% training accuracy but 72% validation accuracy. Name likely causes and the first checks you would perform.","Suspect overfitting, leakage or distribution mismatch; inspect split strategy, duplicates/leakage, class balance, learning curves and regularization; compare validation data provenance.","","","Evidence-based diagnosis, not just tuning.","Score likely causes and validation plan.",120),
 ("AI & Machine Learning","Medium","Coding","Coding task (machine learning): Given true-positive, false-positive and false-negative counts, write a Python function returning precision and recall, using 0 when a denominator is zero.","def precision_recall(tp, fp, fn):\n    precision = tp / (tp + fp) if tp + fp else 0\n    recall = tp / (tp + fn) if tp + fn else 0\n    return precision, recall","","","Use correct denominators and guard zero division.","Score formulas and edge cases.",120),
 ("AI & Machine Learning","Hard","Scenario-Based","Scenario (AI/ML): Your production classifier's performance drops after a new customer segment launches. Explain how you would detect and respond to model drift.","Monitor feature/label distributions and delayed outcome metrics by segment; check data pipeline/schema changes; compare cohorts; alert, investigate, retrain only after validation and controlled rollout.","","","Distinguish data drift from concept drift and protect deployment.","Score monitoring, segmentation and controlled response.",150),
 ("AI & Machine Learning","Hard","Explanation","Explain how you would evaluate a retrieval-augmented generation system beyond answer fluency, including retrieval and groundedness.","Measure retrieval recall/precision and ranking; assess context relevance, answer faithfulness/groundedness, citation correctness, answer relevance, latency and cost; use curated test sets and human review.","","","Separate retrieval quality from generation quality.","Score metric coverage and evaluation discipline.",150),
-# SQL
+("AI & Machine Learning","Hard","MCQ","Which evaluation metric is most appropriate for an imbalanced binary classification problem?","F1 score / PR-AUC",["Accuracy alone","F1 score / PR-AUC","Mean absolute error","R-squared"],"Accuracy misleads under imbalance; F1 and PR-AUC reflect minority-class performance.","","Choose metrics for class imbalance.",90),
+("AI & Machine Learning","Hard","Explanation","Explain gradient descent and how the learning rate affects convergence.","Gradient descent iteratively moves parameters opposite the gradient of the loss. A high learning rate can overshoot or diverge; a low rate converges slowly; adaptive rates help balance speed and stability.","","","Describe the update rule and the role of the learning rate.","Score correctness and convergence reasoning.",150),
+# SQL (10): 2E / 4M / 4H
 ("SQL","Easy","MCQ","Which SQL aggregate counts all rows, including rows where a particular column is NULL?","COUNT(*)",["COUNT(column)","COUNT(*)","SUM(*)","TOTAL(column)"],"COUNT(*) counts rows; COUNT(column) ignores NULL values.","","Basic SQL aggregate behavior.",60),
+("SQL","Easy","MCQ","Which SQL keyword removes duplicate rows from a result set?","DISTINCT",["UNIQUE","DISTINCT","FILTER","GROUP"],"DISTINCT returns only unique rows.","","Basic SQL clauses.",60),
+("SQL","Medium","SQL","SQL task: Return all columns for the customer whose id is 42.","SELECT * FROM customers WHERE id = 42","","","Expected SELECT with a WHERE equality predicate.","Compare query results on generated SQL datasets.",90),
+("SQL","Medium","MCQ","Which SQL clause orders result rows?","ORDER BY",["ORDER BY","GROUP BY","LIMIT","HAVING"],"ORDER BY sorts the result rows.","","Basic SQL ordering.",90),
 ("SQL","Medium","SQL","SQL task: Return each city and the number of customers in that city, ordered by city.","SELECT city, COUNT(*) AS customer_count FROM customers GROUP BY city ORDER BY city","","","Expected GROUP BY and COUNT.","Compare query results on generated SQL datasets.",120),
-("SQL","Medium","Scenario-Based","Scenario (SQL): A report query became slow after the orders table grew tenfold. Describe how you would diagnose and improve it without guessing indexes.","Inspect query plan and timings; check predicates, join keys and cardinality; identify scans/sorts; test a targeted index; compare execution plans and write/read trade-offs.","","","Use EXPLAIN and measurement; avoid indiscriminate indexes.","Score diagnosis and validation.",120),
+("SQL","Medium","MCQ","Which JOIN returns all rows from both tables, matching where possible and NULL where not?","FULL OUTER JOIN",["INNER JOIN","LEFT JOIN","FULL OUTER JOIN","CROSS JOIN"],"FULL OUTER JOIN preserves rows from both sides.","","Distinguish join types.",90),
 ("SQL","Hard","SQL","SQL task: Return customers whose completed-order total exceeds 1000. Output customer name and total, highest total first.","SELECT c.name, SUM(o.amount) AS total FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.status = 'completed' GROUP BY c.id, c.name HAVING SUM(o.amount) > 1000 ORDER BY total DESC","","","Expected WHERE, GROUP BY, HAVING and ordering.","Compare query results on generated SQL datasets.",150),
 ("SQL","Hard","Explanation","Explain how a database transaction and an appropriate isolation level help prevent inconsistent updates when two users purchase the last item in stock.","Use an atomic conditional update or row lock within a transaction; choose isolation/locking to prevent lost updates or overselling; handle serialization/deadlock retries and commit/rollback.","","","Explain concurrency control and atomicity.","Score correctness and practical safeguards.",150),
+("SQL","Hard","SQL","SQL task: For each city, return the customer with the highest single order amount, showing city and customer name.","SELECT c.city, c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.amount = (SELECT MAX(o2.amount) FROM customers c2 JOIN orders o2 ON o2.customer_id = c2.id WHERE c2.city = c.city) ORDER BY c.city","","","Expected a correlated maximum per group.","Compare query results on generated SQL datasets.",180),
+("SQL","Hard","SQL","SQL task: Return the second-highest distinct order amount among completed orders. Return NULL if it does not exist.","SELECT MAX(amount) FROM orders WHERE status = 'completed' AND amount < (SELECT MAX(amount) FROM orders WHERE status = 'completed')","","","Expected distinct second-highest value using MAX below the maximum.","Compare query results on generated SQL datasets.",150),
 ]
 
-def insert_question(qid, category, subcategory, difficulty, qtype, prompt, answer,
-                    options, explanation, reference, rubric, seconds):
-    run("""INSERT INTO question_bank(
-        id,category_id,subcategory,question_type,difficulty_level,question_text,
-        options,correct_answer,explanation,reference_answer,grading_rubric,marks,
-        time_allocation,status,created_by,created_at,version
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(id) DO NOTHING""", (
-        qid, category, subcategory, qtype, difficulty, prompt, json.dumps(options),
+_INSERT_SQL = """INSERT INTO question_bank(
+    id,category_id,subcategory,question_type,difficulty_level,question_text,
+    options,correct_answer,explanation,reference_answer,grading_rubric,marks,
+    time_allocation,status,created_by,created_at,version
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO NOTHING"""
+
+
+def _insert(conn, qid, category, subcategory, difficulty, qtype, prompt, answer,
+            options, explanation, reference, rubric, seconds):
+    # Non-MCQ questions pass options as "" — store a JSON list so QuestionRecord
+    # validation (options: list[str]) never drops them from the bank.
+    opts = options if isinstance(options, list) else []
+    conn.execute(_INSERT_SQL, (
+        qid, category, subcategory, qtype, difficulty, prompt, json.dumps(opts),
         answer, explanation, reference, rubric, 1, seconds, "active", ACTOR, NOW, 1
     ))
 
+
 def seed():
-    from main import init_db, run
+    from main import db, init_db
     import enterprise
     init_db()
     # Ensure admin question-bank tables exist and preserve existing legacy sample data.
     enterprise._seed_question_bank()
-    for index, row in enumerate(FUNDAMENTALS, 1):
-        topic, category, difficulty, qtype, prompt, answer, options, explanation, reference, rubric, seconds = row
-        insert_question(f"demo-gr-f-{index:02d}", category, topic, difficulty, qtype,
-                        prompt, answer, options, explanation, reference, rubric, seconds)
-    for index, row in enumerate(CV_QUESTIONS, 1):
-        skill, difficulty, qtype, prompt, answer, options, explanation, reference, rubric, seconds = row
-        insert_question(f"demo-gr-cv-{index:02d}", "CAT-10", skill, difficulty, qtype,
-                        prompt, answer, options, explanation, reference, rubric, seconds)
+    with db() as conn:
+        for index, row in enumerate(FUNDAMENTALS, 1):
+            topic, category, difficulty, qtype, prompt, answer, options, explanation, reference, rubric, seconds = row
+            _insert(conn, f"demo-gr-f-{index:02d}", category, topic, difficulty, qtype,
+                    prompt, answer, options, explanation, reference, rubric, seconds)
+        for index, row in enumerate(CV_QUESTIONS, 1):
+            skill, difficulty, qtype, prompt, answer, options, explanation, reference, rubric, seconds = row
+            _insert(conn, f"demo-gr-cv-{index:02d}", "CAT-10", skill, difficulty, qtype,
+                    prompt, answer, options, explanation, reference, rubric, seconds)
+    # Materialise the Skill -> Question graph edges (HAS_QUESTION) after seeding.
+    import main
+    edges = main.sync_skill_question_edges()
     total = len(FUNDAMENTALS) + len(CV_QUESTIONS)
+    per_topic = {}
+    for topic, *_ in FUNDAMENTALS:
+        per_topic[topic] = per_topic.get(topic, 0) + 1
+    for skill, *_ in CV_QUESTIONS:
+        per_topic[skill] = per_topic.get(skill, 0) + 1
     print(f"[graphrag-seed] inserted/verified {total} deterministic synthetic questions")
-    print("[graphrag-seed] Fundamental: 25 | CV: Python 5, Git 5, AI/ML 5, SQL 5")
+    print("[graphrag-seed] per-topic counts:", ", ".join(f"{k}={v}" for k, v in sorted(per_topic.items())))
+    print(f"[graphrag-seed] skill->question graph edges: {edges}")
     print("[graphrag-seed] Safe to rerun; existing question IDs are not overwritten.")
 
 if __name__ == "__main__":

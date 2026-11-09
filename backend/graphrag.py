@@ -188,13 +188,22 @@ def _topic_match(q: dict, topic: str) -> bool:
     return any(_norm(term) in haystack for term in spec["terms"])
 
 def _skill_match(q: dict, skill: CVSkill) -> bool:
-    haystack = " ".join([str(q.get("subcategory", "")), str(q.get("question_text", "")),
-                         str(q.get("grading_rubric", ""))]).lower()
-    aliases = SKILL_ALIASES.get(skill.skill_id, [skill.label.lower()])
-    def contains(alias: str) -> bool:
-        pattern = r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])"
-        return bool(re.search(pattern, haystack))
-    return any(contains(alias) for alias in aliases) or contains(skill.label)
+    """Match a CV skill to its dedicated skill questions by subcategory only.
+
+    Fundamental topics (DSA/OOP/Networking/Coding/Database/Critical Thinking) live in
+    their own categories and are matched by `_topic_match`; matching CV skills against
+    question text would pull fundamental questions (e.g. Database SQL) into the CV pool
+    and starve retakes. The skill seed uses subcategory = skill name, so subcategory
+    matching cleanly separates the two sections.
+    """
+    sub = _norm(q.get("subcategory", ""))
+    if not sub:
+        return False
+    aliases = [skill.skill_id, skill.label] + list(SKILL_ALIASES.get(skill.skill_id, []))
+    def sub_contains(alias: str) -> bool:
+        a = _norm(alias)
+        return bool(a) and (a == sub or bool(re.search(r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])", sub)))
+    return any(sub_contains(a) for a in aliases)
 
 def _external_retrieval(query: str, category_id: str | None = None) -> tuple[list[str], list[str]]:
     """Return IDs ordered by Meilisearch and Neo4j. Missing services are a normal fallback."""
@@ -322,21 +331,35 @@ def _format_kind(q: dict) -> str:
         return "explanation"
     return "mcq"
 
+def _format_priority(fmt: str) -> int:
+    """Rank formats so rarer deterministic kinds (coding/sql) win format-coverage ties."""
+    if fmt in ("coding", "sql"):
+        return 0
+    if fmt in ("scenario", "explanation"):
+        return 1
+    return 2
+
+
 def _allocate(pool: list[dict], count: int, difficulty: str, used: set[str], external: dict[str, float],
               preferred_formats: set[str] | None = None) -> list[dict]:
     candidates = [q for q in pool if q["id"] not in used and _difficulty(q) == difficulty]
     preferred_formats = preferred_formats or set()
     candidates.sort(key=lambda q: (0 if _format_kind(q) in preferred_formats else 1,
+                                   _format_priority(_format_kind(q)),
                                    -(external.get(q["id"], 0)), q["id"]))
     selected = candidates[:count]
     used.update(q["id"] for q in selected)
     return selected
 
-def build_assessment(rows: Iterable[Any], cv_skills: list[CVSkill], *, retrieval: bool = True) -> dict:
+def build_assessment(rows: Iterable[Any], cv_skills: list[CVSkill], *, retrieval: bool = True,
+                     exclude_ids: Iterable[str] | None = None) -> dict:
     """Build the fixed fundamental section plus five questions per CV skill.
 
     The selector fails closed with detailed pool shortages; it never silently changes
     quotas or invents questions. All question IDs remain traceable to the source bank.
+
+    ``exclude_ids`` is the retake filter: question IDs a candidate has already seen in a
+    previous attempt are removed from every pool, so a retake serves fresh questions.
     """
     started = time.perf_counter()
     bank = []
@@ -347,7 +370,10 @@ def build_assessment(rows: Iterable[Any], cv_skills: list[CVSkill], *, retrieval
                 bank.append(q.model_dump())
         except (ValidationError, TypeError, ValueError):
             continue
-    used: set[str] = set()
+    # Seed the used-set with previously-seen questions (retake filter) so they can
+    # never be re-selected, while still acting as the within-assessment dedup set.
+    excluded: set[str] = {str(x) for x in (exclude_ids or []) if x}
+    used: set[str] = set(excluded)
     selected: list[dict] = []
     trace: list[RetrievalTrace] = []
     shortages: list[dict] = []
@@ -372,7 +398,9 @@ def build_assessment(rows: Iterable[Any], cv_skills: list[CVSkill], *, retrieval
             if len(chosen) < count:
                 shortages.append({"section": "fundamental", "topic": topic, "difficulty": difficulty,
                                   "required": count, "available_selected": len(chosen)})
-    required_fundamental_formats = {"scenario", "explanation", "sql", "coding"}
+    # SQL is a CV-skill format (not a core fundamental), so it is preferred but not
+    # hard-required; requiring it would exhaust the limited SQL pool across retakes.
+    required_fundamental_formats = {"scenario", "explanation", "coding"}
     for missing_format in sorted(required_fundamental_formats - fundamental_formats):
         shortages.append({"section": "fundamental", "topic": "Question format mix", "difficulty": "Any",
                           "required": 1, "available_selected": 0, "format": missing_format})
@@ -397,16 +425,22 @@ def build_assessment(rows: Iterable[Any], cv_skills: list[CVSkill], *, retrieval
                 shortages.append({"section": "cv", "topic": skill.label, "difficulty": difficulty,
                                   "required": count, "available_selected": len(chosen)})
         cv_format_coverage[skill.skill_id] = sorted(cv_formats)
+        # Format mix is a quality preference, not a correctness requirement. With a
+        # 10-question-per-skill bank the retake (the second 5) cannot always include
+        # every format, so it is reported rather than treated as a blocking shortage.
         if not ({"coding", "sql"} & cv_formats):
-            shortages.append({"section": "cv", "topic": skill.label, "difficulty": "Any", "required": 1, "available_selected": 0, "format": "coding_or_sql"})
+            shortages.append({"section": "cv", "topic": skill.label, "difficulty": "Any", "required": 1,
+                              "available_selected": 0, "format": "coding_or_sql", "fatal": False})
         if not ({"scenario", "explanation"} & cv_formats):
-            shortages.append({"section": "cv", "topic": skill.label, "difficulty": "Any", "required": 1, "available_selected": 0, "format": "scenario_or_explanation"})
+            shortages.append({"section": "cv", "topic": skill.label, "difficulty": "Any", "required": 1,
+                              "available_selected": 0, "format": "scenario_or_explanation", "fatal": False})
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     fundamental = [q for q in selected if q["assessment_section"] == "fundamental"]
     cv_questions = [q for q in selected if q["assessment_section"] == "cv"]
     total_seconds = sum(int(q.get("time_allocation") or 60) for q in selected)
+    fatal_shortages = [s for s in shortages if s.get("fatal", True)]
     return {
-        "status": "ready" if not shortages else "question_bank_incomplete",
+        "status": "ready" if not fatal_shortages else "question_bank_incomplete",
         "fundamental": fundamental, "cv_based": cv_questions,
         "questions": selected, "total_questions": len(selected),
         "fundamental_count": len(fundamental), "cv_count": len(cv_questions),
@@ -417,6 +451,7 @@ def build_assessment(rows: Iterable[Any], cv_skills: list[CVSkill], *, retrieval
         "fundamental_targets": FUNDAMENTAL_TARGETS,
         "per_skill_targets": PER_SKILL_TARGETS,
         "skills": [s.model_dump() for s in cv_skills],
+        "excluded_ids": sorted(excluded),
         "fundamental_formats": sorted(fundamental_formats), "cv_format_coverage": cv_format_coverage,
         "shortages": shortages, "retrieval_trace": [t.model_dump() for t in trace],
         "retrieval_ms": elapsed_ms,

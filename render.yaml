@@ -1,8 +1,10 @@
-# SkillBridge deployment: Vercel frontend + Render FastAPI backend + managed PostgreSQL.
+# SkillBridge deployment: Vercel frontend + Render FastAPI backend + Neon PostgreSQL.
 #
-# docker-compose.yml provides a local PostgreSQL container only through the
-# optional "localdb" profile for development. Render uses its own managed
-# PostgreSQL service below; DATABASE_URL is injected into the backend.
+# The backend connects to Neon (managed PostgreSQL). Set DATABASE_URL in the Render
+# dashboard (or via `render blueprint launch`) to your Neon connection string, e.g.:
+#   postgresql://USER:PASSWORD@HOST:5432/skillbridge?sslmode=require
+# The question bank (10 per topic) and Skill->Question graph edges are seeded
+# automatically and idempotently by start.sh on every deploy.
 services:
   - type: web
     name: skillbridge
@@ -16,10 +18,9 @@ services:
     envVars:
       - key: SECRET_KEY
         generateValue: true
+      # Neon connection string. Set in the Render dashboard (never commit it).
       - key: DATABASE_URL
-        fromDatabase:
-          name: skillbridge-db
-          property: connectionString
+        sync: false
       - key: RETEST_COOLDOWN_HOURS
         value: "336"
       - key: MAX_ATTEMPTS_90D
@@ -27,14 +28,31 @@ services:
       # Never seed demo accounts into the public production database.
       - key: SEED_DEMO
         value: "false"
-      - key: SEED_GRAPHRAG_QUESTIONS
-        value: "false"
+      # CV extraction provider (LLM) with automatic failover.
+      - key: AI_PROVIDER
+        value: groq
+      - key: AI_PROVIDER_FALLBACKS
+        value: gemini
+      - key: GROQ_API_KEYS
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: GEMINI_API_KEYS
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: AI_TIMEOUT_SECONDS
+        value: "90"
+      - key: MAX_CV_TEXT_CHARS
+        value: "25000"
+      # CV file storage: 'local' (ephemeral) or 's3' (S3-compatible bucket, e.g. R2).
+      - key: STORAGE_BACKEND
+        value: local
       - key: CORS_ORIGINS
         value: https://skillbridge-seven-peach.vercel.app,https://skillbridge.onrender.com
-      - key: ANTHROPIC_API_KEY
-        sync: false
       - key: LLM_MODEL
         value: claude-haiku-5-5
+      # Optional GraphRAG accelerators (empty = deterministic relational fallback).
       - key: MEILISEARCH_URL
         sync: false
       - key: MEILISEARCH_API_KEY
@@ -51,12 +69,3 @@ services:
         value: neo4j
       - key: SPACY_MODEL
         value: en_core_web_sm
-
-# Render-managed PostgreSQL replaces the optional local "db" container from
-# docker-compose.yml. The backend connects using the internal connection string.
-databases:
-  - name: skillbridge-db
-    databaseName: skillbridge
-    user: skillbridge
-    plan: 0.1c-256mb
-    region: oregon

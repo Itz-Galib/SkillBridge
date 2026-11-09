@@ -16,4 +16,5 @@ RUN useradd -m app && mkdir -p /data && chown app /data
 USER app
 EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=3s CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# start.sh seeds the GraphRAG question bank (idempotent) then launches uvicorn.
+CMD ["sh", "start.sh"]

@@ -135,4 +135,39 @@ def test_synthetic_seed_builds_complete_45_question_assessment():
         skill_questions = [q for q in result["cv_based"] if q["skill_id"] == skill.skill_id]
         assert len(skill_questions) == 5
         assert [sum(q["difficulty_level"] == d for q in skill_questions) for d in ("Easy", "Medium", "Hard")] == [1, 2, 2]
-    assert result["estimated_duration_seconds"] == sum(q["time_allocation"] for q in rows)
+    # The bank is larger than the assessment (10 per topic) so the duration reflects
+    # only the questions actually selected, not the whole bank.
+    assert result["estimated_duration_seconds"] == sum(q["time_allocation"] for q in result["questions"])
+
+
+def test_retake_filter_excludes_previously_asked_questions():
+    import seed_graphrag_questions as seed
+
+    rows = []
+    for index, item in enumerate(seed.FUNDAMENTALS, 1):
+        topic, category, difficulty, qtype, prompt, answer, options, explanation, reference, rubric, seconds = item
+        rows.append({"id": f"demo-gr-f-{index:02d}", "category_id": category, "subcategory": topic,
+                     "difficulty_level": difficulty, "question_type": qtype, "question_text": prompt,
+                     "correct_answer": answer, "options": options, "explanation": explanation,
+                     "reference_answer": reference, "grading_rubric": rubric, "marks": 1,
+                     "time_allocation": seconds, "status": "active", "version": 1})
+    for index, item in enumerate(seed.CV_QUESTIONS, 1):
+        skill, difficulty, qtype, prompt, answer, options, explanation, reference, rubric, seconds = item
+        rows.append({"id": f"demo-gr-cv-{index:02d}", "category_id": "CAT-10", "subcategory": skill,
+                     "difficulty_level": difficulty, "question_type": qtype, "question_text": prompt,
+                     "correct_answer": answer, "options": options, "explanation": explanation,
+                     "reference_answer": reference, "grading_rubric": rubric, "marks": 1,
+                     "time_allocation": seconds, "status": "active", "version": 1})
+
+    skills = [CVSkill(skill_id="python", label="Python")]
+    first = build_assessment(rows, skills, retrieval=False)
+    assert first["status"] == "ready", first["shortages"]
+    first_ids = {q["id"] for q in first["questions"]}
+
+    # The retake must serve a complete assessment with zero overlap.
+    retake = build_assessment(rows, skills, retrieval=False, exclude_ids=first_ids)
+    assert retake["status"] == "ready", retake["shortages"]
+    retake_ids = {q["id"] for q in retake["questions"]}
+    assert not (retake_ids & first_ids), "retake repeated previously-asked questions"
+    assert len(retake_ids) == len(first_ids)
+    assert set(retake["excluded_ids"]) == first_ids

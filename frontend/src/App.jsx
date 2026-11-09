@@ -1676,7 +1676,20 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     }
     setSetupBusy(true);
     try {
-      const v = await api("/attempts", { method: "POST" });
+      // Prefer the CV-based GraphRAG assessment (fundamental + CV skills) when a
+      // candidate has confirmed CV skills. Fall back to the standard adaptive
+      // assessment when no CV / confirmed skills / complete bank is available.
+      let blueprintId = null;
+      try {
+        const bp = await api("/assessment/blueprint", { method: "POST" });
+        if (bp && bp.status === "ready") blueprintId = bp.blueprint_id;
+      } catch (e) {
+        blueprintId = null;
+      }
+      const v = await api("/attempts", {
+        method: "POST",
+        body: blueprintId ? { blueprint_id: blueprintId } : undefined,
+      });
       if (v.status === "active") {
         await api("/attempts/" + v.attempt_id + "/event", {
           method: "POST",

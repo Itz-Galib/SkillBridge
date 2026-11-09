@@ -24,10 +24,14 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       DB_PATH: /data/skillbridge.db
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      STORAGE_LOCAL_DIR: /data/cv_files
     volumes:
       - sb_data:/data
     restart: unless-stopped
     expose: ["8000"]
+    # start.sh (the image CMD) seeds the GraphRAG question bank idempotently,
+    # then launches uvicorn on :8000.
   frontend:
     build: ./frontend
     depends_on: [backend]

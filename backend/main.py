@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS candidate_profiles(user_id INTEGER PRIMARY KEY, name 
 CREATE TABLE IF NOT EXISTS candidate_avatars(user_id INTEGER PRIMARY KEY, storage_key TEXT NOT NULL, content_type TEXT NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_blueprints(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_answer_events(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, question_id TEXT NOT NULL, revision INTEGER NOT NULL, answer_hash TEXT NOT NULL, answer_length INTEGER NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS attempt_questions(attempt_id TEXT NOT NULL, question_id TEXT NOT NULL, PRIMARY KEY(attempt_id, question_id));
+CREATE TABLE IF NOT EXISTS cv_skill_nodes(user_id INTEGER NOT NULL, skill_id TEXT NOT NULL, label TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.8, PRIMARY KEY(user_id, skill_id));
+CREATE TABLE IF NOT EXISTS skill_question_edges(skill_id TEXT NOT NULL, question_id TEXT NOT NULL, PRIMARY KEY(skill_id, question_id));
 """
 
 
@@ -2079,14 +2082,22 @@ def generate_assessment_blueprint(u=Depends(current_user)):
         raise HTTPException(422, "No confirmed technical skills were found in the CV evidence")
     import enterprise as admin_data
     admin_data._seed_question_bank()
-    rows = allr("SELECT * FROM question_bank WHERE status='active' ORDER BY created_at DESC")
-    result = build_assessment(rows, skills, retrieval=True)
+    rows = allr("SELECT * FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated' ORDER BY created_at DESC")
+    # Retake filter: never re-serve a question this candidate has already been asked.
+    result = build_assessment(rows, skills, retrieval=True, exclude_ids=asked_question_ids(u["id"]))
+    # Persist the CV -> Skill graph edges (HAS_SKILL) for this candidate.
+    for s in skills:
+        run("""INSERT INTO cv_skill_nodes(user_id,skill_id,label,evidence,confidence)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(user_id,skill_id) DO UPDATE SET
+                 label=excluded.label, evidence=excluded.evidence, confidence=excluded.confidence""",
+            (u["id"], s.skill_id, s.label, s.evidence, s.confidence))
     blueprint_id = uuid.uuid4().hex
     snapshot = {**result, "user_id": u["id"], "blueprint_id": blueprint_id}
     run("INSERT INTO assessment_blueprints(id,user_id,status,payload,created) VALUES (?,?,?,?,?)",
         (blueprint_id, u["id"], result["status"], json.dumps(snapshot), time.time()))
     audit(u["id"], "assessment_blueprint_generated",
-          f"{blueprint_id};questions={result['total_questions']};status={result['status']};ms={result['retrieval_ms']}")
+          f"{blueprint_id};questions={result['total_questions']};status={result['status']};ms={result['retrieval_ms']};excluded={len(result.get('excluded_ids') or [])}")
     return {
         "blueprint_id": blueprint_id, "status": result["status"],
         "fundamental_count": result["fundamental_count"], "cv_count": result["cv_count"],
@@ -2108,11 +2119,11 @@ def admin_graphrag_status(u=Depends(current_user)):
     import enterprise as admin_data
     admin_data.admin_only(u, "questions")
     import graphrag as G
-    rows = allr("SELECT category_id,difficulty_level,COUNT(*) AS n FROM question_bank WHERE status='active' GROUP BY category_id,difficulty_level")
-    active_rows = allr("SELECT * FROM question_bank WHERE status='active'")
+    rows = allr("SELECT category_id,difficulty_level,COUNT(*) AS n FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated' GROUP BY category_id,difficulty_level")
+    active_rows = allr("SELECT * FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated'")
     fundamental_check = G.build_assessment(active_rows, [], retrieval=False)
     return {
-        "active_question_count": one("SELECT COUNT(*) AS n FROM question_bank WHERE status='active'")["n"],
+        "active_question_count": one("SELECT COUNT(*) AS n FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated'")["n"],
         "question_distribution": [dict(r) for r in rows],
         "fundamental_readiness": fundamental_check["status"],
         "fundamental_selected_count": fundamental_check["fundamental_count"],
@@ -2132,10 +2143,11 @@ def admin_graphrag_reindex(u=Depends(current_user)):
     admin_data.admin_only(u, "questions")
     import graphrag as G
     admin_data._seed_question_bank()
-    rows = allr("SELECT * FROM question_bank WHERE status='active'")
+    rows = allr("SELECT * FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated'")
     result = G.index_question_bank(rows)
+    result["graph_edges"] = sync_skill_question_edges()
     audit(u["id"], "graphrag_question_bank_reindex",
-          f"active={result['active_questions']};meili={result['meilisearch']};neo4j={result['neo4j']}")
+          f"active={result['active_questions']};meili={result['meilisearch']};neo4j={result['neo4j']};edges={result['graph_edges']}")
     return result
 
 
@@ -2177,6 +2189,54 @@ def seen_before(uid):
     s = set()
     for a in allr("SELECT state FROM attempts WHERE user_id=? AND status='done'", (uid,)): s |= set(json.loads(a["state"])["used"])
     return s
+
+
+def asked_question_ids(uid):
+    """Retake filter: every question a candidate has already been asked (ASKED_QUESTION).
+
+    Reads the graph edge table first (the source of truth for GraphRAG attempts) and
+    falls back to parsing stored attempt state so legacy attempts are still respected.
+    """
+    ids: set[str] = set()
+    for row in allr("SELECT question_id FROM attempt_questions WHERE attempt_id IN "
+                    "(SELECT id FROM attempts WHERE user_id=? AND status='done')", (uid,)):
+        ids.add(str(row["question_id"]))
+    if not ids:
+        for a in allr("SELECT state FROM attempts WHERE user_id=? AND status='done'", (uid,)):
+            try:
+                for q in (json.loads(a["state"]).get("selected_questions") or []):
+                    if q.get("id"):
+                        ids.add(str(q["id"]))
+            except Exception:
+                continue
+    return ids
+
+
+def sync_skill_question_edges():
+    """Materialise Skill -> Question (HAS_QUESTION) graph edges from the approved bank.
+
+    Deterministic alias matching only (same matcher as GraphRAG retrieval). Excludes
+    legacy curated rows (subcategory 'Legacy curated') which predate the GraphRAG
+    taxonomy. Returns the number of edges written, so the admin reindex can report
+    graph coverage.
+    """
+    import graphrag as G
+    rows = allr("SELECT * FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated'")
+    edges = []
+    for r in rows:
+        q = dict(r)
+        text = " ".join([str(q.get("question_text", "")), str(q.get("subcategory", "")),
+                         str(q.get("grading_rubric", ""))]).lower()
+        for sid, aliases in G.SKILL_ALIASES.items():
+            hit = any(re.search(r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])", text)
+                      for alias in aliases)
+            if hit:
+                edges.append((sid, str(q["id"])))
+    with db() as conn:
+        for sid, qid in edges:
+            conn.execute("INSERT INTO skill_question_edges(skill_id,question_id) VALUES (?,?) ON CONFLICT DO NOTHING",
+                         (sid, qid))
+    return len(edges)
 
 
 def view(att):
@@ -2368,6 +2428,14 @@ def start_attempt(b: Optional[StartAttempt] = None, u=Depends(current_user)):
                 raise HTTPException(402, "retake_credit_required")
         conn.execute("INSERT INTO attempts(id,user_id,kind,seed,status,state,started) VALUES (?,?,?,?,?,?,?)",
                      (aid, u["id"], kind, seed, "active", json.dumps(st), now))
+        # Record ASKED_QUESTION graph edges for the retake filter (GraphRAG knows the
+        # full question set up-front; the adaptive flow records its questions on answer).
+        if st.get("graphrag"):
+            for q in st["selected_questions"]:
+                conn.execute(
+                    "INSERT INTO attempt_questions(attempt_id,question_id) VALUES (?,?) ON CONFLICT DO NOTHING",
+                    (aid, str(q["id"])),
+                )
         if kind == "post":
             conn.execute("INSERT INTO billing_credit_ledger(id,user_id,delta,entry_type,source_ref,reason,actor_id,created) VALUES (?,?,?,?,?,?,?,?)",
                          (uuid.uuid4().hex, u["id"], -credit_cost, "retake_consumption", aid,
