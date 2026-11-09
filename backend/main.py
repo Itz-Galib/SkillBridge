@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import engine as E
-from content import TAXONOMY, JOB, QBYID, TESTABLE
+from content import TAXONOMY, JOB, QBYID
 
 log = logging.getLogger("skillbridge")
 DB_PATH = os.getenv("DB_PATH", "/data/skillbridge.db")
@@ -262,7 +262,7 @@ def profile_skill_entries(profile):
         taxonomy_id = matches[0]["id"] if matches else None
         entries.append({
             "name": name,
-            "id": taxonomy_id if taxonomy_id in TESTABLE else None,
+            "id": taxonomy_id,
             "taxonomy_id": taxonomy_id,
         })
     return entries
@@ -402,10 +402,6 @@ def export_data(u=Depends(current_user)):
 
 @app.delete("/api/me")
 def delete_me(u=Depends(current_user)):
-    ids = [r["id"] for r in allr("SELECT id FROM attempts WHERE user_id=?", (u["id"],))]
-    for i in ids: run("DELETE FROM events WHERE attempt_id=?", (i,))
-    import cv_store
-    cv_store.delete_user_documents(u["id"])   # removes the stored CV files and extraction drafts too
     avatar = one("SELECT storage_key FROM candidate_avatars WHERE user_id=?", (u["id"],))
     if avatar:
         from storage import StorageError, get_storage
@@ -415,6 +411,10 @@ def delete_me(u=Depends(current_user)):
             log.error("Avatar storage deletion failed: %s", ex)
             raise HTTPException(503, "Could not remove the profile photo, please try again")
         run("DELETE FROM candidate_avatars WHERE user_id=?", (u["id"],))
+    ids = [r["id"] for r in allr("SELECT id FROM attempts WHERE user_id=?", (u["id"],))]
+    for i in ids: run("DELETE FROM events WHERE attempt_id=?", (i,))
+    import cv_store
+    cv_store.delete_user_documents(u["id"])   # removes the stored CV files and extraction drafts too
     for t in (
     "consents",
     "profiles",
@@ -2039,7 +2039,20 @@ def confirm_skills(b: Confirm, u=Depends(current_user)):
             "UPDATE candidate_profiles SET skills=?,updated=? WHERE user_id=?",
             (json.dumps(profile["skills"]), time.time(), u["id"]),
         )
-        _, ids = sync_skill_journey(u["id"], profile)
+        ids = list(dict.fromkeys(
+            entry["taxonomy_id"] for entry in profile_skill_entries(profile)
+            if entry["taxonomy_id"]
+        ))
+        current_journey = one(
+            "SELECT source FROM profiles WHERE user_id=?", (u["id"],)
+        )
+        if current_journey and current_journey["source"] != "profile":
+            run(
+                "UPDATE profiles SET confirmed=? WHERE user_id=?",
+                (json.dumps(ids), u["id"]),
+            )
+        else:
+            _, ids = sync_skill_journey(u["id"], profile)
     else:
         run(
             """INSERT INTO profiles(user_id,confirmed) VALUES (?,?)

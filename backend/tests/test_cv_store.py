@@ -424,8 +424,8 @@ def test_profile_skills_sync_to_journey_and_blueprint_without_cv():
     state = client.get("/api/state", headers=headers).json()
     assert state["from_profile"] is True
     assert state["profile_skills"] == ["Python", "SQL", "React.js", "Git & GitHub"]
-    assert set(state["confirmed"]) == {"python", "sql"}
-    assert state["not_assessable_yet"] == ["React.js", "Git & GitHub"]
+    assert set(state["confirmed"]) == {"python", "sql", "javascript", "git"}
+    assert state["not_assessable_yet"] == []
     profile_view = main.one("SELECT * FROM profiles WHERE user_id=?", (uid,))
     assert profile_view["source"] == "profile"
     assert json.loads(profile_view["redaction"]) == {
@@ -443,8 +443,8 @@ def test_profile_skills_sync_to_journey_and_blueprint_without_cv():
     updated = client.put("/api/candidate/profile", json=profile, headers=headers)
     assert updated.status_code == 200, updated.text
     state = client.get("/api/state", headers=headers).json()
-    assert set(state["confirmed"]) == {"python", "statistics"}
-    assert state["not_assessable_yet"] == ["React.js", "Git & GitHub"]
+    assert set(state["confirmed"]) == {"python", "statistics", "javascript", "git"}
+    assert state["not_assessable_yet"] == []
 
     added = client.put("/api/skills", json={"skills": ["visualization"]}, headers=headers)
     assert added.status_code == 200, added.text
@@ -453,8 +453,30 @@ def test_profile_skills_sync_to_journey_and_blueprint_without_cv():
         (skill["name"], skill["status"]) for skill in saved_profile["skills"]
     } >= {("Data Visualization", "claimed")}
     assert set(client.get("/api/state", headers=headers).json()["confirmed"]) == {
-        "python", "statistics", "visualization",
+        "python", "statistics", "visualization", "javascript", "git",
     }
+
+    reanalysis = client.post(
+        "/api/cv",
+        data={"text": "Work summary: Python SQL and Java experience in production applications."},
+        headers=headers,
+    )
+    assert reanalysis.status_code == 200, reanalysis.text
+    before_confirm = main.one("SELECT * FROM profiles WHERE user_id=?", (uid,))
+    assert before_confirm["source"] == "rules"
+    assert "Java" in before_confirm["redacted"]
+    confirmed_cv_skills = client.put(
+        "/api/skills", json={"skills": ["java"]}, headers=headers
+    )
+    assert confirmed_cv_skills.status_code == 200, confirmed_cv_skills.text
+    after_confirm = main.one("SELECT * FROM profiles WHERE user_id=?", (uid,))
+    assert after_confirm["redacted"] == before_confirm["redacted"]
+    assert after_confirm["source"] == before_confirm["source"]
+    assert "java" in json.loads(after_confirm["confirmed"])
+    updated_profile = client.get(
+        "/api/candidate/profile", headers=headers
+    ).json()["profile"]
+    assert any(skill["name"] == "Java" for skill in updated_profile["skills"])
 
 
 def _image_bytes(image_format, exif=None):
@@ -554,6 +576,70 @@ def test_avatar_remove_clears_storage_and_metadata():
     }
     assert not storage.get_storage().exists(key)
     assert main.one("SELECT 1 FROM candidate_avatars WHERE user_id=?", (uid,)) is None
+
+
+def test_avatar_rejects_excessive_dimensions_before_decode(monkeypatch):
+    import enterprise
+    from fastapi import HTTPException
+
+    class OversizedImage:
+        format = "PNG"
+        width = 12_000
+        height = 12_000
+        loaded = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def load(self):
+            self.loaded = True
+
+    image = OversizedImage()
+    monkeypatch.setattr(Image, "open", lambda *_args, **_kwargs: image)
+    with pytest.raises(HTTPException) as error:
+        enterprise._process_candidate_avatar(b"small compressed image")
+    assert error.value.status_code == 413
+    assert image.loaded is False
+
+
+def test_avatar_storage_cleanup_failures_do_not_misreport_replacement_or_half_delete(monkeypatch):
+    uid, headers = _user("avatar-storage-failure@example.com")
+    cv_document = cv_store.save_document(uid, "cv.txt", CV)
+    uploaded = client.post(
+        "/api/candidate/avatar",
+        files={"file": ("profile.png", _image_bytes("PNG"), "image/png")},
+        headers=headers,
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    old_key = main.one(
+        "SELECT storage_key FROM candidate_avatars WHERE user_id=?", (uid,)
+    )["storage_key"]
+    backend = storage.get_storage()
+
+    def fail_delete(_key):
+        raise storage.StorageError("simulated storage outage")
+
+    monkeypatch.setattr(backend, "delete", fail_delete)
+    replacement = client.post(
+        "/api/candidate/avatar",
+        files={"file": ("replacement.png", _image_bytes("PNG"), "image/png")},
+        headers=headers,
+    )
+    assert replacement.status_code == 200, replacement.text
+    new_key = main.one(
+        "SELECT storage_key FROM candidate_avatars WHERE user_id=?", (uid,)
+    )["storage_key"]
+    assert new_key != old_key
+
+    deletion = client.delete("/api/me", headers=headers)
+    assert deletion.status_code == 503
+    assert main.one("SELECT 1 FROM users WHERE id=?", (uid,)) is not None
+    assert main.one("SELECT 1 FROM candidate_avatars WHERE user_id=?", (uid,)) is not None
+    assert main.one("SELECT 1 FROM cv_documents WHERE id=?", (cv_document["id"],)) is not None
+    assert storage.get_storage().exists(cv_document["storage_key"])
 
 
 def test_s3_backend_roundtrip(monkeypatch):

@@ -699,6 +699,8 @@ def _process_candidate_avatar(data: bytes) -> bytes:
         with Image.open(io.BytesIO(data)) as opened:
             if opened.format not in {"PNG", "JPEG", "WEBP"}:
                 raise HTTPException(415, "Upload a PNG, JPEG or WebP image")
+            if opened.width * opened.height > 16_000_000:
+                raise HTTPException(413, "Image dimensions too large (max 16 megapixels)")
             opened.load()
             image = ImageOps.exif_transpose(opened)
             if image.mode in {"RGBA", "LA"} or (
@@ -750,8 +752,7 @@ async def upload_candidate_avatar(file: UploadFile = File(...), user=Depends(cur
         try:
             storage.delete(old["storage_key"])
         except StorageError as exc:
-            log.error("Replaced avatar could not be deleted: %s", exc)
-            raise HTTPException(503, "Photo was updated, but the previous photo could not be removed") from exc
+            log.error("Replaced avatar could not be deleted; orphaned key %s: %s", old["storage_key"], exc)
     return {"ok": True, "has_avatar": True, "avatar_updated": updated}
 
 

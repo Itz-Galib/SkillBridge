@@ -493,7 +493,7 @@ function Consent({ lang, onDone }) {
 }
 
 /* ---------- profile: CV -> skills ---------- */
-function Profile({ st, onDone }) {
+function Profile({ st, onDone, onEditProfile }) {
   const t = useT();
   const [text, setText] = useState("");
   const [file, setFile] = useState(null);
@@ -549,18 +549,14 @@ function Profile({ st, onDone }) {
         <div className="card profile-journey-skills">
           <h3>Skills from your profile</h3>
           <p className="note">These skills are claimed until verified. Update your profile to change these.</p>
-          <ul className="skills">
+          <p className="chips">
             {(st.profile_skill_items || []).map((skill, index) => (
-              <li key={`${skill.name}-${index}`}>
-                <label className="check">
-                  <input type="checkbox" checked={skill.id ? sel.includes(skill.id) : true} disabled />
-                  <strong>{skill.name}</strong>
-                  <span className="chip chip-mid">{t("claimed")}</span>
-                  {!skill.id && <span className="chip">Not assessable yet</span>}
-                </label>
-              </li>
+              <span className="chip chip-mid" key={`${skill.name}-${index}`}>
+                {skill.name} · {t("claimed")}
+                {!skill.id && " · Not assessable yet"}
+              </span>
             ))}
-          </ul>
+          </p>
           {!st.profile_skill_items?.length && (
             <p className="muted">No skills are listed yet. Add them to your profile to begin.</p>
           )}
@@ -569,10 +565,9 @@ function Profile({ st, onDone }) {
               Not assessable yet: {st.not_assessable_yet.join(", ")}. These skills remain in your profile.
             </p>
           )}
-          <button className="btn" onClick={confirm} disabled={busy || !sel.length}>
-            {busy ? "Confirming…" : "Confirm skills"}
+          <button className="btn ghost" onClick={onEditProfile}>
+            Edit skills on My profile
           </button>
-          <Err e={err} />
         </div>
       )}
       {st.from_profile && !res ? (
@@ -3081,6 +3076,7 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
                 <ProfileJourneyRouter
                   st={st}
                   refresh={refresh}
+                  onEditProfile={() => go("profile")}
                   tick={tick}
                   setTick={setTick}
                   done={done}
@@ -3161,12 +3157,13 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
     </div>
   );
 }
-function ProfileJourneyRouter({ st, refresh, tick, setTick, done, v, setV }) {
+function ProfileJourneyRouter({ st, refresh, onEditProfile, tick, setTick, done, v, setV }) {
   return (
     <>
       {v === "profile" && (
         <Profile
           st={st}
+          onEditProfile={onEditProfile}
           onDone={async () => {
             await refresh();
             setV("gap");
