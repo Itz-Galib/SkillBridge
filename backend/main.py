@@ -527,6 +527,9 @@ class Heartbeat(BaseModel):
     seq: int = Field(ge=1)
     client_ts: Optional[float] = None
 
+class BeaconEv(Ev):
+    authorization: str = Field(min_length=20, max_length=4096)
+
 
 def _request_fingerprint(request):
     return (request.client.host if request.client else "", request.headers.get("user-agent", "")[:300])
@@ -565,6 +568,20 @@ def _accept_sequence(att, seq, aid, request, event_type, client_ts=None, metadat
 
 @app.post("/api/attempts/{aid}/event")
 def event(aid: str, b: Ev, request: Request, u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    if b.type not in EVENT_TYPES:
+        raise HTTPException(422, "unsupported_event_type")
+    att["_provided_session"] = b.session_id
+    now = _accept_sequence(att, b.seq, aid, request, b.type, b.client_ts, b.metadata)
+    return {"ok": True, "server_ts": now, "seq": b.seq}
+
+
+@app.post("/api/attempts/{aid}/event/beacon")
+def event_beacon(aid: str, b: BeaconEv, request: Request):
+    # sendBeacon cannot set Authorization headers; accept the same signed bearer token in its JSON body.
+    u = current_user("Bearer " + b.authorization)
     att = get_att(aid, u["id"])
     if att["status"] != "active":
         raise HTTPException(409, "attempt_not_active")
