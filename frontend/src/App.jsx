@@ -289,17 +289,23 @@ function ExamRun({ initial, onFinished, screenStream }) {
   const sessionId = useRef(initial.session_id);
   const sequence = useRef(initial.last_event_seq || 0);
   const pendingEvents = useRef([]);
+  const flushPromise = useRef(null);
 
   const flushEvents = useCallback(async () => {
-    while (pendingEvents.current.length) {
-      const item = pendingEvents.current[0];
-      try {
-        await api(`/attempts/${aid}/event`, { method: "POST", body: item });
-        pendingEvents.current.shift();
-      } catch {
-        break;
+    if (flushPromise.current) return flushPromise.current;
+    flushPromise.current = (async () => {
+      while (pendingEvents.current.length) {
+        const item = pendingEvents.current[0];
+        try {
+          await api(`/attempts/${aid}/event`, { method: "POST", body: item });
+          pendingEvents.current.shift();
+        } catch {
+          break;
+        }
       }
-    }
+    })();
+    try { await flushPromise.current; }
+    finally { flushPromise.current = null; }
   }, [aid]);
 
   const report = useCallback((type, metadata = {}) => {
