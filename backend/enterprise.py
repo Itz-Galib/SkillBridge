@@ -4,6 +4,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from main import current_user, one, allr, run, audit
+from content import QBYID
 
 router = APIRouter(tags=["hiring"])
 
