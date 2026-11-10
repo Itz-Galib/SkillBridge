@@ -1002,10 +1002,45 @@ def admin_integrity_attempt_detail(attempt_id: str, user=Depends(current_user)):
         "SELECT id,type,ts AS server_ts,question_id,question_index FROM events WHERE attempt_id=? ORDER BY ts,id",
         (attempt_id,)
     )]
+    interval_pairs = {"tab_hidden": "tab_visible", "blur": "focus", "fullscreen_exit": "fullscreen_enter", "screen_share_stopped": "screen_share_started", "screen_share_unavailable": "screen_share_started"}
+    pending = {}
+    now_ts = time.time()
     for event in item["events"]:
         question = QBYID.get(event.get("question_id"))
         event["question"] = question.get("prompt") if question else None
         event["elapsed_seconds"] = round(max(0, float(event["server_ts"]) - float(item["started"])), 1)
+        event["duration_seconds"] = None
+        event["duration_status"] = "instant" if event["type"] in {"copy", "cut", "paste"} else None
+        if event["type"] in interval_pairs:
+            pending.setdefault(event["type"], []).append(event)
+        else:
+            for start_type, end_type in interval_pairs.items():
+                starts = pending.get(start_type) or []
+                if end_type == event["type"] and starts:
+                    start_event = starts.pop(0)
+                    duration = round(max(0, float(event["server_ts"]) - float(start_event["server_ts"])), 1)
+                    start_event["duration_seconds"] = duration
+                    start_event["duration_status"] = "measured"
+                    event["duration_seconds"] = duration
+                    event["duration_status"] = "interval_end"
+                    break
+    for starts in pending.values():
+        for start_event in starts:
+            if item["status"] == "active":
+                start_event["duration_seconds"] = round(max(0, now_ts - float(start_event["server_ts"])), 1)
+                start_event["duration_status"] = "ongoing"
+            else:
+                start_event["duration_status"] = "no_end_event"
+    for answer in item["answers"]:
+        question_data = QBYID.get(answer.get("question_id")) or {}
+        if answer.get("type") == "mcq":
+            try:
+                option_index = int(answer.get("answer", ""))
+                options = question_data.get("options") or []
+                if 0 <= option_index < len(options):
+                    answer["answer"] = options[option_index]
+            except (TypeError, ValueError):
+                pass
     item["integrity"] = item["result"] or {}
     audit(user["id"], "integrity_attempt_viewed", attempt_id)
     return item
