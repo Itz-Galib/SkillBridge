@@ -271,8 +271,120 @@ function Gap({ onStart, refreshKey }) {
   );
 }
 
+/* ---------- local-only AI proctoring ---------- */
+function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report }) {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [status, setStatus] = useState("Loading local vision models…");
+  const [detections, setDetections] = useState({ face: "Starting", objects: "Starting" });
+  const lastAlert = useRef({});
+  const modelRef = useRef(null);
+
+  const evidence = useCallback(async (type, confidence) => {
+    const now = Date.now();
+    if (now - (lastAlert.current[type] || 0) < 15000) return;
+    lastAlert.current[type] = now;
+    report(type, { confidence: Number(confidence.toFixed(2)), model: "mediapipe", local_only: true });
+    try {
+      const video = videoRef.current, canvas = canvasRef.current;
+      if (!video || !canvas || video.readyState < 2) return;
+      canvas.width = 480; canvas.height = Math.round(480 * video.videoHeight / video.videoWidth);
+      const ctx = canvas.getContext("2d", { alpha: false });
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.55));
+      if (!blob || blob.size > 180 * 1024) return;
+      const form = new FormData();
+      form.append("session_id", sessionId.current);
+      form.append("seq", String(nextSeq()));
+      form.append("event_type", type);
+      form.append("confidence", String(confidence));
+      form.append("image", blob, "evidence.jpg");
+      await api(`/attempts/${aid}/evidence`, { method: "POST", form });
+    } catch {
+      // Detection log remains in the event queue even if evidence upload fails.
+    }
+  }, [aid, nextSeq, report, sessionId]);
+
+  useEffect(() => {
+    let cancelled = false, timer = null;
+    const video = videoRef.current;
+    if (!cameraStream || !video) return;
+    video.srcObject = cameraStream;
+    video.play().catch(() => {});
+    const load = async () => {
+      try {
+        const vision = await import("@mediapipe/tasks-vision");
+        const files = await vision.FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
+        );
+        const face = await vision.FaceLandmarker.createFromOptions(files, {
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
+          runningMode: "VIDEO", numFaces: 3
+        });
+        let objects = null;
+        try {
+          objects = await vision.ObjectDetector.createFromOptions(files, {
+            baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/1.tflite", delegate: "GPU" },
+            runningMode: "VIDEO", scoreThreshold: 0.55, maxResults: 10
+          });
+        } catch { /* Face/gaze checks can still run when object model fails. */ }
+        if (cancelled) { face.close(); objects?.close(); return; }
+        modelRef.current = { face, objects };
+        setStatus(objects ? "Local AI monitoring active" : "Face analysis active; object model unavailable");
+        let lastVideoTime = -1;
+        const loop = () => {
+          if (cancelled) return;
+          if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+            lastVideoTime = video.currentTime;
+            const now = performance.now();
+            const faces = face.detectForVideo(video, now).faceLandmarks || [];
+            const count = faces.length;
+            setDetections(old => ({ ...old, face: count === 0 ? "No face" : count > 1 ? `${count} faces` : "One face" }));
+            if (count === 0) evidence("ai_no_face", 0.8);
+            if (count > 1) evidence("ai_multiple_faces", Math.min(0.99, 0.65 + count * 0.08));
+            if (count === 1) {
+              const points = faces[0];
+              const nose = points[1], leftEye = points[33], rightEye = points[263];
+              if (nose && leftEye && rightEye) {
+                const center = (leftEye.x + rightEye.x) / 2;
+                const offset = Math.abs(nose.x - center);
+                if (offset > 0.075 || nose.y < Math.min(leftEye.y, rightEye.y) - 0.04 || nose.y > Math.max(leftEye.y, rightEye.y) + 0.11)
+                  evidence("ai_gaze_away", Math.min(0.95, 0.55 + offset));
+              }
+            }
+            if (objects) {
+              const found = objects.detectForVideo(video, now).detections || [];
+              const phone = found.find(d => (d.categories || []).some(c => ["cell phone", "mobile phone", "phone"].includes((c.categoryName || "").toLowerCase())));
+              setDetections(old => ({ ...old, objects: phone ? "Possible phone" : "No phone detected" }));
+              if (phone) evidence("ai_phone_detected", phone.categories?.[0]?.score || 0.6);
+            } else setDetections(old => ({ ...old, objects: "Unavailable" }));
+          }
+          timer = requestAnimationFrame(loop);
+        };
+        loop();
+      } catch (e) {
+        if (!cancelled) setStatus("Local AI unavailable: " + (e?.message || "model load failed"));
+        report("ai_model_unavailable", { reason: "model_load_failed", local_only: true });
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+      if (timer) cancelAnimationFrame(timer);
+      modelRef.current?.face?.close();
+      modelRef.current?.objects?.close();
+      modelRef.current = null;
+    };
+  }, [cameraStream, evidence, report]);
+  return <div className="ai-proctor-panel">
+    <video ref={videoRef} muted playsInline aria-label="Local webcam analysis" />
+    <canvas ref={canvasRef} hidden />
+    <div><strong>On-device AI</strong><span>{status}</span><small>Face: {detections.face} · Object: {detections.objects}</small></div>
+  </div>;
+}
+
 /* ---------- exam ---------- */
-function ExamRun({ initial, onFinished, screenStream }) {
+function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
   const t = useT();
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState("");
@@ -289,7 +401,7 @@ function ExamRun({ initial, onFinished, screenStream }) {
   const sessionId = useRef(initial.session_id);
   const sequence = useRef(initial.last_event_seq || 0);
   const pendingEvents = useRef([]);
-  const flushPromise = useRef(null);
+  const flushPromise = useRef(null);\n  const nextSeq = useCallback(() => ++sequence.current, []);
 
   const flushEvents = useCallback(async () => {
     if (flushPromise.current) return flushPromise.current;
@@ -482,7 +594,7 @@ function ExamRun({ initial, onFinished, screenStream }) {
         <progress value={q.index} max={q.total} />
         <span className={"timer" + (left < 120 ? " low" : "")}>{t("timeLeft")}: {fmt(left)}</span>
       </div>
-      <div className={"exam-integrity-banner" + (shareActive ? " active" : " warning")} role="status">
+      <LocalProctor cameraStream={cameraStream} aid={aid} sessionId={sessionId} nextSeq={nextSeq} report={report} />\n      <div className={"exam-integrity-banner" + (shareActive ? " active" : " warning")} role="status">
         <strong>{shareActive ? t("shareActive") : t("shareStopped")}</strong>
         <span>{t("sharePrivacy")}</span>
         {!shareActive && <button type="button" className="btn sm" onClick={restartShare}>{t("restartShare")}</button>}
@@ -595,7 +707,7 @@ function Uplift() {
 function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const t = useT();
   const [active, setActive] = useState(null);
-  const [screenStream, setScreenStream] = useState(null);
+  const [screenStream, setScreenStream] = useState(null);\n  const [cameraStream, setCameraStream] = useState(null);\n  const [cameraReady, setCameraReady] = useState(false);
   const [shareReady, setShareReady] = useState(false);
   const [fullscreenReady, setFullscreenReady] = useState(Boolean(document.fullscreenElement));
   const [setupBusy, setSetupBusy] = useState(false);
@@ -626,7 +738,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     return () => track.removeEventListener("ended", syncShare);
   }, [screenStream]);
 
-  // Stop a pending screen capture if the candidate leaves the setup screen.
+  // Stop pending camera capture if setup is abandoned.\n  useEffect(() => () => { cameraStream?.getTracks().forEach(track => track.stop()); }, [cameraStream]);\n\n  const enableCamera = async () => {\n    setErr(null);\n    try {\n      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access is not supported in this browser.");\n      const media = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });\n      setCameraStream(media); setCameraReady(true);\n    } catch (e) { setCameraReady(false); setErr(new Error(e?.name === "NotAllowedError" ? "Camera permission is required for this assessment." : e.message || "Unable to start camera.")); }\n  };\n\n  // Stop a pending screen capture if the candidate leaves the setup screen.
   useEffect(() => () => {
     screenStream?.getTracks().forEach((track) => track.stop());
   }, [screenStream]);
@@ -670,11 +782,11 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     const fullscreen = Boolean(document.fullscreenElement);
     setShareReady(Boolean(sharing));
     setFullscreenReady(fullscreen);
-    if (mobileDevice || !browserSupported || !navigator.onLine || !sharing || !fullscreen) {
+    if (mobileDevice || !browserSupported || !navigator.onLine || !sharing || !fullscreen || !cameraReady || !cameraStream?.getVideoTracks().some(track => track.readyState === "live")) {
       setErr(new Error(mobileDevice ? "This assessment requires a supported desktop browser." :
         !browserSupported ? "Your browser does not support the required screen-sharing and full-screen features." :
         !navigator.onLine ? "A network connection is required to begin the assessment." :
-        !sharing ? t("shareRequired") : t("fullscreenRequired")));
+        !sharing ? t("shareRequired") : !fullscreen ? t("fullscreenRequired") : "Please enable your webcam before starting."));
       return;
     }
     setSetupBusy(true);
@@ -695,7 +807,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     } finally {
       setSetupBusy(false);
     }
-  }, [refresh, screenStream, t]);
+  }, [refresh, screenStream, cameraStream, cameraReady, t]);
   const finished = async () => {
     screenStream?.getTracks().forEach((track) => track.stop());
     setScreenStream(null);
@@ -703,7 +815,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     await refresh();
   };
 
-  if (active) return <ExamRun initial={active} screenStream={screenStream} onFinished={finished} />;
+  if (active) return <ExamRun initial={active} screenStream={screenStream} cameraStream={cameraStream} onFinished={finished} />;
   if (act && (act.kind === kind)) return (
     <section className="card narrow">
       <h2>{t("resume")}</h2>
@@ -742,7 +854,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
         <p className="muted">{t("examSetupHint")}</p>
       </div>
       <Err e={err} />
-      <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady}>
+      <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady || !cameraReady}>
         {setupBusy ? t("saving") : t("startTest")}
       </button>
     </section>
