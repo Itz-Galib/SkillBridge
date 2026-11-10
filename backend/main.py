@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, name
 CREATE TABLE IF NOT EXISTS consents(id INTEGER PRIMARY KEY, user_id INT, version TEXT, lang TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY, redacted TEXT, redaction TEXT, extracted TEXT, source TEXT, confirmed TEXT);
 CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, user_id INT, kind TEXT, seed INT, status TEXT, state TEXT, started REAL, finished REAL, result TEXT, appeal TEXT);
-CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, attempt_id TEXT, type TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, attempt_id TEXT, type TEXT, ts REAL, question_id TEXT, question_index INTEGER);
 CREATE TABLE IF NOT EXISTS passports(id TEXT PRIMARY KEY, user_id INT, payload TEXT, signature TEXT, created REAL, revoked INT DEFAULT 0);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL, actor INT, action TEXT, target TEXT);
 CREATE TABLE IF NOT EXISTS user_roles(user_id INTEGER PRIMARY KEY, role TEXT NOT NULL DEFAULT 'candidate');
@@ -95,6 +95,15 @@ def init_db():
             schema = schema.replace("events(id INTEGER PRIMARY KEY", "events(id BIGSERIAL PRIMARY KEY")
             schema = schema.replace("audit(id INTEGER PRIMARY KEY", "audit(id BIGSERIAL PRIMARY KEY")
         c.executescript(schema)
+        # Additive migration for existing databases.
+        if DATABASE_URL:
+            event_columns = {row["column_name"] for row in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='events'").fetchall()}
+        else:
+            event_columns = {row["name"] for row in c.execute("PRAGMA table_info(events)").fetchall()}
+        if "question_id" not in event_columns:
+            c.execute("ALTER TABLE events ADD COLUMN question_id TEXT")
+        if "question_index" not in event_columns:
+            c.execute("ALTER TABLE events ADD COLUMN question_index INTEGER")
 
 
 def one(sql, args=()):
@@ -445,7 +454,10 @@ def answer(aid: str, b: Ans, u=Depends(current_user)):
         finalize(att, st); return view(get_att(aid, u["id"]))
     if b.question_id != st["current"]: raise HTTPException(409, "Question mismatch")
     q = QBYID[st["current"]]
-    E.record_answer(st, q, b.answer, time.time() - (st["served_at"] or time.time()))
+    submitted_at = time.time()
+    served_at = float(st.get("served_at") or submitted_at)
+    E.record_answer(st, q, b.answer, submitted_at - served_at, answer_text=b.answer,
+                    started_at=served_at, submitted_at=submitted_at)
     if st["index"] >= len(E.SLOTS):
         finalize(att, st)
     else:
@@ -479,7 +491,9 @@ def event(aid: str, b: Ev, u=Depends(current_user)):
         "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
         "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
     }:
-        run("INSERT INTO events(attempt_id,type,ts) VALUES (?,?,?)", (aid, b.type, time.time()))
+        st = json.loads(att["state"])
+        run("INSERT INTO events(attempt_id,type,ts,question_id,question_index) VALUES (?,?,?,?,?)",
+            (aid, b.type, time.time(), st.get("current"), st.get("index")))
     return {"ok": True}
 
 
