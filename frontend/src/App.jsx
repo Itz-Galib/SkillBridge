@@ -456,14 +456,14 @@ function ExamRun({ initial, onFinished, screenStream }) {
     if (!shareActive || !fullscreenActive) { setShareNotice(!shareActive ? t("shareRequired") : t("fullscreenRequired")); return; }
     setBusy(true); setErr(null);
     try {
-      const r = await api(`/attempts/${aid}/answer`, { method: "POST", body: { question_id: q.id, answer: String(ans) } });
+      const r = await api(`/attempts/${aid}/answer`, { method: "POST", body: { question_id: q.id, answer: String(ans), session_id: sessionId.current } });
       setV(r); setLeft(r.remaining);
       if (r.status === "done") onFinished(aid);
     } catch (e) { setErr(e); } finally { setBusy(false); }
   };
   const runSql = async () => {
     if (!shareActive) { setShareNotice(t("shareRequired")); return; }
-    try { setOut(await api(`/attempts/${aid}/sql-run`, { method: "POST", body: { sql: ans } })); } catch (e) { setErr(e); }
+    try { setOut(await api(`/attempts/${aid}/sql-run`, { method: "POST", body: { sql: ans, session_id: sessionId.current } })); } catch (e) { setErr(e); }
   };
 
   if (!q) return <p>{t("loading")}</p>;
