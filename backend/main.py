@@ -382,7 +382,7 @@ def seen_before(uid):
 def view(att):
     st = json.loads(att["state"])
     remaining = max(0, int(att["started"] + E.TEST_SECONDS - time.time()))
-    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "answered": len(st["answers"]), "total": len(E.SLOTS), "session_id": att.get("session_id") if isinstance(att, dict) else att["session_id"]}
+    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "answered": len(st["answers"]), "total": len(E.SLOTS), "session_id": att.get("session_id"), "last_event_seq": int(att.get("last_event_seq") or 0)}
     if att["status"] == "active" and st["current"]:
         out["question"] = E.public_question(QBYID[st["current"]], st)
     return out
@@ -432,11 +432,12 @@ def start_attempt(u=Depends(current_user)):
         if time.time() > act["started"] + E.TEST_SECONDS + E.GRACE:
             finalize(dict(act), json.loads(act["state"]))
         else:
-            if not act["session_id"]:
-                sid = secrets.token_urlsafe(32)
-                run("UPDATE attempts SET session_id=?,last_heartbeat=? WHERE id=?", (sid, time.time(), act["id"]))
-                act = get_att(act["id"], u["id"])
-            return view(dict(act))                       # resume after a dropped connection
+            # A fresh page/session takes ownership; the previous tab is rejected from this point.
+            sid = secrets.token_urlsafe(32)
+            now = time.time()
+            run("UPDATE attempts SET session_id=?,last_event_seq=0,last_heartbeat=? WHERE id=?", (sid, now, act["id"]))
+            act = get_att(act["id"], u["id"])
+            return view(dict(act))                       # resume while invalidating any older tab
     done = allr("SELECT finished FROM attempts WHERE user_id=? AND status='done' ORDER BY finished DESC", (u["id"],))
     if len([d for d in done if d["finished"] > time.time() - 90 * 86400]) >= MAX_ATTEMPTS_90D:
         raise HTTPException(429, "attempt_cap")
