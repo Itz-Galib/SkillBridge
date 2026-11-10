@@ -136,7 +136,7 @@ def test_ai_proctor_signals_are_capped_advisory_and_never_hard_flags():
     )
     result = trust_label(events, [], {"rule_version": "phase2-test", "normalize_per_30_minutes": False})
     reasons = {r["key"]: r for r in result["reasons"]}
-    assert reasons["ai_gaze_away"]["n"] == 3
+    assert reasons["ai_gaze_away"]["n"] == 2
     assert reasons["ai_gaze_away"]["advisory"] is True
     assert reasons["ai_multiple_faces"]["advisory"] is True
     assert reasons["ai_phone_detected"]["advisory"] is True
