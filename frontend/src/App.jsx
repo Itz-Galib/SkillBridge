@@ -1298,14 +1298,12 @@ function HiringWorkspace({ role }) {
   const setJob = (key,value) => setJobForm(v=>({...v,[key]:value}));
   const editJob = (j) => {
     const d=j.details||{};
-    setJobForm({title:j.title,description:j.description,location:j.location,employment_type:j.employment_type,work_mode:d.work_mode||"Remote",experience_level:d.experience_level||"Any",salary_min:d.salary_min??"",salary_max:d.salary_max??"",salary_currency:d.salary_currency||"BDT",deadline:d.deadline||"",required_skills:(d.required_skills||j.skills||[]).join(", "),preferred_skills:(d.preferred_skills||[]).join(", "),eligibility:d.eligibility||"",hard_requirements:(d.hard_requirements||[]).join("
-")});
+    setJobForm({title:j.title,description:j.description,location:j.location,employment_type:j.employment_type,work_mode:d.work_mode||"Remote",experience_level:d.experience_level||"Any",salary_min:d.salary_min??"",salary_max:d.salary_max??"",salary_currency:d.salary_currency||"BDT",deadline:d.deadline||"",required_skills:(d.required_skills||j.skills||[]).join(", "),preferred_skills:(d.preferred_skills||[]).join(", "),eligibility:d.eligibility||"",hard_requirements:(d.hard_requirements||[]).join("\n")});
     setJobEditId(j.id); setPage("jobs");
   };
   const submitJob = async (e) => {
     e.preventDefault();
-    const payload={...jobForm,salary_min:jobForm.salary_min===""?null:Number(jobForm.salary_min),salary_max:jobForm.salary_max===""?null:Number(jobForm.salary_max),required_skills:jobForm.required_skills.split(",").map(x=>x.trim()).filter(Boolean),preferred_skills:jobForm.preferred_skills.split(",").map(x=>x.trim()).filter(Boolean),hard_requirements:jobForm.hard_requirements.split("
-").map(x=>x.trim()).filter(Boolean)};
+    const payload={...jobForm,salary_min:jobForm.salary_min===""?null:Number(jobForm.salary_min),salary_max:jobForm.salary_max===""?null:Number(jobForm.salary_max),required_skills:jobForm.required_skills.split(",").map(x=>x.trim()).filter(Boolean),preferred_skills:jobForm.preferred_skills.split(",").map(x=>x.trim()).filter(Boolean),hard_requirements:jobForm.hard_requirements.split("\n").map(x=>x.trim()).filter(Boolean)};
     try {
       if(jobEditId) await api("/company/jobs/"+jobEditId,{method:"PATCH",body:payload});
       else await api("/company/jobs",{method:"POST",body:payload});
