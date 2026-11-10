@@ -323,8 +323,11 @@ function ExamRun({ initial, onFinished, screenStream }) {
       if (!active) {
         report("fullscreen_exit");
         setIntegrityNotice(t("fullscreenWarning"));
+      } else {
+        report("fullscreen_enter");
       }
     };
+    const focus = () => report("focus");
     document.addEventListener("copy", clipboard, true);
     document.addEventListener("cut", clipboard, true);
     document.addEventListener("paste", clipboard, true);
@@ -333,6 +336,7 @@ function ExamRun({ initial, onFinished, screenStream }) {
     document.addEventListener("visibilitychange", visibility);
     document.addEventListener("fullscreenchange", fullscreen);
     window.addEventListener("blur", blur);
+    window.addEventListener("focus", focus);
     return () => {
       document.removeEventListener("copy", clipboard, true);
       document.removeEventListener("cut", clipboard, true);
@@ -342,6 +346,7 @@ function ExamRun({ initial, onFinished, screenStream }) {
       document.removeEventListener("visibilitychange", visibility);
       document.removeEventListener("fullscreenchange", fullscreen);
       window.removeEventListener("blur", blur);
+      window.removeEventListener("focus", focus);
     };
   }, [report]);
 
