@@ -864,6 +864,13 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
           </button>
         </div>
         <div className="row">
+          <span>{cameraReady ? "✓" : "3."} Enable webcam for local AI analysis</span>
+          <button type="button" className="btn ghost sm" onClick={enableCamera} disabled={setupBusy}>
+            {cameraReady ? "Camera ready" : "Enable camera"}
+          </button>
+        </div>
+        <p className="muted">The webcam is analyzed in this browser. Only alert logs and limited JPEG evidence snapshots may be uploaded; no continuous video or audio is recorded.</p>
+        <div className="row">
           <span>{fullscreenReady ? "✓" : "2."} {t("fullscreenSetupStep")}</span>
           <button type="button" className="btn ghost sm" onClick={enableFullscreen} disabled={setupBusy}>
             {fullscreenReady ? t("fullscreenActive") : t("restartFullscreen")}
