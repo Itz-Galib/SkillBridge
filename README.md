@@ -79,7 +79,7 @@ The candidate Verify flow now requests browser screen sharing and full-screen mo
 
 During an active attempt, the frontend blocks ordinary copy, cut, paste, keyboard clipboard shortcuts and the context menu, and records copy/cut/paste attempts, window blur, hidden-tab events, full-screen exits and screen-sharing interruptions. The backend stores event counts with the attempt and includes them in the advisory trust label. Integrity signals do not change the score or automatically fail a candidate; the existing appeal and human-review approach remains.
 
-**Browser-enforced limits:** browsers do not let a website silently start screen sharing. The candidate must approve the browser prompt, and the browser may allow sharing a single tab/window instead of the entire desktop. A web page cannot reliably prevent screenshots, another device, OS-level shortcuts, developer tools, browser extensions or a determined user from bypassing client-side controls. The API also checks that the latest reported screen-sharing event is active before accepting an answer or running SQL. This is a consistency check, not cryptographic proof: browser telemetry is client-reported and a determined user can forge requests. These controls are deterrents and review signals, not a secure remote-proctoring system. No camera or microphone is requested, and the screen stream is not recorded or uploaded by this application. Use HTTPS (or localhost for development) and test in supported desktop browsers.
+**Browser-enforced limits:** browsers do not let a website silently start screen sharing. The candidate must approve the browser prompt, and the browser may allow sharing a single tab/window instead of the entire desktop. A web page cannot reliably prevent screenshots, another device, OS-level shortcuts, developer tools, browser extensions or a determined user from bypassing client-side controls. The API also checks that the latest reported screen-sharing event is active before accepting an answer or running SQL. This is a consistency check, not cryptographic proof: browser telemetry is client-reported and a determined user can forge requests. These controls are deterrents and review signals, not a secure remote-proctoring system. Phase 2 adds an optional-permission webcam stream for on-device AI analysis; it is not compared with the profile photo. Webcam frames are not continuously uploaded or recorded. Only limited JPEG snapshots associated with selected AI alerts may be uploaded. No microphone audio is requested or stored. Use HTTPS (or localhost for development) and test in supported desktop browsers.
 
 ## Phase 1 exam-integrity update
 
@@ -95,9 +95,27 @@ The Phase 1 implementation on `feature/exam-integrity-monitoring` now includes:
 - Clipboard actions are blocked outside the SQL editor; ordinary copy/cut/paste remains available inside the editor. Browser telemetry remains advisory.
 - Versioned, explainable trust rules in `backend/engine.py`, with configurable-in-code weights, incident grouping, duration treatment and caps. Integrity points never alter technical scores or automatically fail a candidate.
 
-**Limitations:** A browser cannot prove that the user is not using another device, cannot reliably detect every form of tampering, and does not expose the selected share surface consistently in every browser. An unknown surface is rejected rather than assumed to be a monitor. The application does not record or upload screen video and does not request camera or microphone access. These controls improve observability but are not a secure remote-proctoring guarantee.
+**Limitations:** A browser cannot prove that the user is not using another device, cannot reliably detect every form of tampering, and does not expose the selected share surface consistently in every browser. An unknown surface is rejected rather than assumed to be a monitor. The application does not record or upload continuous screen video or microphone audio. Phase 2 adds local webcam inference and limited alert snapshots; see the Phase 2 section below. These controls improve observability but are not a secure remote-proctoring guarantee.
 
 **Verification status:** The changes are committed to this feature branch. They still need to be run through the project's backend test suite, frontend production build, and manual multi-browser/offline testing before being treated as production-ready.
+## Phase 2: browser-local AI monitoring
+
+On `feature/exam-integrity-monitoring`, Phase 2 adds a browser-side MediaPipe Tasks Vision integration:
+
+- The candidate explicitly enables the webcam through the browser permission prompt. No profile-photo comparison or face identity verification is performed.
+- Face Landmarker runs locally in the browser and estimates face presence, multiple visible faces and a rough head/gaze direction signal.
+- MediaPipe Object Detector attempts to identify a phone in the webcam view. If that model cannot load, face analysis continues and the UI reports the object detector as unavailable.
+- Detection runs against the live webcam stream in the browser. Raw frames are not sent to the backend as a stream and no camera video or microphone audio is recorded.
+- When a supported alert triggers, the browser creates a small JPEG snapshot (maximum 180 KB) and sends it with a short event record. Uploads are throttled per alert type, and the API limits evidence to 20 snapshots per attempt.
+- Snapshots are stored outside the event JSON in the `exam_evidence` table, with a configurable expiry. `EVIDENCE_RETENTION_DAYS` defaults to 30 and is clamped to 1–90 days; an hourly cleanup task deletes expired snapshots.
+- Admin assessment review includes the AI event timeline and available evidence snapshots. AI signals use low, capped advisory trust weights; they are not hard flags, cannot automatically invalidate an attempt, and do not change technical scores.
+
+**Interpretation and limitations:** A single webcam view cannot reliably prove gaze intent, detect every phone, or establish that another person is helping. Head pose is only a rough gaze proxy. Lighting, camera quality, occlusion, model download failure and device performance can affect results. The object model may be unavailable in some browsers or networks. An alert should prompt human review, not an automatic penalty. No microphone access, voice analysis, continuous webcam recording, or live-screen AI classifier is implemented in this phase. The screen-share stream remains a browser-enforced share-status requirement and is not uploaded or analyzed frame-by-frame.
+
+**Deployment:** The frontend downloads the MediaPipe JavaScript package and model assets at runtime. A production deployment should pin and self-host reviewed model assets, verify model licences and hashes, test GPU/CPU fallback, and configure HTTPS. Evidence images are sensitive personal data; disclose the collection and retention period before enabling this feature in a real exam.
+
+**Verification status:** Source changes and a focused trust-scoring unit test have been committed. Backend tests, Vite build, real webcam inference, model asset loading, Postgres migration and end-to-end evidence upload have not yet been run in this environment.
+ 
 ## What is real vs. mock (honest list)
 | Area | R0 status |
 |---|---|
