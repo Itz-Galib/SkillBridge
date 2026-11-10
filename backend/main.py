@@ -623,8 +623,9 @@ async def upload_exam_evidence(aid: str, request: Request, session_id: str = For
                                  {"confidence": round(confidence, 3), "model": "mediapipe_tasks_vision", "local_only": True})
     evidence_id = uuid.uuid4().hex
     expires = server_ts + EVIDENCE_RETENTION_DAYS * 86400
+    event_row = one("SELECT id FROM events WHERE attempt_id=? AND seq=? ORDER BY id DESC LIMIT 1", (aid, seq))
     run("INSERT INTO exam_evidence(id,attempt_id,event_id,captured_at,mime_type,image_data,size_bytes,expires_at) VALUES (?,?,?,?,?,?,?,?)",
-        (evidence_id, aid, None, server_ts, "image/jpeg", payload, len(payload), expires))
+        (evidence_id, aid, event_row["id"] if event_row else None, server_ts, "image/jpeg", payload, len(payload), expires))
     run("DELETE FROM exam_evidence WHERE expires_at<?", (server_ts,))
     return {"ok": True, "evidence_id": evidence_id, "server_ts": server_ts, "size_bytes": len(payload), "retention_days": EVIDENCE_RETENTION_DAYS}
 
