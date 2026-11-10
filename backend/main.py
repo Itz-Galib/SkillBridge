@@ -5,6 +5,7 @@ from typing import Optional, List
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form, Request
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 COOLDOWN_HOURS = float(os.getenv("RETEST_COOLDOWN_HOURS", "0"))   # spec default is 14 days (336h); 0 for demos
 MAX_ATTEMPTS_90D = int(os.getenv("MAX_ATTEMPTS_90D", "3"))
+EVIDENCE_RETENTION_DAYS = max(1, min(90, int(os.getenv("EVIDENCE_RETENTION_DAYS", "30"))))
+MAX_EVIDENCE_BYTES = 180 * 1024
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-5-5")
 CONSENT_VERSION = "r0-2"
@@ -95,6 +98,7 @@ def init_db():
             schema = schema.replace("events(id INTEGER PRIMARY KEY", "events(id BIGSERIAL PRIMARY KEY")
             schema = schema.replace("audit(id INTEGER PRIMARY KEY", "audit(id BIGSERIAL PRIMARY KEY")
         c.executescript(schema)
+        c.execute("CREATE TABLE IF NOT EXISTS exam_evidence(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, event_id INTEGER, captured_at REAL NOT NULL, mime_type TEXT NOT NULL, image_data BYTEA NOT NULL, size_bytes INTEGER NOT NULL, expires_at REAL NOT NULL)")
         # Additive migration for existing databases.
         if DATABASE_URL:
             event_columns = {row["column_name"] for row in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='events'").fetchall()}
@@ -509,9 +513,9 @@ def sql_run(aid: str, b: SqlRun, u=Depends(current_user)):
 EVENT_TYPES = {
     "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
     "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
-    "fullscreen_enter", "focus", "wrong_share_surface"
+    "fullscreen_enter", "focus", "wrong_share_surface", "ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected", "ai_audio_level", "ai_model_unavailable"
 }
-EVENT_META_KEYS = {"surface", "editor", "reason", "visibility", "supported"}
+EVENT_META_KEYS = {"surface", "editor", "reason", "visibility", "supported", "confidence", "model", "duration_ms", "local_only"}
 
 
 class Ev(BaseModel):
@@ -590,6 +594,48 @@ def event_beacon(aid: str, b: BeaconEv, request: Request):
     att["_provided_session"] = b.session_id
     now = _accept_sequence(att, b.seq, aid, request, b.type, b.client_ts, b.metadata)
     return {"ok": True, "server_ts": now, "seq": b.seq}
+
+
+@app.post("/api/attempts/{aid}/evidence")
+async def upload_exam_evidence(aid: str, request: Request, session_id: str = Form(...), seq: int = Form(...),
+                              event_type: str = Form(...), confidence: float = Form(...),
+                              image: UploadFile = File(...), u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    _check_exam_session(att, session_id)
+    if event_type not in {"ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected"}:
+        raise HTTPException(422, "unsupported_evidence_event")
+    if not 0 <= confidence <= 1:
+        raise HTTPException(422, "invalid_confidence")
+    if image.content_type != "image/jpeg":
+        raise HTTPException(415, "jpeg_evidence_required")
+    payload = await image.read(MAX_EVIDENCE_BYTES + 1)
+    if not payload or len(payload) > MAX_EVIDENCE_BYTES:
+        raise HTTPException(413, "evidence_too_large")
+    if not payload.startswith(bytes([255, 216, 255])):
+        raise HTTPException(415, "invalid_jpeg")
+    count = one("SELECT COUNT(*) AS n FROM exam_evidence WHERE attempt_id=?", (aid,))
+    if count and count["n"] >= 20:
+        raise HTTPException(429, "evidence_limit_reached")
+    att["_provided_session"] = session_id
+    server_ts = _accept_sequence(att, seq, aid, request, event_type, None,
+                                 {"confidence": round(confidence, 3), "model": "mediapipe_tasks_vision", "local_only": True})
+    evidence_id = uuid.uuid4().hex
+    expires = server_ts + EVIDENCE_RETENTION_DAYS * 86400
+    run("INSERT INTO exam_evidence(id,attempt_id,event_id,captured_at,mime_type,image_data,size_bytes,expires_at) VALUES (?,?,?,?,?,?,?,?)",
+        (evidence_id, aid, None, server_ts, "image/jpeg", payload, len(payload), expires))
+    run("DELETE FROM exam_evidence WHERE expires_at<?", (server_ts,))
+    return {"ok": True, "evidence_id": evidence_id, "server_ts": server_ts, "size_bytes": len(payload), "retention_days": EVIDENCE_RETENTION_DAYS}
+
+
+@app.get("/api/attempts/{aid}/evidence/{evidence_id}")
+def get_own_exam_evidence(aid: str, evidence_id: str, u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    row = one("SELECT mime_type,image_data,expires_at FROM exam_evidence WHERE id=? AND attempt_id=?", (evidence_id, aid))
+    if not row or row["expires_at"] < time.time():
+        raise HTTPException(404, "evidence_not_found")
+    return Response(content=bytes(row["image_data"]), media_type=row["mime_type"], headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/attempts/{aid}/heartbeat")
