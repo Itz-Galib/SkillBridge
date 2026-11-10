@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { api, getToken, setToken } from "./api.js";
 import { LangCtx, useT } from "./i18n.js";
 
@@ -286,23 +286,72 @@ function ExamRun({ initial, onFinished, screenStream }) {
   const [shareNotice, setShareNotice] = useState("");
   const [integrityNotice, setIntegrityNotice] = useState("");
   const aid = v.attempt_id;
+  const sessionId = useRef(initial.session_id);
+  const sequence = useRef(initial.last_event_seq || 0);
+  const pendingEvents = useRef([]);
 
-  const report = useCallback((type) => {
-    api(`/attempts/${aid}/event`, { method: "POST", body: { type } }).catch(() => {});
+  const flushEvents = useCallback(async () => {
+    while (pendingEvents.current.length) {
+      const item = pendingEvents.current[0];
+      try {
+        await api(`/attempts/${aid}/event`, { method: "POST", body: item });
+        pendingEvents.current.shift();
+      } catch {
+        break;
+      }
+    }
   }, [aid]);
+
+  const report = useCallback((type, metadata = {}) => {
+    const item = {
+      type, session_id: sessionId.current, seq: ++sequence.current,
+      client_ts: Date.now(), metadata
+    };
+    pendingEvents.current.push(item);
+    flushEvents();
+  }, [flushEvents]);
+
+  useEffect(() => {
+    const heartbeat = async () => {
+      const body = { session_id: sessionId.current, seq: ++sequence.current, client_ts: Date.now() };
+      try {
+        await api(`/attempts/${aid}/heartbeat`, { method: "POST", body });
+        await flushEvents();
+      } catch {
+        // The next successful heartbeat lets the server record the monitoring gap.
+      }
+    };
+    const timer = setInterval(heartbeat, 10000);
+    const flushOnExit = () => {
+      const token = localStorage.getItem("sb_token");
+      for (const item of pendingEvents.current) {
+        fetch(`/api/attempts/${aid}/event`, {
+          method: "POST", keepalive: true,
+          headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+          body: JSON.stringify(item)
+        }).catch(() => {});
+      }
+    };
+    window.addEventListener("pagehide", flushOnExit);
+    return () => { clearInterval(timer); window.removeEventListener("pagehide", flushOnExit); };
+  }, [aid, flushEvents]);
 
   useEffect(() => { const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000); return () => clearInterval(i); }, []);
   useEffect(() => { setAns(""); setOut(null); }, [v.question?.id]);
 
   // Block clipboard actions throughout the exam, not only in the SQL editor.
   useEffect(() => {
+    const inCodeEditor = (target) => Boolean(target?.closest?.("textarea.code, [contenteditable='true']"));
     const clipboard = (event) => {
+      // Candidate may use normal clipboard shortcuts inside the SQL editor.
+      if (inCodeEditor(event.target)) return;
       event.preventDefault();
-      report(event.type);
+      report(event.type, { editor: false });
       setIntegrityNotice(t("clipboardBlocked"));
     };
     const keyboard = (event) => {
       const key = String(event.key || "").toLowerCase();
+      if (inCodeEditor(event.target)) return;
       if ((event.ctrlKey || event.metaKey) && ["c", "v", "x"].includes(key)) {
         event.preventDefault();
         report(key === "c" ? "copy" : key === "x" ? "cut" : "paste");
@@ -386,7 +435,13 @@ function ExamRun({ initial, onFinished, screenStream }) {
     try {
       if (!navigator.mediaDevices?.getDisplayMedia) throw new Error(t("shareUnsupported"));
       const nextStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 5 }, audio: false });
-      await api(`/attempts/${aid}/event`, { method: "POST", body: { type: "screen_share_started" } });
+      const surface = nextStream.getVideoTracks()[0]?.getSettings?.().displaySurface || "unknown";
+      if (surface !== "monitor") {
+        nextStream.getTracks().forEach((track) => track.stop());
+        report("wrong_share_surface", { surface });
+        throw new Error("Please share your entire screen (not a tab or window).");
+      }
+      report("screen_share_started", { surface });
       setStream(nextStream);
       setShareActive(true);
       setShareNotice("");
