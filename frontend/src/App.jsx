@@ -326,10 +326,12 @@ function ExamRun({ initial, onFinished, screenStream }) {
     const flushOnExit = () => {
       const token = localStorage.getItem("sb_token");
       for (const item of pendingEvents.current) {
-        fetch(`/api/attempts/${aid}/event`, {
-          method: "POST", keepalive: true,
-          headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-          body: JSON.stringify(item)
+        const payload = { ...item, authorization: token || "" };
+        const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+        if (navigator.sendBeacon?.(`/api/attempts/${aid}/event/beacon`, blob)) continue;
+        fetch(`/api/attempts/${aid}/event/beacon`, {
+          method: "POST", keepalive: true, headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
         }).catch(() => {});
       }
     };
