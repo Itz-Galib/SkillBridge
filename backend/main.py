@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional, List
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -39,8 +39,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT, salt TEXT, pw_hash TEXT, created REAL);
 CREATE TABLE IF NOT EXISTS consents(id INTEGER PRIMARY KEY, user_id INT, version TEXT, lang TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY, redacted TEXT, redaction TEXT, extracted TEXT, source TEXT, confirmed TEXT);
-CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, user_id INT, kind TEXT, seed INT, status TEXT, state TEXT, started REAL, finished REAL, result TEXT, appeal TEXT);
-CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, attempt_id TEXT, type TEXT, ts REAL, question_id TEXT, question_index INTEGER);
+CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, user_id INT, kind TEXT, seed INT, status TEXT, state TEXT, started REAL, finished REAL, result TEXT, appeal TEXT, session_id TEXT, last_event_seq INTEGER NOT NULL DEFAULT 0, last_heartbeat REAL, session_ip TEXT, session_ua TEXT);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, attempt_id TEXT, type TEXT, ts REAL, question_id TEXT, question_index INTEGER, seq INTEGER, client_ts REAL, metadata TEXT);
 CREATE TABLE IF NOT EXISTS passports(id TEXT PRIMARY KEY, user_id INT, payload TEXT, signature TEXT, created REAL, revoked INT DEFAULT 0);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL, actor INT, action TEXT, target TEXT);
 CREATE TABLE IF NOT EXISTS user_roles(user_id INTEGER PRIMARY KEY, role TEXT NOT NULL DEFAULT 'candidate');
@@ -102,8 +102,22 @@ def init_db():
             event_columns = {row["name"] for row in c.execute("PRAGMA table_info(events)").fetchall()}
         if "question_id" not in event_columns:
             c.execute("ALTER TABLE events ADD COLUMN question_id TEXT")
-        if "question_index" not in event_columns:
-            c.execute("ALTER TABLE events ADD COLUMN question_index INTEGER")
+        for column, definition in {
+            "question_id": "TEXT", "question_index": "INTEGER", "seq": "INTEGER",
+            "client_ts": "REAL", "metadata": "TEXT"
+        }.items():
+            if column not in event_columns:
+                c.execute(f"ALTER TABLE events ADD COLUMN {column} {definition}")
+        if DATABASE_URL:
+            attempt_columns = {row["column_name"] for row in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='attempts'").fetchall()}
+        else:
+            attempt_columns = {row["name"] for row in c.execute("PRAGMA table_info(attempts)").fetchall()}
+        for column, definition in {
+            "session_id": "TEXT", "last_event_seq": "INTEGER NOT NULL DEFAULT 0",
+            "last_heartbeat": "REAL", "session_ip": "TEXT", "session_ua": "TEXT"
+        }.items():
+            if column not in attempt_columns:
+                c.execute(f"ALTER TABLE attempts ADD COLUMN {column} {definition}")
 
 
 def one(sql, args=()):
@@ -368,7 +382,7 @@ def seen_before(uid):
 def view(att):
     st = json.loads(att["state"])
     remaining = max(0, int(att["started"] + E.TEST_SECONDS - time.time()))
-    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "answered": len(st["answers"]), "total": len(E.SLOTS)}
+    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "answered": len(st["answers"]), "total": len(E.SLOTS), "session_id": att.get("session_id") if isinstance(att, dict) else att["session_id"]}
     if att["status"] == "active" and st["current"]:
         out["question"] = E.public_question(QBYID[st["current"]], st)
     return out
@@ -418,6 +432,10 @@ def start_attempt(u=Depends(current_user)):
         if time.time() > act["started"] + E.TEST_SECONDS + E.GRACE:
             finalize(dict(act), json.loads(act["state"]))
         else:
+            if not act["session_id"]:
+                sid = secrets.token_urlsafe(32)
+                run("UPDATE attempts SET session_id=?,last_heartbeat=? WHERE id=?", (sid, time.time(), act["id"]))
+                act = get_att(act["id"], u["id"])
             return view(dict(act))                       # resume after a dropped connection
     done = allr("SELECT finished FROM attempts WHERE user_id=? AND status='done' ORDER BY finished DESC", (u["id"],))
     if len([d for d in done if d["finished"] > time.time() - 90 * 86400]) >= MAX_ATTEMPTS_90D:
@@ -429,8 +447,11 @@ def start_attempt(u=Depends(current_user)):
     q = E.pick_question(st, seen_before(u["id"]))
     st["current"], st["served_at"] = q["id"], time.time()
     aid = uuid.uuid4().hex[:12]
-    run("INSERT INTO attempts(id,user_id,kind,seed,status,state,started) VALUES (?,?,?,?,?,?,?)",
-        (aid, u["id"], "post" if done else "pre", seed, "active", json.dumps(st), time.time()))
+    session_id = secrets.token_urlsafe(32)
+    started_at = time.time()
+    run("INSERT INTO attempts(id,user_id,kind,seed,status,state,started,session_id,last_heartbeat,session_ip,session_ua) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (aid, u["id"], "post" if done else "pre", seed, "active", json.dumps(st), started_at,
+         session_id, started_at, "", ""))
     audit(u["id"], "attempt_start", aid)
     return view(get_att(aid, u["id"]))
 
@@ -480,21 +501,92 @@ def sql_run(aid: str, b: SqlRun, u=Depends(current_user)):
     return E.run_query(att["seed"], b.sql)                  # visible dataset only; scoring uses hidden datasets
 
 
+EVENT_TYPES = {
+    "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
+    "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
+    "fullscreen_enter", "focus", "wrong_share_surface"
+}
+EVENT_META_KEYS = {"surface", "editor", "reason", "visibility", "supported"}
+
+
 class Ev(BaseModel):
     type: str = Field(min_length=1, max_length=40)
+    session_id: str = Field(min_length=20, max_length=100)
+    seq: int = Field(ge=1)
+    client_ts: Optional[float] = None
+    metadata: dict = Field(default_factory=dict)
+
+
+class Heartbeat(BaseModel):
+    session_id: str = Field(min_length=20, max_length=100)
+    seq: int = Field(ge=1)
+    client_ts: Optional[float] = None
+
+
+def _request_fingerprint(request):
+    return (request.client.host if request.client else "", request.headers.get("user-agent", "")[:300])
+
+
+def _check_exam_session(att, session_id):
+    if not att.get("session_id") or not hmac.compare_digest(str(att["session_id"]), str(session_id or "")):
+        raise HTTPException(409, "exam_session_replaced")
+
+
+def _accept_sequence(att, seq, aid, request, event_type, client_ts=None, metadata=None):
+    now = time.time()
+    _check_exam_session(att, att.get("_provided_session"))
+    last = int(att.get("last_event_seq") or 0)
+    if seq <= last:
+        raise HTTPException(409, "event_sequence_replayed")
+    if seq > last + 100:
+        raise HTTPException(409, "event_sequence_gap")
+    recent = one("SELECT COUNT(*) AS n FROM events WHERE attempt_id=? AND ts>?", (aid, now - 60))
+    if recent and recent["n"] >= 180:
+        raise HTTPException(429, "event_rate_limited")
+    ip, ua = _request_fingerprint(request)
+    prior_ip = att.get("session_ip") or ""
+    if prior_ip and ip and prior_ip != ip:
+        run("INSERT INTO events(attempt_id,type,ts,question_id,question_index,seq,client_ts,metadata) VALUES (?,?,?,?,?,?,?,?)",
+            (aid, "network_ip_changed", now, None, None, None, None, json.dumps({"previous_ip_changed": True})))
+    st = json.loads(att["state"])
+    safe_meta = {k: v for k, v in (metadata or {}).items() if k in EVENT_META_KEYS and isinstance(v, (str, int, float, bool))}
+    run("INSERT INTO events(attempt_id,type,ts,question_id,question_index,seq,client_ts,metadata) VALUES (?,?,?,?,?,?,?,?)",
+        (aid, event_type, now, st.get("current"), st.get("index"), seq,
+         float(client_ts) if client_ts is not None else None, json.dumps(safe_meta)))
+    run("UPDATE attempts SET last_event_seq=?,session_ip=?,session_ua=? WHERE id=?", (seq, ip, ua, aid))
+    return now
 
 
 @app.post("/api/attempts/{aid}/event")
-def event(aid: str, b: Ev, u=Depends(current_user)):
+def event(aid: str, b: Ev, request: Request, u=Depends(current_user)):
     att = get_att(aid, u["id"])
-    if att["status"] == "active" and b.type in {
-        "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
-        "screen_share_started", "screen_share_stopped", "screen_share_unavailable", "fullscreen_enter", "focus",
-    }:
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    if b.type not in EVENT_TYPES:
+        raise HTTPException(422, "unsupported_event_type")
+    att["_provided_session"] = b.session_id
+    now = _accept_sequence(att, b.seq, aid, request, b.type, b.client_ts, b.metadata)
+    return {"ok": True, "server_ts": now, "seq": b.seq}
+
+
+@app.post("/api/attempts/{aid}/heartbeat")
+def heartbeat(aid: str, b: Heartbeat, request: Request, u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    _check_exam_session(att, b.session_id)
+    now = time.time()
+    previous = float(att.get("last_heartbeat") or att["started"])
+    gap = now - previous
+    att["_provided_session"] = b.session_id
+    _accept_sequence(att, b.seq, aid, request, "heartbeat", b.client_ts, {})
+    if gap > 30:
         st = json.loads(att["state"])
-        run("INSERT INTO events(attempt_id,type,ts,question_id,question_index) VALUES (?,?,?,?,?)",
-            (aid, b.type, time.time(), st.get("current"), st.get("index")))
-    return {"ok": True}
+        run("INSERT INTO events(attempt_id,type,ts,question_id,question_index,seq,client_ts,metadata) VALUES (?,?,?,?,?,?,?,?)",
+            (aid, "heartbeat_gap", now, st.get("current"), st.get("index"), None, None,
+             json.dumps({"gap_seconds": round(gap, 1), "classification": "monitoring_gap_not_misconduct"})))
+    run("UPDATE attempts SET last_heartbeat=? WHERE id=?", (now, aid))
+    return {"ok": True, "server_ts": now, "gap_seconds": round(gap, 1) if gap > 30 else 0}
 
 
 @app.get("/api/attempts/{aid}/result")
