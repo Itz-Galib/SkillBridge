@@ -379,10 +379,10 @@ def seen_before(uid):
     return s
 
 
-def view(att):
+def view(att, include_session=False):
     st = json.loads(att["state"])
     remaining = max(0, int(att["started"] + E.TEST_SECONDS - time.time()))
-    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "answered": len(st["answers"]), "total": len(E.SLOTS), "session_id": att.get("session_id"), "last_event_seq": int(att.get("last_event_seq") or 0)}
+    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "answered": len(st["answers"]), "total": len(E.SLOTS), "session_id": att.get("session_id") if include_session else None, "last_event_seq": int(att.get("last_event_seq") or 0)}
     if att["status"] == "active" and st["current"]:
         out["question"] = E.public_question(QBYID[st["current"]], st)
     return out
@@ -437,7 +437,7 @@ def start_attempt(u=Depends(current_user)):
             now = time.time()
             run("UPDATE attempts SET session_id=?,last_event_seq=0,last_heartbeat=? WHERE id=?", (sid, now, act["id"]))
             act = get_att(act["id"], u["id"])
-            return view(dict(act))                       # resume while invalidating any older tab
+            return view(dict(act), include_session=True)  # resume while invalidating any older tab
     done = allr("SELECT finished FROM attempts WHERE user_id=? AND status='done' ORDER BY finished DESC", (u["id"],))
     if len([d for d in done if d["finished"] > time.time() - 90 * 86400]) >= MAX_ATTEMPTS_90D:
         raise HTTPException(429, "attempt_cap")
@@ -454,7 +454,7 @@ def start_attempt(u=Depends(current_user)):
         (aid, u["id"], "post" if done else "pre", seed, "active", json.dumps(st), started_at,
          session_id, started_at, "", ""))
     audit(u["id"], "attempt_start", aid)
-    return view(get_att(aid, u["id"]))
+    return view(get_att(aid, u["id"]), include_session=True)
 
 
 @app.get("/api/attempts/{aid}")
