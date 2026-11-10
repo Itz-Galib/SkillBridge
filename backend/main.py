@@ -213,7 +213,7 @@ _evidence_cleanup_task = None
 
 
 @app.on_event("startup")
-def _startup():
+async def _startup():
     global _evidence_cleanup_task
     init_db()
     _evidence_cleanup_task = asyncio.create_task(_purge_expired_exam_evidence())
