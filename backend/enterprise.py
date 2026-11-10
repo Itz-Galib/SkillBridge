@@ -991,15 +991,21 @@ def admin_integrity_attempt_detail(attempt_id: str, user=Depends(current_user)):
     except Exception:
         state = {}
     item["answers"] = [{
-        "question_id": a.get("qid"), "topic": a.get("topic"), "type": a.get("type"),
-        "difficulty": a.get("difficulty"), "seconds": a.get("seconds"),
-        "submitted_at": a.get("submitted_at"), "answered": True,
-    } for a in state.get("answers", [])]
+        "question_id": a.get("qid"), "question_index": i + 1,
+        "question": QBYID.get(a.get("qid"), {}).get("prompt", "Question text unavailable"),
+        "topic": a.get("topic"), "type": a.get("type"), "difficulty": a.get("difficulty"),
+        "answer": a.get("answer", ""), "seconds": a.get("seconds"),
+        "started_at": a.get("started_at"), "submitted_at": a.get("submitted_at"), "answered": True,
+    } for i, a in enumerate(state.get("answers", []))]
     item.pop("state", None)
     item["events"] = [dict(e) for e in allr(
-        "SELECT id,type,ts AS server_ts FROM events WHERE attempt_id=? ORDER BY ts,id",
+        "SELECT id,type,ts AS server_ts,question_id,question_index FROM events WHERE attempt_id=? ORDER BY ts,id",
         (attempt_id,)
     )]
+    for event in item["events"]:
+        question = QBYID.get(event.get("question_id"))
+        event["question"] = question.get("prompt") if question else None
+        event["elapsed_seconds"] = round(max(0, float(event["server_ts"]) - float(item["started"])), 1)
     item["integrity"] = item["result"] or {}
     audit(user["id"], "integrity_attempt_viewed", attempt_id)
     return item
