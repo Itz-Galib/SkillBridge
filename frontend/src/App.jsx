@@ -353,9 +353,9 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
               const nose = points[1], leftEye = points[33], rightEye = points[263];
               if (nose && leftEye && rightEye) {
                 const center = (leftEye.x + rightEye.x) / 2;
-                const offset = Math.abs(nose.x - center);
-                if (offset > 0.075 || nose.y < Math.min(leftEye.y, rightEye.y) - 0.04 || nose.y > Math.max(leftEye.y, rightEye.y) + 0.11)
-                  evidence("ai_gaze_away", Math.min(0.95, 0.55 + offset));
+                const eyeSpan = Math.max(0.001, Math.abs(rightEye.x - leftEye.x));
+                const offset = Math.abs(nose.x - center) / eyeSpan;
+                if (offset > 0.09) evidence("ai_gaze_away", Math.min(0.9, 0.55 + offset));
               }
             }
             if (objects) {
