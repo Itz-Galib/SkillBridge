@@ -433,10 +433,10 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
 
   useEffect(() => {
     const heartbeat = async () => {
-      const body = { session_id: sessionId.current, seq: ++sequence.current, client_ts: Date.now() };
       try {
         await flushEvents();
         if (pendingEvents.current.length) return; // preserve strict sequence order while offline
+        const body = { session_id: sessionId.current, seq: ++sequence.current, client_ts: Date.now() };
         await api(`/attempts/${aid}/heartbeat`, { method: "POST", body });
       } catch {
         // The next successful heartbeat lets the server record the monitoring gap.
