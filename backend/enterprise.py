@@ -1,5 +1,5 @@
 """Initial hiring workflow APIs for SkillBridge PRD."""
-import json, time, uuid, os, re, secrets
+import json, time, uuid, os, re, secrets, base64
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -1045,6 +1045,12 @@ def admin_integrity_attempt_detail(attempt_id: str, user=Depends(current_user)):
                     answer["answer"] = options[option_index]
             except (TypeError, ValueError):
                 pass
+    evidence_rows = allr("SELECT id,event_id,captured_at,mime_type,image_data,size_bytes,expires_at FROM exam_evidence WHERE attempt_id=? AND expires_at>? ORDER BY captured_at", (attempt_id, time.time()))
+    item["evidence"] = [{
+        "id": e["id"], "event_id": e["event_id"], "captured_at": e["captured_at"],
+        "mime_type": e["mime_type"], "size_bytes": e["size_bytes"],
+        "data_url": "data:" + e["mime_type"] + ";base64," + base64.b64encode(bytes(e["image_data"])).decode("ascii")
+    } for e in evidence_rows]
     item["integrity"] = item["result"] or {}
     audit(user["id"], "integrity_attempt_viewed", attempt_id)
     return item
