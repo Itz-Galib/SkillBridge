@@ -1,5 +1,5 @@
 """SkillBridge Global R0 API (FastAPI). Scores come from stored answer keys + server logic; AI never grades."""
-import os, io, re, json, time, uuid, base64, hmac, hashlib, secrets, sqlite3, zipfile, logging
+import os, io, re, json, time, uuid, base64, hmac, hashlib, secrets, sqlite3, zipfile, logging, asyncio
 from pathlib import Path
 from typing import Optional, List
 
@@ -200,8 +200,33 @@ app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http
                    allow_methods=["*"], allow_headers=["*"])
 
 
+async def _purge_expired_exam_evidence():
+    while True:
+        try:
+            run("DELETE FROM exam_evidence WHERE expires_at<?", (time.time(),))
+        except Exception:
+            log.exception("Could not purge expired exam evidence")
+        await asyncio.sleep(3600)
+
+
+_evidence_cleanup_task = None
+
+
 @app.on_event("startup")
-def _startup(): init_db()
+def _startup():
+    global _evidence_cleanup_task
+    init_db()
+    _evidence_cleanup_task = asyncio.create_task(_purge_expired_exam_evidence())
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    if _evidence_cleanup_task:
+        _evidence_cleanup_task.cancel()
+        try:
+            await _evidence_cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/api/health")
