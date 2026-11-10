@@ -315,8 +315,9 @@ function ExamRun({ initial, onFinished, screenStream }) {
     const heartbeat = async () => {
       const body = { session_id: sessionId.current, seq: ++sequence.current, client_ts: Date.now() };
       try {
-        await api(`/attempts/${aid}/heartbeat`, { method: "POST", body });
         await flushEvents();
+        if (pendingEvents.current.length) return; // preserve strict sequence order while offline
+        await api(`/attempts/${aid}/heartbeat`, { method: "POST", body });
       } catch {
         // The next successful heartbeat lets the server record the monitoring gap.
       }
@@ -591,6 +592,8 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const [fullscreenReady, setFullscreenReady] = useState(Boolean(document.fullscreenElement));
   const [setupBusy, setSetupBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const mobileDevice = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+  const browserSupported = Boolean(navigator.mediaDevices?.getDisplayMedia && document.documentElement.requestFullscreen);
   const done = st.attempts.filter((a) => a.status === "done");
   const mine = kind === "pre" ? done[0] : done.length > 1 ? done[done.length - 1] : null;
   const act = st.attempts.find((a) => a.status === "active");
@@ -659,16 +662,21 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     const fullscreen = Boolean(document.fullscreenElement);
     setShareReady(Boolean(sharing));
     setFullscreenReady(fullscreen);
-    if (!sharing || !fullscreen) {
-      setErr(new Error(!sharing ? t("shareRequired") : t("fullscreenRequired")));
+    if (mobileDevice || !browserSupported || !navigator.onLine || !sharing || !fullscreen) {
+      setErr(new Error(mobileDevice ? "This assessment requires a supported desktop browser." :
+        !browserSupported ? "Your browser does not support the required screen-sharing and full-screen features." :
+        !navigator.onLine ? "A network connection is required to begin the assessment." :
+        !sharing ? t("shareRequired") : t("fullscreenRequired")));
       return;
     }
     setSetupBusy(true);
     try {
       const v = await api("/attempts", { method: "POST" });
       if (v.status === "active") {
-        await api(`/attempts/${v.attempt_id}/event`, { method: "POST", body: { type: "screen_share_started" } });
-        setActive(v);
+        const body = { type: "screen_share_started", session_id: v.session_id, seq: (v.last_event_seq || 0) + 1,
+          client_ts: Date.now(), metadata: { surface: screenStream.getVideoTracks()[0]?.getSettings?.().displaySurface || "unknown" } };
+        await api(`/attempts/${v.attempt_id}/event`, { method: "POST", body });
+        setActive({ ...v, last_event_seq: body.seq });
       } else {
         screenStream?.getTracks().forEach((track) => track.stop());
         setScreenStream(null);
@@ -709,6 +717,8 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
       <p>{kind === "pre" ? t("testIntro") : t("retestIntro")}</p>
       <p className="exam-integrity-note">{t("examIntegrityIntro")}</p>
       <div className="card exam-setup-steps">
+        <p><strong>System check</strong></p>
+        <p>{mobileDevice ? "✕ Desktop device required" : "✓ Desktop device"} · {browserSupported ? "✓ Browser APIs supported" : "✕ Screen sharing/full-screen unsupported"} · {navigator.onLine ? "✓ Network available" : "✕ Network offline"}</p>
         <div className="row">
           <span>{shareReady ? "✓" : "1."} {t("shareSetupStep")}</span>
           <button type="button" className="btn ghost sm" onClick={enableScreenShare} disabled={setupBusy}>
@@ -724,7 +734,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
         <p className="muted">{t("examSetupHint")}</p>
       </div>
       <Err e={err} />
-      <button className="btn" onClick={start} disabled={setupBusy || !shareReady || !fullscreenReady}>
+      <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady}>
         {setupBusy ? t("saving") : t("startTest")}
       </button>
     </section>
