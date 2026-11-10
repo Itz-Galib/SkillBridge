@@ -654,3 +654,279 @@ def test_s3_backend_roundtrip(monkeypatch):
         assert s.presigned_url("cv/1/a.pdf").startswith("https://")
         s.delete("cv/1/a.pdf")
         assert not s.exists("cv/1/a.pdf")
+
+
+def _add_cv_skill_questions(skill, label, base_id):
+    """Insert one Easy, two Medium and two Hard approved CAT-10 questions."""
+    for index, difficulty in enumerate(("Easy", "Medium", "Medium", "Hard", "Hard"), 1):
+        main.run(
+            """INSERT INTO question_bank(id,category_id,subcategory,question_type,difficulty_level,
+               question_text,options,correct_answer,explanation,reference_answer,grading_rubric,marks,
+               time_allocation,status,created_by,created_at,version)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING""",
+            (f"{base_id}-{index}", "CAT-10", label, "MCQ", difficulty,
+             f"{label} test question {index}", json.dumps(["A", "B", "C", "D"]), "A",
+             "Test explanation", "", "Test rubric", 1, 60, "active", "Test", 0, 1),
+        )
+
+
+def test_skill_journey_and_blueprint_use_one_canonical_skill_catalogue():
+    uid, headers = _user("journey-alignment@example.com")
+    skills = [
+        {"name": "Django", "category": "Backend"},
+        {"name": "React", "category": "Frontend"},
+        {"name": "Power BI", "category": "Tool"},
+        {"name": "C++", "category": "Language"},
+        {"name": "Quantum Basket Weaving", "category": "Other"},
+    ]
+    saved = client.put(
+        "/api/candidate/profile/draft",
+        json={"summary": "Python and Django services.", "skills": skills},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+    assert client.post("/api/candidate/profile/confirm", json={}, headers=headers).status_code == 200
+
+    state = client.get("/api/state", headers=headers).json()
+    assert set(state["confirmed"]) == {"python", "javascript", "visualization", "cpp"}
+    assert state["not_assessable_yet"] == ["Quantum Basket Weaving"]
+
+    _add_cv_skill_questions("python", "Python", "test-align-python")
+    journey = client.get("/api/skill-journey", headers=headers)
+    assert journey.status_code == 200, journey.text
+    journey = journey.json()
+    statuses = {item["name"]: item["status"] for item in journey["journey"]}
+    labels = {item["name"]: item["label"] for item in journey["journey"]}
+    assert statuses["Django"] == "ready_to_verify"
+    assert labels["Django"] == "Python"
+    assert statuses["React"] == "question_bank_pending"
+    assert statuses["Power BI"] == "question_bank_pending"
+    assert statuses["Quantum Basket Weaving"] == "not_assessable"
+    assert "python" in journey["coverage_summary"]["covered_skill_ids"]
+
+    blueprint = client.post("/api/assessment/blueprint", headers=headers)
+    assert blueprint.status_code == 200, blueprint.text
+    blueprint = blueprint.json()
+    assert blueprint["skills"]
+    assert {item["skill_id"] for item in blueprint["skills"]} == {
+        "python", "javascript", "visualization", "cpp",
+    }
+    assert "python" in blueprint["covered_skill_ids"]
+    assert {"javascript", "visualization", "cpp"} <= {
+        item["skill_id"] for item in blueprint["uncovered_skills"]
+    }
+    # The Python skill has a complete 1/2/2 quota and is selected even when the
+    # fundamental section is still incomplete in this test database.
+    assert blueprint["cv_count"] == 5
+
+
+def test_company_and_admin_views_share_the_candidate_skill_alignment():
+    uid, headers = _user("company-align-candidate@example.com")
+    saved = client.put(
+        "/api/candidate/profile/draft",
+        json={
+            "summary": "Python and Docker projects.",
+            "skills": [
+                {"name": "Python", "category": "Language"},
+                {"name": "Docker", "category": "Tool"},
+                {"name": "Power BI", "category": "Tool"},
+            ],
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+    assert client.post("/api/candidate/profile/confirm", json={}, headers=headers).status_code == 200
+    _add_cv_skill_questions("python", "Python", "test-company-python")
+    main.run(
+        """INSERT INTO attempts(id,user_id,kind,seed,status,state,started,finished,result,appeal)
+           VALUES (?,?,?,?,?,?,?,?,?,NULL)""",
+        ("company-align-attempt", uid, "pre", 1, "done", "{}", 0, 1,
+         json.dumps({"overall": 80, "topics": {
+             "python": {"score": 80, "level": "Advanced", "n": 5},
+         }})),
+    )
+
+    company_reg = client.post(
+        "/api/auth/register",
+        json={"email": "company-align@example.com", "name": "Acme", "password": "password123", "role": "company"},
+    )
+    assert company_reg.status_code == 200, company_reg.text
+    company_headers = {"Authorization": "Bearer " + company_reg.json()["token"]}
+    assert client.post("/api/consent", json={"lang": "en"}, headers=company_headers).status_code == 200
+    company_uid = main.one("SELECT id FROM users WHERE email=?", ("company-align@example.com",))["id"]
+    main.run("INSERT INTO companies(id,owner_user_id,name,website,verified,created) VALUES (?,?,?,?,?,?)",
+             ("company-align", company_uid, "Acme", "https://acme.test", 1, 0))
+    main.run("""INSERT INTO jobs(id,company_id,title,description,location,employment_type,skills,status,is_mock,created)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+             ("job-align", "company-align", "Backend Engineer", "Build services", "Remote", "Full-time",
+              json.dumps(["Python", "Docker", "SQL"]), "published", 0, 0))
+    main.run("INSERT INTO applications(id,job_id,candidate_id,status,results_shared,created) VALUES (?,?,?,?,?,?)",
+             ("app-align", "job-align", uid, "submitted", 1, 0))
+
+    detail = client.get("/api/company/applications/app-align", headers=company_headers)
+    assert detail.status_code == 200, detail.text
+    detail = detail.json()
+    statuses = {skill["required"]: skill["status"] for skill in detail["candidate_skills"]}
+    assert statuses == {"Python": "verified", "Docker": "claimed", "SQL": "missing"}
+    assert detail["skill_evidence_summary"] == {"verified": 1, "claimed": 1, "missing": 1, "not_shared": 0}
+
+    admin_reg = client.post(
+        "/api/auth/register",
+        json={"email": "alignment-admin@example.com", "name": "Admin", "password": "password123", "role": "candidate"},
+    )
+    admin_headers = {"Authorization": "Bearer " + admin_reg.json()["token"]}
+    admin_uid = main.one("SELECT id FROM users WHERE email=?", ("alignment-admin@example.com",))["id"]
+    main.run("UPDATE user_roles SET role='admin' WHERE user_id=?", (admin_uid,))
+    main.run("INSERT INTO admin_staff_roles(user_id,admin_role,updated_by,updated_at) VALUES (?,?,?,?)",
+             (admin_uid, "super_admin", admin_uid, 0))
+    coverage = client.get("/api/admin/assessment/graphrag/status", headers=admin_headers)
+    assert coverage.status_code == 200, coverage.text
+    coverage = coverage.json()
+    assert "python" in [item["skill_id"] for item in coverage["covered_skills"]]
+    assert "docker" in [item["skill_id"] for item in coverage["uncovered_skills"]]
+
+
+def test_admin_approval_updates_learning_path_and_creates_passport():
+    uid, headers = _user("approval-flow-candidate@example.com")
+    saved = client.put(
+        "/api/candidate/profile/draft",
+        json={"summary": "Python services.", "skills": [{"name": "Python", "category": "Language"}]},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+    assert client.post("/api/candidate/profile/confirm", json={}, headers=headers).status_code == 200
+    _add_cv_skill_questions("python", "Python", "test-approval-python")
+    main.run(
+        """INSERT INTO attempts(id,user_id,kind,seed,status,state,started,finished,result,appeal)
+           VALUES (?,?,?,?,?,?,?,?,?,NULL)""",
+        ("approval-flow-attempt", uid, "pre", 1, "done", "{}", 0, 1,
+         json.dumps({
+             "overall": 40, "level": "Beginner", "trust": "High trust", "date": "2026-01-01",
+             "review_status": "pending_human_review", "manual_review_required": True,
+             "topics": {
+                 "python": {"score": 40, "level": "Beginner", "n": 5, "label": "Python"},
+                 "dsa": {"score": 90, "level": "Advanced", "n": 5, "label": "DSA"},
+             },
+         })),
+    )
+
+    before = client.get("/api/learning/dashboard", headers=headers)
+    assert before.status_code == 200, before.text
+    before = before.json()
+    assert before["approved"] is False
+    assert before["passport"] is None
+    assert "python" in before["gaps"]
+    assert any(r["topic"] == "python" for r in before["resources"])
+
+    admin_reg = client.post(
+        "/api/auth/register",
+        json={"email": "approval-flow-admin@example.com", "name": "Approver", "password": "password123", "role": "candidate"},
+    )
+    admin_headers = {"Authorization": "Bearer " + admin_reg.json()["token"]}
+    admin_uid = main.one("SELECT id FROM users WHERE email=?", ("approval-flow-admin@example.com",))["id"]
+    main.run("UPDATE user_roles SET role='admin' WHERE user_id=?", (admin_uid,))
+    main.run("INSERT INTO admin_staff_roles(user_id,admin_role,updated_by,updated_at) VALUES (?,?,?,?)",
+             (admin_uid, "super_admin", admin_uid, 0))
+
+    approved = client.post(
+        "/api/admin/attempts/approval-flow-attempt/review",
+        json={"decision": "approved", "reason": "Human reviewer confirmed the recorded answers."},
+        headers=admin_headers,
+    )
+    assert approved.status_code == 200, approved.text
+    approved = approved.json()
+    assert approved["learning_path_updated"] is True
+    assert approved["passport_id"], approved
+
+    after = client.get("/api/learning/dashboard", headers=headers).json()
+    assert after["approved"] is True
+    assert after["review_status"] == "approved"
+    assert after["passport"]["id"] == approved["passport_id"]
+    assert after["result_summary"]["overall"] == 40
+    assert after["result_summary"]["review_status"] == "approved"
+    assert any(item["skill"] == "python" and item["status"] == "below" for item in after["performance"])
+    assert any(item["skill"] == "dsa" and item["status"] == "met" for item in after["performance"])
+
+    state = client.get("/api/state", headers=headers).json()
+    auto = [p for p in state["passports"] if p["id"] == approved["passport_id"]]
+    assert auto and auto[0]["auto"] is True
+    assert auto[0]["source_attempt"] == "approval-flow-attempt"
+
+    public = client.get(f"/api/public/passport/{approved['passport_id']}").json()
+    assert public["revoked"] is False and public["signature_valid"] is True
+    assert public["passport"]["verification"] == "admin_approved"
+    assert public["passport"]["attempt_id"] == "approval-flow-attempt"
+    assert {s["skill"] for s in public["passport"]["skills"]} == {"python", "dsa"}
+
+    invalidated = client.post(
+        "/api/admin/attempts/approval-flow-attempt/review",
+        json={"decision": "invalidated", "reason": "Reviewer found a duplicate submission."},
+        headers=admin_headers,
+    )
+    assert invalidated.status_code == 200, invalidated.text
+    assert client.get(f"/api/public/passport/{approved['passport_id']}").json()["revoked"] is True
+    after_invalid = client.get("/api/learning/dashboard", headers=headers).json()
+    assert after_invalid["approved"] is False
+    assert after_invalid["review_status"] == "invalidated"
+
+
+def test_graphrag_scorecard_is_60_fundamental_40_cv_with_sql_as_fundamental():
+    uid, headers = _user("scorecard-weighting@example.com")
+    selected = [
+        {"id": "weight-f1", "assessment_section": "fundamental", "assessment_topic": "DSA",
+         "assessment_topic_key": "dsa", "question_type": "MCQ", "difficulty_level": "Easy",
+         "question_text": "DSA question", "correct_answer": "A", "marks": 1, "time_allocation": 60},
+        {"id": "weight-f2", "assessment_section": "fundamental", "assessment_topic": "OOP",
+         "assessment_topic_key": "oop", "question_type": "MCQ", "difficulty_level": "Easy",
+         "question_text": "OOP question", "correct_answer": "A", "marks": 1, "time_allocation": 60},
+        {"id": "weight-sql", "assessment_section": "cv", "assessment_topic": "SQL",
+         "assessment_topic_key": "sql", "skill_id": "sql", "question_type": "MCQ",
+         "difficulty_level": "Easy", "question_text": "SQL question", "correct_answer": "A",
+         "marks": 1, "time_allocation": 60},
+        {"id": "weight-c1", "assessment_section": "cv", "assessment_topic": "Python",
+         "assessment_topic_key": "python", "skill_id": "python", "question_type": "MCQ",
+         "difficulty_level": "Easy", "question_text": "Python question 1", "correct_answer": "A",
+         "marks": 1, "time_allocation": 60},
+        {"id": "weight-c2", "assessment_section": "cv", "assessment_topic": "Python",
+         "assessment_topic_key": "python", "skill_id": "python", "question_type": "MCQ",
+         "difficulty_level": "Easy", "question_text": "Python question 2", "correct_answer": "A",
+         "marks": 1, "time_allocation": 60},
+    ]
+    answers = {
+        "weight-f1": "A", "weight-f2": "B", "weight-sql": "A",
+        "weight-c1": "A", "weight-c2": "B",
+    }
+    aid = "weighting-attempt"
+    main.run(
+        """INSERT INTO attempts(id,user_id,kind,seed,status,state,started,result,appeal)
+           VALUES (?,?,?,?,?,?,?,NULL,NULL)""",
+        (aid, uid, "pre", 1, "active", "{}", 0),
+    )
+    st = {
+        "graphrag": True, "blueprint_id": "weighting-blueprint", "selected_questions": selected,
+        "question_index": 0, "answers": answers, "duration_seconds": 600,
+        "question_time_seconds": {}, "seed": 1, "current": None,
+    }
+    main.finalize(dict(main.one("SELECT * FROM attempts WHERE id=?", (aid,))), st)
+    result = json.loads(main.one("SELECT result FROM attempts WHERE id=?", (aid,))["result"])
+    assert result["scoring_version"] == "r1-60-40"
+    assert result["section_scores"]["fundamental"]["possible"] == 3
+    assert result["section_scores"]["cv"]["possible"] == 2
+    assert result["section_scores"]["fundamental"]["score"] == 67
+    assert result["section_scores"]["cv"]["score"] == 50
+    assert result["overall"] == 60
+    assert result["topics"]["sql"]["section"] == "fundamental"
+    assert result["topics"]["python"]["section"] == "cv"
+
+
+def test_retake_locked_until_current_result_has_human_review():
+    uid, headers = _user("retake-lock@example.com")
+    main.run(
+        """INSERT INTO attempts(id,user_id,kind,seed,status,state,started,finished,result,appeal)
+           VALUES (?,?,?,?,?,?,?,?,?,NULL)""",
+        ("retake-lock-attempt", uid, "pre", 1, "done", "{}", 0, 1,
+         json.dumps({"overall": 50, "topics": {"python": {"score": 50, "level": "Intermediate", "n": 5}}})),
+    )
+    blocked = client.post("/api/attempts", headers=headers)
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"] == "result_awaiting_review"

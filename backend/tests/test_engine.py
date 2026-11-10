@@ -96,5 +96,20 @@ def test_path_honest():
     assert p["gaps"] == ["python"] and all(i["url"].startswith("https://") and i["licence"] for i in p["items"])
     assert build_path({k: {"score": 99} for k in TESTABLE})["items"] == []
 
+
+def test_pending_review_scores_do_not_crash_gap_or_learning_path():
+    # GraphRAG topic scores can be None when every selected question is waiting
+    # for human review. The gap map and learning path must treat that as
+    # unverified rather than comparing None with a threshold.
+    topics = {
+        "sql": {"score": None, "level": "Beginner", "n": 3},
+        "python": {"score": 70, "level": "Advanced", "n": 2},
+    }
+    rows = gap_map(topics)
+    assert {row["skill"]: row["status"] for row in rows}["sql"] == "unverified"
+    assert {row["skill"]: row["status"] for row in rows}["python"] == "met"
+    path = build_path(topics)
+    assert "sql" in path["gaps"]
+
 def test_sign():
     assert sign_payload({"a": 1}, "k") == sign_payload({"a": 1}, "k") != sign_payload({"a": 2}, "k")

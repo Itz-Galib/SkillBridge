@@ -14,7 +14,7 @@ Skills: SQL, Python, Excel, Git. Presentation and report writing for class proje
 (Synthetic sample CV for demo purposes.)`;
 
 /* ---------- small helpers ---------- */
-const STEPS = ["profile", "gap", "assess", "learn", "retest", "passport"];
+const STEPS = ["profile", "assess", "gap", "learn", "retest", "passport"];
 const fmt = (s) =>
   `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
@@ -501,6 +501,14 @@ function Profile({ st, onDone, onEditProfile }) {
   const [sel, setSel] = useState([]);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [journey, setJourney] = useState(null);
+
+  useEffect(() => {
+    if (!st.from_profile) return;
+    api("/skill-journey")
+      .then(setJourney)
+      .catch(() => {});
+  }, [st.from_profile, st.confirmed]);
 
   useEffect(() => {
     if (st.from_profile) setSel(st.confirmed || []);
@@ -548,14 +556,45 @@ function Profile({ st, onDone, onEditProfile }) {
       {st.from_profile && !res && (
         <div className="card profile-journey-skills">
           <h3>Skills from your profile</h3>
-          <p className="note">These skills are claimed until verified. Update your profile to change these.</p>
+          <p className="note">These skills are claimed in your profile. Their verified status comes from your approved assessment result.</p>
           <p className="chips">
-            {(st.profile_skill_items || []).map((skill, index) => (
-              <span className="chip chip-mid" key={`${skill.name}-${index}`}>
-                {skill.name} · {t("claimed")}
-                {!skill.id && " · Not assessable yet"}
-              </span>
-            ))}
+            {(st.profile_skill_items || []).map((skill, index) => {
+              const item = journey?.journey?.find(
+                (entry) =>
+                  entry.skill_id === skill.id ||
+                  (entry.skill_ids || []).includes(skill.id),
+              );
+              const status = !item
+                ? t("claimed")
+                : item.status === "verified"
+                  ? `Verified · ${item.score}%`
+                  : item.status === "needs_practice"
+                    ? `Needs practice · ${item.score}%`
+                    : item.status === "pending_review"
+                      ? "Pending human review"
+                      : item.status === "ready_to_verify"
+                        ? "Ready to verify"
+                        : item.status === "question_bank_pending"
+                          ? "Practice bank pending"
+                          : item.status === "covered_by_fundamental"
+                            ? "Covered by fundamentals"
+                            : "Not assessable yet";
+              return (
+                <span
+                  className={
+                    "chip " +
+                    (item?.status === "verified"
+                      ? "chip-ok"
+                      : !item || item.status === "not_assessable"
+                        ? "chip-rev"
+                        : "chip-mid")
+                  }
+                  key={`${skill.name}-${index}`}
+                >
+                  {skill.label || skill.name} · {status}
+                </span>
+              );
+            })}
           </p>
           {!st.profile_skill_items?.length && (
             <p className="muted">No skills are listed yet. Add them to your profile to begin.</p>
@@ -661,18 +700,121 @@ function Profile({ st, onDone, onEditProfile }) {
 }
 
 /* ---------- gap ---------- */
-function Gap({ onStart, refreshKey }) {
+function Gap({ st, onStart, refreshKey, actionLabel }) {
   const t = useT();
   const [d, setD] = useState(null);
+  const [journey, setJourney] = useState(null);
   const [err, setErr] = useState(null);
   useEffect(() => {
-    api("/job").then(setD).catch(setErr);
+    Promise.all([
+      api("/job"),
+      api("/skill-journey").catch(() => null),
+    ])
+      .then(([jobData, journeyData]) => {
+        setD(jobData);
+        setJourney(journeyData);
+      })
+      .catch(setErr);
   }, [refreshKey]);
   if (err) return <Err e={err} />;
   if (!d) return <p>{t("loading")}</p>;
+  const journeyStatusLabel = (item) => {
+    if (item.status === "verified") return `Verified · ${item.score}%`;
+    if (item.status === "needs_practice") return `Needs practice · ${item.score}%`;
+    if (item.status === "pending_review") return "Pending human review";
+    if (item.status === "ready_to_verify") return "Ready to verify";
+    if (item.status === "covered_by_fundamental") return "Covered by fundamentals";
+    if (item.status === "question_bank_pending") return "Practice bank pending";
+    return "Not assessable yet";
+  };
+  const gapStatusLabel = (g) => {
+    if (g.score != null) {
+      return `${g.verified ? "Verified" : "Provisional"} · ${g.score}%`;
+    }
+    if (g.coverage_status === "ready_to_verify") return "Ready to verify";
+    if (g.coverage_status === "question_bank_pending") return "Practice bank pending";
+    return t("gs")[g.status];
+  };
   return (
     <section>
       <h2>{t("gapTitle")}</h2>
+      {journey?.latest_result && (
+        <div
+          className={
+            "learn-approval " + (journey.approved ? "approved" : "pending")
+          }
+        >
+          <div>
+            <span className="learn-kicker">
+              {journey.approved ? "VERIFIED ASSESSMENT" : "ASSESSMENT COMPLETE"}
+            </span>
+            <h3>
+              {journey.approved
+                ? "Your result is approved."
+                : "Your score is recorded and awaiting human review."}
+            </h3>
+            <p>
+              {journey.approved
+                ? "Your learning path is verified and your Skill Passport was created automatically."
+                : "Start learning now. The verified path and Skill Passport update automatically after a reviewer approves the result."}
+            </p>
+            {journey.latest_result.section_scores && (
+              <small className="learn-note">
+                Fundamentals 60%:{" "}
+                {journey.latest_result.section_scores.fundamental?.score ?? "—"}%
+                {" · "}CV &amp; development 40%:{" "}
+                {journey.latest_result.section_scores.cv?.score ?? "—"}%
+              </small>
+            )}
+          </div>
+          <div className="learn-approval-score">
+            <strong>
+              {journey.latest_result.overall == null
+                ? "—"
+                : journey.latest_result.overall + "%"}
+            </strong>
+            <small>{journey.latest_result.level || "Pending review"}</small>
+            {journey.passport && !journey.passport.revoked && (
+              <span>Passport issued</span>
+            )}
+          </div>
+        </div>
+      )}
+      {journey && (
+        <div className="card profile-journey-skills">
+          <h3>Skills from your profile &amp; CV</h3>
+          <p className="note">
+            These confirmed skills drive your assessment, learning and skill
+            journey. Skills without approved practice questions stay visible and
+            are marked below instead of being dropped.
+          </p>
+          <p className="chips">
+            {(journey.journey || []).map((item, index) => (
+              <span className="chip chip-mid" key={`${item.name}-${index}`}>
+                {item.label} · {journeyStatusLabel(item)}
+              </span>
+            ))}
+          </p>
+          {!journey.journey?.length && (
+            <p className="muted">
+              No profile skills are confirmed yet. Add skills on My profile to
+              start the journey.
+            </p>
+          )}
+          {!!journey.pending_question_bank?.length && (
+            <p className="muted">
+              Awaiting question-bank coverage:{" "}
+              {journey.pending_question_bank.map((item) => item.label).join(", ")}.
+            </p>
+          )}
+          {!!journey.not_assessable?.length && (
+            <p className="muted">
+              Not assessable yet: {journey.not_assessable.join(", ")}. These
+              skills remain in your profile.
+            </p>
+          )}
+        </div>
+      )}
       <div className="card">
         <div className="jobhead">
           <h3>{d.job.title}</h3>
@@ -686,9 +828,8 @@ function Gap({ onStart, refreshKey }) {
                 <span className="muted">
                   {g.claimed ? t("claimedTag") : t("notClaimed")}
                 </span>
-                <span className={"status s-" + g.status}>
-                  {t("gs")[g.status]}
-                  {g.score != null ? ` · ${g.score}%` : ""}
+                <span className={"status s-" + (g.score != null ? (g.verified ? "met" : "unverified") : g.status)}>
+                  {gapStatusLabel(g)}
                 </span>
               </div>
               <Bar
@@ -709,9 +850,9 @@ function Gap({ onStart, refreshKey }) {
             .map((p) => `${p.name}${p.claimed ? " ✓" : ""}`)
             .join(", ")}
         </p>
-        {onStart && (
+        {onStart && journey?.latest_result && (
           <button className="btn" onClick={onStart}>
-            {t("startTest")}
+            {actionLabel || t("startTest")}
           </button>
         )}
       </div>
@@ -1184,7 +1325,7 @@ function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
           {v.total} questions · {Math.ceil(v.duration_seconds / 60)} minutes
           allocated
         </span>
-        <span>Fundamental + CV skills</span>
+        <span>60% fundamentals · 40% CV &amp; development</span>
       </div>
       <div className="gr-question-table">
         <table>
@@ -1220,8 +1361,10 @@ function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
       <div className="gr-question-current">
         <div className="gr-question-label">
           <span>
-            {q.assessment_section === "cv" ? "CV-BASED" : "FUNDAMENTAL"} ·{" "}
-            {q.assessment_topic}
+            {q.assessment_section === "cv" && q.skill_id !== "sql"
+              ? "CV-BASED"
+              : "FUNDAMENTAL"}{" "}
+            · {q.assessment_topic}
           </span>
           <span>
             {q.difficulty_level} · {q.question_type}
@@ -1388,13 +1531,67 @@ function Result({ aid, next, nextLabel }) {
           </div>
         </dl>
       </div>
+      {r.section_scores && (
+        <div className="score-split">
+          <article>
+            <small>Fundamentals · 60% weight</small>
+            <strong>
+              {r.section_scores.fundamental?.score == null
+                ? "—"
+                : r.section_scores.fundamental.score + "%"}
+            </strong>
+            <span>
+              DSA · SQL · Networking · OOP · Database · Coding · Critical Thinking
+            </span>
+          </article>
+          <article>
+            <small>CV & Development · 40% weight</small>
+            <strong>
+              {r.section_scores.cv?.score == null
+                ? "—"
+                : r.section_scores.cv.score + "%"}
+            </strong>
+            <span>AI/ML · Git · Docker · all confirmed CV skills merged</span>
+          </article>
+        </div>
+      )}
+      {r.scoring_version === "legacy-adaptive" && (
+        <p className="note">
+          This is a legacy adaptive result. Take a new verified assessment to
+          receive the 60% fundamentals / 40% CV development scorecard.
+        </p>
+      )}
+      {r.review_status === "approved" && (
+        <p className="success-note">
+          Human-reviewed and approved. Your verified learning path is updated
+          and a Skill Passport has been issued automatically.
+        </p>
+      )}
+      {r.review_status === "invalidated" && (
+        <p className="err">
+          This result was invalidated during human review. Your score was not
+          changed, but it cannot be used as verified evidence.
+        </p>
+      )}
+      {r.review_status === "needs_more_info" && (
+        <p className="note">
+          The reviewer requested more information. Your learning recommendations
+          remain provisional until the result is approved.
+        </p>
+      )}
+      {r.manual_review_required && (
+        <p className="note">
+          This result is awaiting human review. You can start learning now; the
+          verified path and Skill Passport update automatically after approval.
+        </p>
+      )}
       <div className="card">
         <h3>{t("topics")}</h3>
         <ul className="gaps">
           {Object.entries(r.topics).map(([k, v]) => (
             <li key={k}>
               <div className="gaprow">
-                <strong>{k}</strong>
+                <strong>{v.label || k}</strong>
                 <span className="muted">
                   {v.score == null ? "Pending review" : t("levels")[v.level]}
                 </span>
@@ -1440,7 +1637,7 @@ function Result({ aid, next, nextLabel }) {
                       <td>{item.question}</td>
                       <td>{item.answer || "No answer"}</td>
                       <td>{item.correct_answer || "Pending human review"}</td>
-                      <td>{item.review_status}</td>
+                      <td>{String(item.review_status).replaceAll("_", " ")}</td>
                     </tr>
                   ))}
               </tbody>
@@ -1526,28 +1723,32 @@ function Uplift() {
       <h3>{t("upliftTitle")}</h3>
       <p className="bignum small">
         <span>
-          {u.overall.delta >= 0 ? "+" : ""}
-          {u.overall.delta}
+          {u.overall.delta == null
+            ? "Pending"
+            : `${u.overall.delta >= 0 ? "+" : ""}${u.overall.delta}`}
         </span>
         <small>
-          {" "}
-          pts ({u.overall.pre}% → {u.overall.post}%)
+          {u.overall.delta == null
+            ? " human review"
+            : ` pts (${u.overall.pre}% → ${u.overall.post}%)`}
         </small>
       </p>
       <ul className="gaps">
         {Object.entries(u.topics).map(([k, v]) => (
           <li key={k}>
             <div className="gaprow">
-              <strong>{k}</strong>
+              <strong>{v.label || k}</strong>
               <span>
-                {t("pre")} {v.pre}% → {t("post")} {v.post}%
+                {t("pre")} {v.pre == null ? "—" : v.pre + "%"} → {t("post")}{" "}
+                {v.post == null ? "—" : v.post + "%"}
               </span>
               <span>
-                {v.delta >= 0 ? "+" : ""}
-                {v.delta}
+                {v.delta == null
+                  ? "—"
+                  : `${v.delta >= 0 ? "+" : ""}${v.delta}`}
               </span>
             </div>
-            <Bar score={v.post} threshold={v.pre} />
+            <Bar score={v.post ?? 0} threshold={v.pre ?? 0} />
           </li>
         ))}
       </ul>
@@ -1560,15 +1761,21 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const t = useT();
   const [active, setActive] = useState(null),
     [err, setErr] = useState(null);
+  const [banner, setBanner] = useState("");
   const [screenStream, setScreenStream] = useState(null),
     [shareReady, setShareReady] = useState(false),
     [fullscreenReady, setFullscreenReady] = useState(
       Boolean(document.fullscreenElement),
     ),
     [setupBusy, setSetupBusy] = useState(false);
-  const done = st.attempts.filter((a) => a.status === "done");
+  const done = st.attempts
+    .filter((a) => a.status === "done")
+    .sort((a, b) => (a.finished || 0) - (b.finished || 0));
+  const latestDone = done.length ? done[done.length - 1] : null;
+  // Both Verify and Re-test show the current result. The old code showed the
+  // oldest attempt in Verify, which made Verify and Gap disagree.
   const mine =
-    kind === "pre" ? done[0] : done.length > 1 ? done[done.length - 1] : null;
+    kind === "pre" ? latestDone : done.length > 1 ? latestDone : null;
   const act = st.attempts.find((a) => a.status === "active");
   useEffect(() => {
     const track = screenStream?.getVideoTracks()[0];
@@ -1675,6 +1882,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
       return;
     }
     setSetupBusy(true);
+    setBanner("");
     try {
       // Prefer the CV-based GraphRAG assessment (fundamental + CV skills) when a
       // candidate has confirmed CV skills. Fall back to the standard adaptive
@@ -1682,8 +1890,30 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
       let blueprintId = null;
       try {
         const bp = await api("/assessment/blueprint", { method: "POST" });
-        if (bp && bp.status === "ready") blueprintId = bp.blueprint_id;
+        if (bp && bp.status === "ready") {
+          blueprintId = bp.blueprint_id;
+          if (bp.uncovered_skills?.length) {
+            setBanner(
+              "Some confirmed skills have no approved practice questions yet: " +
+                bp.uncovered_skills.map((x) => x.label).join(", ") +
+                ". The assessment will cover the available skills.",
+            );
+          }
+        } else if (bp) {
+          setBanner(
+            "The GraphRAG question bank is not complete yet (" +
+              (bp.shortages?.length || 0) +
+              " coverage gaps). Using the standard adaptive assessment so you can still verify your skills.",
+          );
+        }
       } catch (e) {
+        if (st?.confirmed?.length) {
+          setBanner(
+            "GraphRAG assessment is unavailable for this profile (" +
+              (e.message || "unknown error") +
+              "). Using the standard adaptive assessment.",
+          );
+        }
         blueprintId = null;
       }
       const v = await api("/attempts", {
@@ -1776,6 +2006,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
           </button>
         </div>
       </div>
+      {banner && <p className="note">{banner}</p>}
       <Err e={err} />
       <button
         className="btn"
@@ -1841,6 +2072,9 @@ function Learn({ onNext }) {
     );
   const topics = [...new Set(data.resources.map((r) => r.topic))],
     retake = data.retake || {};
+  const gapsWithoutResources = (data.gap_details || []).filter(
+    (gap) => !data.resources.some((resource) => resource.topic === gap.skill),
+  );
   const fmt = (v) => (v ? new Date(v * 1000).toLocaleDateString() : "—");
   return (
     <section className="learn-workspace">
@@ -1849,9 +2083,10 @@ function Learn({ onNext }) {
           <span className="learn-kicker">YOUR PERSONAL DEVELOPMENT PLAN</span>
           <h2>Turn skill gaps into progress.</h2>
           <p>
-            Curated resources are reviewed by SkillBridge before they appear
-            here. Track what you study and measure progress with a separate
-            assessment attempt.
+            Your learning path is built from your latest exam performance,
+            including fundamental and CV-based skills. When a reviewer approves
+            the result, the path is marked verified and a Skill Passport is
+            issued automatically.
           </p>
         </div>
         <div className="learn-hero-mark">↗</div>
@@ -1861,11 +2096,81 @@ function Learn({ onNext }) {
           {error}
         </div>
       )}
+      {data.result_summary && (
+        <div
+          className={
+            "learn-approval " + (data.approved ? "approved" : "pending")
+          }
+        >
+          <div>
+            <span className="learn-kicker">
+              {data.approved ? "VERIFIED RESULT" : "PROVISIONAL RESULT"}
+            </span>
+            <h3>
+              {data.approved
+                ? "Your result is approved."
+                : "Your result is awaiting human review."}
+            </h3>
+            <p>
+              {data.approved
+                ? "The learning path below is now verified and your Skill Passport was created automatically."
+                : "You can start learning immediately. The verified path and Skill Passport update automatically after a reviewer approves the result."}
+            </p>
+            {data.result_summary.section_scores && (
+              <small className="learn-note">
+                Fundamentals 60%:{" "}
+                {data.result_summary.section_scores.fundamental?.score ?? "—"}%
+                {" · "}CV &amp; development 40%:{" "}
+                {data.result_summary.section_scores.cv?.score ?? "—"}%
+              </small>
+            )}
+          </div>
+          <div className="learn-approval-score">
+            <strong>
+              {data.result_summary.overall == null
+                ? "—"
+                : data.result_summary.overall + "%"}
+            </strong>
+            <small>{data.result_summary.level || "Pending review"}</small>
+            {data.passport && !data.passport.revoked && (
+              <span>Passport issued</span>
+            )}
+          </div>
+        </div>
+      )}
+      {!!data.performance?.length && (
+        <div className="learn-performance" aria-label="Exam performance by skill">
+          {data.performance.map((item) => (
+            <span
+              className={"learn-perf " + item.status}
+              key={item.skill}
+              title={
+                item.score == null
+                  ? item.status === "not_assessed"
+                    ? "Not assessed yet"
+                    : "Waiting for review"
+                  : `${item.score}% · ${item.status.replaceAll("_", " ")}`
+              }
+            >
+              {item.name}{" "}
+              {item.score == null
+                ? item.status === "not_assessed"
+                  ? "· not assessed"
+                  : "· pending review"
+                : `· ${item.score}%`}
+            </span>
+          ))}
+        </div>
+      )}
       <div className="learn-stats">
         <article>
           <small>Topics to strengthen</small>
           <strong>{data.gaps.length}</strong>
-          <span>Based on your latest result</span>
+          <span>
+            {data.result_summary?.overall == null
+              ? "From your latest result"
+              : `After your ${data.result_summary.overall}% assessment`}
+          </span>
         </article>
         <article>
           <small>Resources completed</small>
@@ -1890,11 +2195,14 @@ function Learn({ onNext }) {
           <span className="learn-kicker">CURATED FOR YOUR GAPS</span>
           <h3>Recommended learning</h3>
           <p>
-            Only verified links are shown. No suitable resource is invented when
-            the catalogue has no match.
+            Only approved curated links are shown. If no approved resource exists
+            for a gap, the catalogue says so instead of inventing one.
           </p>
         </div>
         <span className="learn-verified">✓ Verified catalogue</span>
+        <button className="btn ghost sm" onClick={load}>
+          Refresh path
+        </button>
       </div>
       {!topics.length ? (
         <div className="learn-empty">
@@ -1917,7 +2225,7 @@ function Learn({ onNext }) {
             <header>
               <div>
                 <span>SKILL GAP</span>
-                <h4>{topic.replaceAll("_", " ")}</h4>
+                <h4>{data.gap_labels?.[topic] || topic.replaceAll("_", " ")}</h4>
               </div>
               <small>
                 {data.resources.filter((r) => r.topic === topic).length}{" "}
@@ -2000,6 +2308,13 @@ function Learn({ onNext }) {
           </section>
         ))
       )}
+      {!!gapsWithoutResources.length && (
+        <p className="learn-note">
+          No approved resource yet for:{" "}
+          {gapsWithoutResources.map((gap) => gap.name).join(", ")}. These gaps
+          stay visible so you know what is still pending.
+        </p>
+      )}
       <div className="learn-bottom-grid">
         <section className="learn-panel">
           <span className="learn-kicker">REASSESSMENT</span>
@@ -2038,13 +2353,15 @@ function Learn({ onNext }) {
             <small className="learn-reason">
               {retake.active_attempt
                 ? "An assessment is already in progress."
-                : retake.balance < retake.credit_cost
-                  ? "You need more retake credits."
-                  : retake.attempts_used_90d >= retake.max_attempts_90d
-                    ? "You have reached the 90-day attempt limit."
-                    : retake.has_result
-                      ? "The retake cooldown is still active."
-                      : "Complete your first assessment to unlock retakes."}
+                : retake.awaiting_review
+                  ? "Your latest result is awaiting human review. The verified learning path and retake unlock after approval."
+                  : retake.balance < retake.credit_cost
+                    ? "You need more retake credits."
+                    : retake.attempts_used_90d >= retake.max_attempts_90d
+                      ? "You have reached the 90-day attempt limit."
+                      : retake.has_result
+                        ? "The retake cooldown is still active."
+                        : "Complete your first assessment to unlock retakes."}
             </small>
           )}
         </section>
@@ -2139,8 +2456,16 @@ function Passport({ st, refresh }) {
   const [name, setName] = useState(false);
   const [err, setErr] = useState(null);
   const [copied, setCopied] = useState(null);
-  const done = st.attempts.filter((a) => a.status === "done");
+  const [journey, setJourney] = useState(null);
+  const done = st.attempts
+    .filter((a) => a.status === "done")
+    .sort((a, b) => (a.finished || 0) - (b.finished || 0));
   const latest = done[done.length - 1];
+  useEffect(() => {
+    api("/skill-journey")
+      .then(setJourney)
+      .catch(() => {});
+  }, [latest?.id]);
   useEffect(() => {
     if (latest)
       api(`/attempts/${latest.id}/result`)
@@ -2175,9 +2500,22 @@ function Passport({ st, refresh }) {
     }
   };
   if (!latest) return <p className="note">{t("needVerified")}</p>;
+  const autoPassports = (st.passports || []).filter((p) => p.auto && !p.revoked);
   return (
     <section>
       <h2>{t("passportTitle")}</h2>
+      {autoPassports.length > 0 && (
+        <p className="success-note">
+          A verified Skill Passport was created automatically when a reviewer
+          approved your assessment result. You can share or revoke it below.
+        </p>
+      )}
+      {journey?.latest_result && !journey.approved && (
+        <p className="note">
+          Your latest result is awaiting human review. A verified Skill Passport
+          will be created automatically after the result is approved.
+        </p>
+      )}
       <div className="card">
         <p>{t("passportHelp")}</p>
         {res && (
@@ -2196,7 +2534,7 @@ function Passport({ st, refresh }) {
                       )
                     }
                   />{" "}
-                  <strong>{k}</strong> · {v.score}% · {t("levels")[v.level]}
+                  <strong>{v.label || k}</strong> · {v.score}% · {t("levels")[v.level]}
                 </label>
               </li>
             ))}
@@ -2222,6 +2560,9 @@ function Passport({ st, refresh }) {
             {st.passports.map((p) => (
               <li key={p.id}>
                 <code>{link(p.id)}</code>
+                {p.auto && !p.revoked && (
+                  <span className="chip chip-ok">Auto-verified</span>
+                )}
                 {p.revoked ? (
                   <span className="chip chip-rev">{t("revoked")}</span>
                 ) : (
@@ -2764,9 +3105,13 @@ function CandidateApplications() {
 }
 function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
   const [section, setSection] = useState("overview");
-  const [journeyView, setJourneyView] = useState(
-    st.from_profile ? "profile" : st.confirmed ? "gap" : "profile",
-  );
+  const [journeyView, setJourneyView] = useState(() => {
+    const completed = (st.attempts || []).filter(
+      (a) => a.status === "done",
+    ).length;
+    if (!st.from_profile) return "profile";
+    return completed > 0 ? "gap" : "assess";
+  });
   useEffect(() => {
     api("/candidate/profile/status")
       .then((result) => {
@@ -2935,7 +3280,7 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
                 <button className="metric-card" onClick={() => go("profile")}>
                   <span className="metric-icon">◉</span>
                   <span className="metric-label">Profile & CV</span>
-                  <strong>{st.has_cv ? "CV added" : "Build profile"}</strong>
+                  <strong>{st.from_profile ? "Profile added" : st.has_cv ? "CV added" : "Build profile"}</strong>
                   <small>{st.confirmed?.length || 0} confirmed skills</small>
                 </button>
                 <button className="metric-card" onClick={() => go("journey")}>
@@ -3073,7 +3418,7 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
                     className={
                       (journeyView === s ? "on " : "") +
                       (done.length === 0 &&
-                      ["learn", "retest", "passport"].includes(s)
+                      ["gap", "learn", "retest", "passport"].includes(s)
                         ? "dim"
                         : "")
                     }
@@ -3178,18 +3523,25 @@ function ProfileJourneyRouter({ st, refresh, onEditProfile, tick, setTick, done,
           onEditProfile={onEditProfile}
           onDone={async () => {
             await refresh();
-            setV("gap");
+            setV("assess");
           }}
         />
       )}
-      {v === "gap" && <Gap refreshKey={tick} onStart={() => setV("assess")} />}
+      {v === "gap" && (
+        <Gap
+          st={st}
+          refreshKey={tick}
+          onStart={() => setV("learn")}
+          actionLabel="Continue to learning path"
+        />
+      )}
       {v === "assess" && (
         <Exam
           kind="pre"
           st={st}
           refresh={refresh}
-          afterResult={() => setV("learn")}
-          afterLabel="Learning path"
+          afterResult={() => setV("gap")}
+          afterLabel="View results & gap"
         />
       )}
       {v === "learn" && <Learn onNext={() => setV("retest")} />}
@@ -3386,6 +3738,7 @@ function AdminConsole({ onLogout }) {
     setSaving(true);
     try {
       const body = { reason: reason.trim() };
+      let actionResult = null;
       if (action.kind === "user") {
         body.status = action.decision;
         await api("/admin/users/" + action.id + "/status", {
@@ -3409,7 +3762,7 @@ function AdminConsole({ onLogout }) {
       }
       if (action.kind === "assessment") {
         body.decision = action.decision;
-        await api("/admin/attempts/" + action.id + "/review", {
+        actionResult = await api("/admin/attempts/" + action.id + "/review", {
           method: "POST",
           body,
         });
@@ -3436,7 +3789,13 @@ function AdminConsole({ onLogout }) {
         });
       }
       setAction(null);
-      flash("Decision saved and recorded in the audit trail.");
+      flash(
+        actionResult?.passport_id
+          ? "Result approved. The learning path is now verified and a Skill Passport was created automatically."
+          : actionResult?.learning_path_updated
+            ? "Result approved. The candidate learning path has been updated."
+            : "Decision saved and recorded in the audit trail.",
+      );
       await load();
     } catch (x) {
       setError(x.message || "Action failed.");
@@ -4534,7 +4893,10 @@ function AdminConsole({ onLogout }) {
                 The current assessment engine uses deterministic answer-key /
                 SQL grading. This report shows that automated evaluation and
                 source evidence; it does not claim an LLM-generated judgement.
-                Older attempts may not contain saved raw answers.
+                Approving a result updates the candidate's verified learning path
+                and issues a Skill Passport automatically. Invalidating or
+                requesting more information revokes that passport. Older attempts
+                may not contain saved raw answers.
               </div>
               <div className="ad-toolbar">
                 <input
@@ -4938,6 +5300,9 @@ function AdminConsole({ onLogout }) {
                         {data.graphrag?.active_question_count ?? "—"} active
                         questions · Fundamental{" "}
                         {data.graphrag?.fundamental_selected_count ?? 0}/25 ·
+                        CV skills{" "}
+                        {data.graphrag?.covered_skill_count ?? 0} covered /{" "}
+                        {data.graphrag?.uncovered_skill_count ?? 0} pending ·
                         Meilisearch{" "}
                         {data.graphrag?.meilisearch_configured
                           ? "configured"
@@ -4948,11 +5313,20 @@ function AdminConsole({ onLogout }) {
                           : "not connected"}
                       </p>
                       <small>
-                        This experimental 25-question + CV-skill blueprint is
-                        separate from the standard 10-question adaptive
-                        candidate assessment. Its readiness status does not
-                        block candidates from taking the standard test.
+                        This 25-question + CV-skill blueprint uses the same skill
+                        catalogue as the candidate profile and skill journey.
+                        Skills without a complete per-difficulty quota are
+                        reported below; no questions are fabricated.
                       </small>
+                      {!!data.graphrag?.uncovered_skills?.length && (
+                        <small>
+                          Pending bank coverage:{" "}
+                          {data.graphrag.uncovered_skills
+                            .slice(0, 6)
+                            .map((x) => x.label)
+                            .join(" · ")}
+                        </small>
+                      )}
                       {data.graphrag?.fundamental_shortages?.length > 0 && (
                         <small>
                           Missing:{" "}
@@ -9112,15 +9486,37 @@ function HiringWorkspace({ role, onLogout }) {
                 <p>Applied {date(detail.created)}</p>
               </div>
               <div className="cr-report-section">
-                <h3>Required job skills</h3>
+                <h3>Required job skills vs candidate evidence</h3>
                 <div className="cr-tags">
-                  {(detail.required_skills || []).map((s) => (
-                    <span>{s}</span>
-                  ))}
+                  {(detail.candidate_skills || detail.required_skills || []).map(
+                    (s, index) => {
+                      const name = typeof s === "string" ? s : s.required;
+                      const status = typeof s === "string" ? "not_shared" : s.status;
+                      return (
+                        <span key={`${name}-${index}`}>
+                          {name} · {String(status).replaceAll("_", " ")}
+                          {typeof s === "object" && s.score != null
+                            ? ` · ${s.score}%`
+                            : ""}
+                        </span>
+                      );
+                    },
+                  )}
                 </div>
+                {detail.skill_evidence_summary && (
+                  <p className="cr-footnote">
+                    Verified {detail.skill_evidence_summary.verified ?? 0} ·
+                    Claimed {detail.skill_evidence_summary.claimed ?? 0} ·
+                    Missing {detail.skill_evidence_summary.missing ?? 0}
+                    {detail.skill_evidence_summary.not_shared
+                      ? ` · Not shared ${detail.skill_evidence_summary.not_shared}`
+                      : ""}
+                  </p>
+                )}
                 <p className="cr-footnote">
-                  Candidate-level verified / claimed / missing evidence is not
-                  yet available in the API.
+                  {detail.results_shared
+                    ? "Claimed and verified skill evidence is shown because the candidate shared results for this application. Contact details and CV files remain private."
+                    : "The candidate has not shared assessment evidence for this application."}
                 </p>
               </div>
               <div className="cr-report-section">

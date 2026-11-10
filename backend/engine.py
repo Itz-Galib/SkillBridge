@@ -290,18 +290,20 @@ def gap_map(topic_scores):
     rows = []
     for r in JOB["required"]:
         s = (topic_scores or {}).get(r["skill"])
+        score = s.get("score") if isinstance(s, dict) else None
         rows.append({"skill": r["skill"], "name": TAXONOMY[r["skill"]]["name"], "threshold": r["threshold"],
-                     "score": s["score"] if s else None,
-                     "status": "unverified" if s is None else ("met" if s["score"] >= r["threshold"] else "below")})
+                     "score": score,
+                     "status": "unverified" if score is None else ("met" if score >= r["threshold"] else "below")})
     return rows
 
 def build_path(topic_scores):
     items, gaps = [], []
     for r in JOB["required"]:
         s = (topic_scores or {}).get(r["skill"])
-        if s is not None and s["score"] >= r["threshold"]: continue
+        score = s.get("score") if isinstance(s, dict) else None
+        if score is not None and score >= r["threshold"]: continue
         gaps.append(r["skill"])
-        need = 1 if (s is None or s["score"] < 40) else 2
+        need = 1 if (score is None or score < 40) else 2
         cands = sorted([x for x in RESOURCES if x["topic"] == r["skill"] and x["level"] >= 1], key=lambda x: (abs(x["level"] - need), x["level"]))
         if not cands:
             items.append({"topic": r["skill"], "none": True})   # honest "no resource found"

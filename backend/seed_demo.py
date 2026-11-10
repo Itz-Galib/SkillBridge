@@ -15,12 +15,11 @@ import time
 import uuid
 
 import engine as E
-from main import SECRET, hash_pw, init_db, one, run
+from main import CONSENT_VERSION, SECRET, hash_pw, init_db, one, run
 
 DEMO_EMAIL = "demo@skillbridge.test"
 DEMO_NAME = "Demo Candidate"
 DEMO_PASSWORD = "demo12345"
-CONSENT_VERSION = "r0-1"
 
 # The same synthetic CV the UI offers via the "Use sample CV" button.
 CV_TEXT = """Sadia Rahman
@@ -75,9 +74,11 @@ def _simulate(seed, seen_before, correct_prefix):
 def _store_attempt(uid, kind, seed, st, started, finished):
     """Write a completed attempt and return (attempt_id, result)."""
     res = E.score(st["answers"])
-    label, reasons = E.trust_label({"paste": 0, "blur": 0}, st["answers"])
-    res.update({"trust": label, "trust_reasons": reasons, "percentile": None,
-                "kind": kind, "date": time.strftime("%Y-%m-%d")})
+    trust = E.trust_label({"paste": 0, "blur": 0}, st["answers"])
+    res.update({"trust": trust["label"], "trust_points": trust["points"],
+                "trust_rule_version": trust["rule_version"],
+                "trust_reasons": trust["reasons"], "trust_hard_flags": trust["hard_flags"],
+                "percentile": None, "kind": kind, "date": time.strftime("%Y-%m-%d")})
     aid = uuid.uuid4().hex[:12]
     run("INSERT INTO attempts(id,user_id,kind,seed,status,state,started,finished,result,appeal) "
         "VALUES (?,?,?,?,?,?,?,?,?,NULL)",

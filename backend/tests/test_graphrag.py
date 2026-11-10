@@ -5,8 +5,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from graphrag import (
     CVSkill, FUNDAMENTAL_DIFFICULTY_MATRIX, FUNDAMENTAL_TARGETS,
-    build_assessment, extract_cv_skills, question_page,
+    SKILL_ALIASES, SKILL_LABELS, build_assessment, canonical_skill_ids,
+    extract_cv_skills, question_page, skill_coverage,
 )
+from content import TAXONOMY
 
 
 def question(qid, category, subcategory, prompt, difficulty, qtype="MCQ", seconds=60):
@@ -171,3 +173,62 @@ def test_retake_filter_excludes_previously_asked_questions():
     assert not (retake_ids & first_ids), "retake repeated previously-asked questions"
     assert len(retake_ids) == len(first_ids)
     assert set(retake["excluded_ids"]) == first_ids
+
+
+def test_graphrag_uses_the_profile_taxonomy_as_its_skill_namespace():
+    assert set(TAXONOMY) == set(SKILL_ALIASES)
+    for skill_id, spec in TAXONOMY.items():
+        assert SKILL_LABELS[skill_id] == spec["name"]
+        assert skill_id.replace("_", " ") in SKILL_ALIASES[skill_id]
+
+
+def test_free_text_profile_skill_names_resolve_to_canonical_ids():
+    assert canonical_skill_ids("Django") == ["python"]
+    assert canonical_skill_ids("React") == ["javascript"]
+    assert canonical_skill_ids("Power BI") == ["visualization"]
+    assert canonical_skill_ids("Data Structures & Algorithms") == ["dsa"]
+    assert canonical_skill_ids("C++") == ["cpp"]
+    assert canonical_skill_ids("C#") == ["csharp"]
+    assert canonical_skill_ids("Machine Learning") == ["ai_ml"]
+
+
+def test_skill_coverage_reports_ready_and_pending_skills():
+    coverage = skill_coverage(complete_bank())
+    assert coverage["python"]["covered"] is True
+    assert coverage["python"]["active_questions"] == 5
+    assert coverage["docker"]["covered"] is False
+    assert coverage["docker"]["missing"] == {"Easy": 1, "Medium": 2, "Hard": 2}
+
+
+def test_symbol_skills_do_not_collapse_to_the_same_letter():
+    rows = [question("cpp-1", "CAT-10", "C++", "C++ pointer question", "Easy")]
+    coverage = skill_coverage(rows)
+    assert coverage["cpp"]["active_questions"] == 1
+    assert coverage["csharp"]["active_questions"] == 0
+
+
+def test_uncovered_cv_skill_is_reported_not_fabricated():
+    result = build_assessment(
+        complete_bank(), [CVSkill(skill_id="docker", label="Docker")], retrieval=False
+    )
+    assert result["status"] == "ready"  # fundamentals are complete
+    assert result["fundamental_count"] == 25
+    assert result["cv_count"] == 0
+    assert result["covered_skill_ids"] == []
+    assert [item["skill_id"] for item in result["uncovered_skills"]] == ["docker"]
+    assert result["uncovered_skills"][0]["reason"] == "question_bank_coverage"
+    assert all(s.get("fatal", False) is False for s in result["uncovered_skills"])
+
+
+def test_covered_and_uncovered_skills_can_share_a_blueprint():
+    result = build_assessment(
+        complete_bank(),
+        [CVSkill(skill_id="python", label="Python"), CVSkill(skill_id="docker", label="Docker")],
+        retrieval=False,
+    )
+    assert result["status"] == "ready"
+    assert result["covered_skill_ids"] == ["python"]
+    assert result["cv_count"] == 5
+    assert [item["skill_id"] for item in result["uncovered_skills"]] == ["docker"]
+    assert all(q.get("assessment_topic_key") for q in result["questions"])
+    assert {q["assessment_topic_key"] for q in result["cv_based"]} == {"python"}

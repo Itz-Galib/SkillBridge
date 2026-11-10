@@ -3,8 +3,8 @@ import json, time, uuid, os, re, secrets, csv, io, logging
 from typing import Annotated, Optional, List, Literal
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from main import current_user, one, allr, run, audit, QBYID, db, DATABASE_URL, COOLDOWN_HOURS, MAX_ATTEMPTS_90D
-from content import RESOURCES, JOB
+from main import current_user, one, allr, run, audit, QBYID, db, DATABASE_URL, COOLDOWN_HOURS, MAX_ATTEMPTS_90D, profile_skill_entries
+from content import RESOURCES, JOB, TAXONOMY
 from urllib.parse import urlparse
 
 router = APIRouter(tags=["hiring"])
@@ -1208,6 +1208,8 @@ def company_application_detail(application_id: str, user=Depends(current_user)):
     item["results_shared"] = bool(item["results_shared"])
     item["required_skills"] = json.loads(item.pop("job_skills") or "[]")
     item["assessment_history"] = []
+    item["candidate_skills"] = []
+    item["skill_evidence_summary"] = {"verified": 0, "claimed": 0, "missing": 0, "not_shared": 0}
     if item["results_shared"]:
         attempts = allr("SELECT id,result,finished FROM attempts WHERE user_id=? AND status='done' ORDER BY finished DESC",
                         (item["candidate_id"],))
@@ -1221,13 +1223,64 @@ def company_application_detail(application_id: str, user=Depends(current_user)):
                 "topics": result.get("topics", {}), "result_status": "prototype",
                 "integrity_summary": "No recruiter-facing integrity evidence is available; human review status is not asserted."
             })
+        # Align the company view with the candidate's profile/CV skill journey.
+        import graphrag as G
+        profile_row = one("SELECT skills FROM candidate_profiles WHERE user_id=?", (item["candidate_id"],))
+        profile_entries = profile_skill_entries(
+            {"skills": json.loads(profile_row["skills"] or "[]")}
+        ) if profile_row else []
+        claimed_ids = {skill_id for entry in profile_entries for skill_id in (entry.get("taxonomy_ids") or [])}
+        confirmed_row = one("SELECT confirmed FROM profiles WHERE user_id=?", (item["candidate_id"],))
+        if confirmed_row and confirmed_row["confirmed"]:
+            claimed_ids.update(json.loads(confirmed_row["confirmed"]))
+        latest_topics = json.loads(attempts[0]["result"]).get("topics", {}) if attempts and attempts[0]["result"] else {}
+        for required_name in item["required_skills"]:
+            ids = G.canonical_skill_ids(str(required_name))
+            topic_id = next((skill_id for skill_id in ids if skill_id in latest_topics), None)
+            topic_score = None
+            topic_level = None
+            if topic_id and isinstance(latest_topics.get(topic_id), dict):
+                topic_score = latest_topics[topic_id].get("score")
+                topic_level = latest_topics[topic_id].get("level")
+            if topic_score is not None:
+                status = "verified"
+                score = topic_score
+            elif any(skill_id in claimed_ids for skill_id in ids):
+                status = "claimed"
+                score = None
+            else:
+                status = "missing"
+                score = None
+            item["candidate_skills"].append({
+                "required": required_name,
+                "skill_ids": ids,
+                "status": status,
+                "score": score,
+                "level": topic_level,
+                "threshold_met": bool(score is not None and score >= 60),
+                "verified": status == "verified",
+            })
+        summary = {"verified": 0, "claimed": 0, "missing": 0, "not_shared": 0}
+        for skill in item["candidate_skills"]:
+            summary[skill["status"]] = summary.get(skill["status"], 0) + 1
+        item["skill_evidence_summary"] = summary
+    else:
+        item["candidate_skills"] = [
+            {"required": name, "skill_ids": [], "status": "not_shared", "score": None,
+             "level": None, "threshold_met": False, "verified": False}
+            for name in item["required_skills"]
+        ]
+        item["skill_evidence_summary"]["not_shared"] = len(item["candidate_skills"])
     notes = allr("SELECT id,body,author_id,created FROM application_notes WHERE application_id=? AND company_id=? ORDER BY created DESC",
                  (application_id, company["id"]))
     history = allr("SELECT from_stage,to_stage,reason,actor_id,created FROM application_history WHERE application_id=? AND company_id=? ORDER BY created DESC",
                    (application_id, company["id"]))
     item["notes"] = [dict(n) for n in notes] if company_role_for(user, company) in ("owner", "recruiter", "hiring_manager") else []
     item["history"] = [dict(h) for h in history]
-    item["profile_visibility"] = "Candidate profile details are not exposed by this prototype unless a dedicated sharing flow is implemented."
+    item["profile_visibility"] = (
+        "Skill evidence is shown only because the candidate shared results for this application. "
+        "Contact details, CV files and free-text profile fields remain private."
+    )
     return item
 
 
@@ -1780,14 +1833,51 @@ def admin_review_attempt(attempt_id: str, body: AdminReviewInput, user=Depends(c
     admin_only(user, "assessment_review")
     if body.decision not in ("approved", "needs_more_info", "invalidated"):
         raise HTTPException(422, "Unsupported review decision")
-    if not one("SELECT id FROM attempts WHERE id=?", (attempt_id,)):
+    attempt = one("SELECT id,user_id,result FROM attempts WHERE id=?", (attempt_id,))
+    if not attempt:
         raise HTTPException(404, "Assessment attempt not found")
+    now = time.time()
     run("""INSERT INTO admin_attempt_reviews(attempt_id,decision,reason,reviewer_id,reviewed_at)
            VALUES (?,?,?,?,?) ON CONFLICT(attempt_id) DO UPDATE SET decision=excluded.decision,
            reason=excluded.reason,reviewer_id=excluded.reviewer_id,reviewed_at=excluded.reviewed_at""",
-        (attempt_id, body.decision, body.reason.strip(), user["id"], time.time()))
+        (attempt_id, body.decision, body.reason.strip(), user["id"], now))
+
+    # The technical score is immutable. Only the human-review status is recorded
+    # on the result so the candidate UI and learning path can reflect approval.
+    if attempt["result"]:
+        try:
+            result = json.loads(attempt["result"])
+        except Exception:
+            result = None
+        if isinstance(result, dict):
+            result["review_status"] = body.decision
+            result["human_review_decision"] = body.decision
+            result["human_review_reason"] = body.reason.strip()
+            result["reviewed_at"] = now
+            result["reviewer_id"] = user["id"]
+            if body.decision == "approved":
+                result["manual_review_required"] = False
+                for question_result in result.get("question_results", []) or []:
+                    if question_result.get("review_status") == "pending_human_review":
+                        question_result["review_status"] = "human_approved"
+            run("UPDATE attempts SET result=? WHERE id=?", (json.dumps(result), attempt_id))
+
+    passport_id = None
+    learning_path_updated = False
+    if body.decision == "approved":
+        from main import create_passport_for_attempt
+        passport_id = create_passport_for_attempt(attempt["user_id"], attempt_id)
+        learning_path_updated = True
+    else:
+        # A result that is no longer approved must not keep verified evidence.
+        run("UPDATE passports SET revoked=1 WHERE user_id=? AND source_attempt=? AND revoked=0",
+            (attempt["user_id"], attempt_id))
+
     audit(user["id"], "assessment_result_reviewed", attempt_id + ":" + body.decision + ":" + body.reason.strip())
     return {"attempt_id": attempt_id, "decision": body.decision,
+            "review_status": body.decision,
+            "passport_id": passport_id,
+            "learning_path_updated": learning_path_updated,
             "note": "The original answer record and deterministic score were not modified."}
 
 
@@ -1869,7 +1959,7 @@ QUESTION_CATEGORIES = [
     {"id":"CAT-07","name":"IQ & Aptitude","icon":"◎","description":"Logical, numerical and analytical reasoning","subcategories":["Logical Reasoning","Numerical Ability","Pattern Recognition","Verbal Reasoning","Data Interpretation"]},
     {"id":"CAT-08","name":"CS Fundamentals","icon":"▦","description":"Core computer science and engineering concepts","subcategories":["Operating Systems","Computer Networks","DBMS","OOP Concepts","Software Engineering","Computer Architecture","Compiler Basics"]},
     {"id":"CAT-09","name":"System Design","icon":"⌘","description":"Architecture, APIs, scalability and reliability","subcategories":["Architecture","API Design","Scalability","Caching","Messaging","Database Design","Security & Reliability"]},
-    {"id":"CAT-10","name":"CV Technology Skills","icon":"◇","description":"Technology-specific questions matched to explicitly confirmed CV skills","subcategories":["Python","Git","AI & Machine Learning","SQL","JavaScript","Java","Docker","Cloud","Other"]}
+    {"id":"CAT-10","name":"CV Technology Skills","icon":"◇","description":"Technology-specific questions matched to explicitly confirmed CV skills","subcategories":[spec["name"] for spec in TAXONOMY.values()] + ["Other"]}
 ]
 QUESTION_CATEGORY_BY_ID = {x["id"]:x for x in QUESTION_CATEGORIES}
 QUESTION_CATEGORY_BY_NAME = {x["name"].lower():x["id"] for x in QUESTION_CATEGORIES}
@@ -2618,10 +2708,17 @@ def ensure_learning_schema():
     for item in RESOURCES:
         rid = str(item["id"])
         run("""INSERT INTO learning_resources(id,topic,title,provider,url,language,level,licence,estimated_minutes,
-               verification_status,created_by,created_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,'pending_review',0,?,?) ON CONFLICT(id) DO NOTHING""",
+               verification_status,last_checked_at,review_note,created_by,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,'verified',?,?,0,?,?) ON CONFLICT(id) DO NOTHING""",
             (rid, item["topic"], item["title"], item["source"], item["url"], item.get("lang","en"),
-             int(item.get("level",1)), item.get("licence",""), int(item.get("minutes",30)), now, now))
+             int(item.get("level",1)), item.get("licence",""), int(item.get("minutes",30)), now,
+             "Built-in curated resource approved for the prototype catalogue.", now, now))
+    # Built-in resources edited by a human curator remain approved; admin-added
+    # resources still enter as pending_review and require an explicit decision.
+    run("""UPDATE learning_resources SET verification_status='verified', last_checked_at=?,
+           review_note=CASE WHEN review_note='' THEN ? ELSE review_note END, updated_at=?
+           WHERE created_by=0 AND verification_status='pending_review'""",
+        (now, "Built-in curated resource approved for the prototype catalogue.", now))
 
 
 ensure_learning_schema()
@@ -2658,12 +2755,73 @@ class LearningResourceInput(BaseModel):
 @router.get("/api/learning/dashboard")
 def candidate_learning_dashboard(user=Depends(current_user)):
     require_role(user, "candidate")
-    latest = one("SELECT id,result,finished FROM attempts WHERE user_id=? AND status='done' ORDER BY finished DESC LIMIT 1", (user["id"],))
-    topics = json.loads(latest["result"]).get("topics", {}) if latest and latest["result"] else {}
-    gaps = [r["skill"] for r in JOB["required"]
-            if not topics.get(r["skill"]) or float(topics[r["skill"]].get("score", 0)) < float(r["threshold"])]
+    # One current result for the candidate: the latest completed attempt. Its
+    # human-review decision is the only thing that changes between provisional
+    # and verified. Keeping this single source avoids the Verify / Gap / Learn
+    # screens showing different scores.
+    latest = one("""SELECT id,kind,result,finished,started
+                    FROM attempts WHERE user_id=? AND status='done'
+                    ORDER BY finished DESC LIMIT 1""", (user["id"],))
+    review = one("""SELECT decision,reason,reviewed_at FROM admin_attempt_reviews
+                    WHERE attempt_id=?""", (latest["id"],)) if latest else None
+    approved = bool(review and review["decision"] == "approved")
+    result = json.loads(latest["result"]) if latest and latest["result"] else {}
+    topics = result.get("topics", {}) if isinstance(result, dict) else {}
+    review_status = (review["decision"] if review else
+                     ((result.get("review_status") if isinstance(result, dict) else None) or "pending_review"))
+
+    # Align learning recommendations with the same profile/CV skills used by the
+    # skill journey and GraphRAG. The mock job's four topics remain a baseline.
+    profile_row = one("SELECT skills FROM candidate_profiles WHERE user_id=?", (user["id"],))
+    profile_ids = []
+    if profile_row:
+        entries = profile_skill_entries({"skills": json.loads(profile_row["skills"] or "[]")})
+        profile_ids = [skill_id for entry in entries for skill_id in (entry.get("taxonomy_ids") or [])]
+    # Include legacy CV-only confirmations so learning stays aligned with the journey.
+    confirmed_row = one("SELECT confirmed FROM profiles WHERE user_id=?", (user["id"],))
+    if confirmed_row and confirmed_row["confirmed"]:
+        profile_ids.extend(json.loads(confirmed_row["confirmed"]))
+    profile_ids = list(dict.fromkeys(profile_ids))
+    # When the candidate has profile/CV skills, the learning path is based on
+    # those skills and the assessed topics. The mock job baseline is used only for
+    # candidates who have not confirmed any profile skills yet.
+    baseline_ids = [] if profile_ids else [r["skill"] for r in JOB["required"]]
+    candidate_ids = list(dict.fromkeys([
+        *profile_ids,
+        *baseline_ids,
+        *[str(topic) for topic in topics],
+    ]))
+    # Learning recommendations start after the first completed assessment.
     if not latest:
-        gaps = [r["skill"] for r in JOB["required"]]
+        candidate_ids = []
+
+    performance = []
+    gaps = []
+    for skill_id in candidate_ids:
+        entry = topics.get(skill_id)
+        score = entry.get("score") if isinstance(entry, dict) else None
+        label = (TAXONOMY.get(skill_id, {}).get("name")
+                 or (entry.get("label") if isinstance(entry, dict) else None)
+                 or skill_id.replace("_", " ").title())
+        if score is None:
+            status = "pending_review" if skill_id in topics else "not_assessed"
+            is_gap = True
+        elif float(score) < 60:
+            status = "below"
+            is_gap = True
+        else:
+            status = "met"
+            is_gap = False
+        item = {
+            "skill": skill_id, "name": label, "score": score,
+            "level": entry.get("level") if isinstance(entry, dict) else None,
+            "status": status, "is_gap": is_gap,
+        }
+        performance.append(item)
+        if is_gap:
+            gaps.append(skill_id)
+    gap_details = [item for item in performance if item["is_gap"]]
+
     resources = allr("""SELECT r.*,p.status AS progress_status,p.started_at,p.completed_at
                         FROM learning_resources r LEFT JOIN learning_progress p
                         ON p.resource_id=r.id AND p.user_id=?
@@ -2672,30 +2830,56 @@ def candidate_learning_dashboard(user=Depends(current_user)):
     attempts = allr("SELECT id,kind,status,started,finished,result FROM attempts WHERE user_id=? ORDER BY started DESC LIMIT 30", (user["id"],))
     policy = _retake_policy()
     recent = [a for a in attempts if a["status"] == "done" and a["finished"] and a["finished"] > time.time()-90*86400]
-    last = next((a for a in attempts if a["status"] == "done"), None)
+    last = latest
+    awaiting_review = bool(last and not review)
     cooldown_until = (last["finished"] + int(policy["cooldown_hours"])*3600) if last else None
     balance = _learning_balance(user["id"])
     cost = int(policy["credits_per_attempt"])
     active = one("SELECT id FROM attempts WHERE user_id=? AND status='active'", (user["id"],))
-    can_retry = bool(last and len(recent) < int(policy["max_attempts_90d"]) and
+    can_retry = bool(last and not awaiting_review and len(recent) < int(policy["max_attempts_90d"]) and
                      (not cooldown_until or time.time() >= cooldown_until) and balance >= cost and not active)
     progress = allr("SELECT status,COUNT(*) AS count FROM learning_progress WHERE user_id=? GROUP BY status", (user["id"],))
     progress_counts = {r["status"]: r["count"] for r in progress}
     history = []
     for a in attempts:
-        result = json.loads(a["result"]) if a["result"] else {}
+        attempt_result = json.loads(a["result"]) if a["result"] else {}
         ledger = one("SELECT delta,created FROM billing_credit_ledger WHERE user_id=? AND source_ref=? AND entry_type='retake_consumption' LIMIT 1", (user["id"], a["id"]))
         history.append({"id":a["id"],"kind":a["kind"],"status":a["status"],"started":a["started"],"finished":a["finished"],
-                        "score":result.get("overall"),"credit_consumed":abs(int(ledger["delta"])) if ledger else 0,
+                        "score":attempt_result.get("overall"),"credit_consumed":abs(int(ledger["delta"])) if ledger else 0,
                         "credit_consumed_at":ledger["created"] if ledger else None})
-    return {"based_on":latest["id"] if latest else None,"gaps":gaps,"resources":[dict(r) for r in resources],
+    passport = one("SELECT id,created,revoked FROM passports WHERE user_id=? AND source_attempt=? ORDER BY created DESC LIMIT 1",
+                   (user["id"], latest["id"])) if latest else None
+    result_summary = None
+    if latest:
+        result_summary = {
+            "attempt_id": latest["id"], "kind": latest["kind"],
+            "overall": result.get("overall"), "level": result.get("level"),
+            "trust": result.get("trust"), "date": result.get("date"),
+            "finished": latest["finished"], "review_status": review_status,
+            "approved": approved, "reviewed_at": review["reviewed_at"] if review else None,
+            "review_reason": review["reason"] if review else None,
+            "section_scores": result.get("section_scores"),
+            "scoring_version": result.get("scoring_version"),
+        }
+    return {"based_on":latest["id"] if latest else None,"gaps":gaps,
+            "gap_labels":{skill_id: TAXONOMY.get(skill_id, {}).get("name", skill_id.replace("_", " ").title()) for skill_id in gaps},
+            "gap_details": gap_details,
+            "performance": performance,
+            "profile_skills":[{"id":skill_id,"name":TAXONOMY.get(skill_id,{}).get("name",skill_id)} for skill_id in dict.fromkeys(profile_ids)],
+            "resources":[dict(r) for r in resources],
+            "result_summary": result_summary,
+            "approved": approved,
+            "review_status": review_status,
+            "reviewed_at": review["reviewed_at"] if review else None,
+            "passport": dict(passport) if passport else None,
             "progress":{"started":progress_counts.get("started",0),"completed":progress_counts.get("completed",0)},
             "retake":{"balance":balance,"credit_cost":cost,"cooldown_hours":int(policy["cooldown_hours"]),
                       "max_attempts_90d":int(policy["max_attempts_90d"]),"attempts_used_90d":len(recent),
                       "cooldown_until":cooldown_until,"eligible":can_retry,"active_attempt":bool(active),
-                      "has_result":bool(last)},
+                      "has_result":bool(last),"awaiting_review":awaiting_review,
+                      "latest_review_status":review_status if last else None},
             "attempt_history":history,
-            "note":"Only admin-verified resources are shown. Retake credits are consumed when an official retake attempt is created, not when the candidate opens this page."}
+            "note":"Only approved curated resources are shown. Retake credits are consumed when an official retake attempt is created, not when the candidate opens this page."}
 
 
 class LearningProgressInput(BaseModel):

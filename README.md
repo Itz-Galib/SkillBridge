@@ -101,11 +101,11 @@ The experimental GraphRAG blueprint path is built around the existing, curator-g
 
 - **Fundamental section:** 25 questions across DSA (5), OOP (4), Networking (4), Coding (5), Database (5), and Critical Thinking (2).
 - **Difficulty:** 40/30/30 is not an exact integer split for 25 questions. The engine uses the nearest whole-question allocation: 10 Easy, 8 Medium, 7 Hard. The per-topic matrix is returned with every blueprint.
-- **CV section:** five questions per candidate-confirmed CV skill: 1 Easy, 2 Medium, 2 Hard. CV skill extraction uses the redacted CV and the expanded technology taxonomy.
-- **Question formats:** the approved bank must cover scenario-based, explanation, SQL and coding questions in the fundamental section. Each CV skill must have practical (coding/SQL) and scenario/explanation coverage.
+- **CV section:** five questions per candidate-confirmed CV/profile skill: 1 Easy, 2 Medium, 2 Hard. Skills are resolved through the single `content.TAXONOMY` catalogue used by the candidate profile, skill journey, admin coverage view and company application view, so free-text skills such as "Django", "React" or "Power BI" map to the same canonical ids everywhere. A confirmed skill without a complete approved-question quota is reported as `question_bank_pending` instead of being silently dropped; the rest of the assessment still runs.
+- **Question formats:** the approved bank must cover scenario-based, explanation, SQL and coding questions in the fundamental section. Each assessable CV skill should have practical (coding/SQL) and scenario/explanation coverage.
 - **Duration:** the server calculates the assessment duration by summing each selected question's configured `time_allocation`; it is not a fixed exam duration.
-- **Candidate experience:** five questions are shown per page in a table, with previous/next page navigation, per-question answer saving, a server-side timer and post-submit answer review. Correct answers are not exposed during the exam.
-- **Auditability:** each generated blueprint stores the selected question IDs, CV skill evidence, retrieval trace, provider status, quota gaps and retrieval latency. Attempt answers and submission results are stored in the existing attempt record. MCQs and SQL questions with a canonical reference query are automatically graded; SQL questions without a reference query, coding, scenario and explanation responses are flagged for human review.
+- **Candidate experience:** five questions are shown per page in a table, with previous/next page navigation, per-question answer saving, a server-side timer and post-submit answer review. Correct answers are not exposed during the exam. Topic scores are stored under canonical skill ids so the learning path, uplift and Skill Passport stay aligned with the skill journey.
+- **Auditability:** each generated blueprint stores the selected question IDs, CV skill evidence, covered and pending skills, retrieval trace, provider status, quota gaps and retrieval latency. Attempt answers and submission results are stored in the existing attempt record. MCQs and SQL questions with a canonical reference query are automatically graded; SQL questions without a reference query, coding, scenario and explanation responses are flagged for human review.
 
 ### Retrieval architecture
 
@@ -124,14 +124,15 @@ The relational question bank remains the source of truth. Meilisearch and Neo4j 
 
 ### Required question-bank preparation
 
-The selector fails closed when a quota is missing. Admins must create/import questions, set the correct category and subcategory, difficulty, question type, answer key/reference answer, explanation/rubric and per-question time allocation, then mark reviewed questions **Active**. For SQL questions to be automatically graded, put a canonical SQL query in the Reference answer field; the SQL grader checks it against two generated datasets using the built-in customers/orders schema. Suggested subcategory labels include Python, Git, AI & Machine Learning, SQL, DSA, OOP, Networking and the other exact technology names found in CVs. Do not activate unreviewed questions. The Admin → Question Governance screen exposes GraphRAG readiness and a **Rebuild search + graph index** action.
+The fundamental selector fails closed when a required quota is missing. For the CV section, the same coverage calculation reports each confirmed skill as covered or pending: pending skills are listed in the blueprint and candidate journey, and are not fabricated or silently hidden. Admins must create/import questions, set the correct category and subcategory, difficulty, question type, answer key/reference answer, explanation/rubric and per-question time allocation, then mark reviewed questions **Active**. For SQL questions to be automatically graded, put a canonical SQL query in the Reference answer field; the SQL grader checks it against two generated datasets using the built-in customers/orders schema. Subcategory labels should use the canonical technology names (Python, Git, AI & Machine Learning, SQL, JavaScript, Java, Docker, and so on). Do not activate unreviewed questions. The Admin → Question Governance screen exposes GraphRAG readiness, per-skill coverage and a **Rebuild search + graph index** action.
 
 ### Seed a synthetic GraphRAG assessment bank for testing
 
-The repository includes an explicit, repeatable seed script with **45 synthetic questions**:
-- 25 fundamental questions across DSA (5), OOP (4), Networking (4), Coding (5), Database (5) and Critical Thinking (2).
-- 5 questions each for Python, Git, AI & Machine Learning, and SQL.
-- Per-skill difficulty: 1 Easy, 2 Medium, 2 Hard.
+The repository includes an explicit, repeatable seed script with **100 synthetic questions**:
+- 10 fundamental questions per topic across DSA, OOP, Networking, Coding, Database and Critical Thinking (60 total).
+- 10 questions each for Python, Git, AI & Machine Learning and SQL (40 total).
+- A normal blueprint selects 25 fundamental questions and five per assessable CV skill (for example Python, Git, AI & Machine Learning and SQL = 45 questions). The surplus is what lets the retake filter serve fresh questions without repeating anything the candidate has already seen.
+- Per-skill difficulty in the CV bank: 2 Easy, 4 Medium, 4 Hard, so a 1/2/2 selection is available for two attempts.
 - Includes MCQ, coding, SQL, scenario and explanation formats, answer keys/reference solutions, rubrics and per-question time allocations.
 
 Run this only against a **development or staging database**. If your Render Free service does not provide Shell access, you can use the temporary startup option instead:
@@ -168,6 +169,7 @@ After configuring both services, sign in as an admin, open **Question Governance
 
 - `POST /api/assessment/blueprint` — create and persist a candidate-specific blueprint after CV skill confirmation.
 - `GET /api/assessment/blueprint/{blueprint_id}` — retrieve blueprint readiness metadata for its owner.
+- `GET /api/skill-journey` — the candidate's canonical profile/CV skills with verified, ready, pending-review and question-bank-pending status.
 - `POST /api/attempts` with `{"blueprint_id":"..." }` — start/resume the official attempt and consume existing retake credits under the existing policy.
 - `POST /api/attempts/{attempt_id}/answer` — save a question answer without revealing correctness.
 - `POST /api/attempts/{attempt_id}/navigate` — navigate to a question index.
@@ -231,6 +233,21 @@ The candidate experience now has a dedicated responsive workspace with:
 - Responsive desktop/mobile navigation and explicit MOCK labelling for synthetic jobs.
 
 Candidate profile fields are persisted through `/api/candidate/profile` and the `candidate_profiles` PostgreSQL table. This is still an implementation milestone: verify the full PostgreSQL runtime, authorization, browser accessibility and end-to-end flows before production use.
+
+## Verified result → learning path → automatic Skill Passport
+
+The candidate journey is now:
+
+**Profile → Verify (fundamental + CV-skill assessment) → Results & gap → Learn → Re-take → Skill Passport**
+
+- The assessment result screen shows the score, per-topic performance and whether the result is awaiting human review. GraphRAG results use a documented **60% fundamentals / 40% CV & development** scorecard: DSA, SQL, Networking, OOP, Database, Coding and Critical Thinking form the 60% bucket (SQL is counted here even though its questions live in the CV-technology bank), while all other confirmed CV skills are merged into the 40% bucket. Per-skill topic scores remain visible for the journey and passport.
+- The learning dashboard is generated from the latest exam performance (fundamental and CV-skill topics). If no approved result exists yet it shows provisional recommendations so the candidate can start learning immediately.
+- An admin with assessment-review permission can approve the result. Approval records the reviewer and reason, marks the result as verified, refreshes the learning path and automatically issues a signed Skill Passport for the approved attempt.
+- Invalidating or requesting more information revokes any auto-issued passport for that attempt.
+- Retakes unlock after the current result has a human-review decision, so Verify, Gap, Learn and Passport always describe the same result while it is pending.
+- The passport is linked to its source attempt, is idempotent (re-approval does not duplicate it) and follows the existing revocable public-link model.
+- The built-in curated resource catalogue is seeded as approved for the prototype; admin-added resources still require explicit review, and admins can quarantine or retire any resource.
+
 
 
 ## Exam integrity monitoring (Phase 1 — advisory)

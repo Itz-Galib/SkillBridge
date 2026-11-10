@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS consents(id INTEGER PRIMARY KEY, user_id INT, version
 CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY, redacted TEXT, redaction TEXT, extracted TEXT, source TEXT, confirmed TEXT);
 CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, user_id INT, kind TEXT, seed INT, status TEXT, state TEXT, started REAL, finished REAL, result TEXT, appeal TEXT);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, attempt_id TEXT, type TEXT, ts REAL);
-CREATE TABLE IF NOT EXISTS passports(id TEXT PRIMARY KEY, user_id INT, payload TEXT, signature TEXT, created REAL, revoked INT DEFAULT 0);
+CREATE TABLE IF NOT EXISTS passports(id TEXT PRIMARY KEY, user_id INT, payload TEXT, signature TEXT, created REAL, revoked INT DEFAULT 0, source_attempt TEXT);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL, actor INT, action TEXT, target TEXT);
 CREATE TABLE IF NOT EXISTS user_roles(user_id INTEGER PRIMARY KEY, role TEXT NOT NULL DEFAULT 'candidate');
 CREATE TABLE IF NOT EXISTS companies(id TEXT PRIMARY KEY, owner_user_id INTEGER UNIQUE NOT NULL, name TEXT NOT NULL, website TEXT, verified INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);
@@ -153,6 +153,21 @@ def init_db():
             "ALTER TABLE candidate_profiles ADD COLUMN updated "
             "REAL NOT NULL DEFAULT 0"
         )
+    # Link a passport to the verified assessment attempt that produced it.
+    if DATABASE_URL:
+        passport_columns = {
+            row["column_name"]
+            for row in allr(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='passports'"
+            )
+        }
+    else:
+        passport_columns = {
+            row["name"] for row in allr("PRAGMA table_info(passports)")
+        }
+    if "source_attempt" not in passport_columns:
+        run("ALTER TABLE passports ADD COLUMN source_attempt TEXT")
     import cv_store  # CV document + extraction-draft tables (imported here to avoid a circular import)
     cv_store.ensure_schema()
 
@@ -281,45 +296,43 @@ def latest_done(uid, kind=None):
 
 
 def profile_skill_entries(profile):
-    """Return profile skill names and the taxonomy IDs their names explicitly match."""
+    """Return profile skill names and every taxonomy id their names explicitly match.
+
+    A single free-text skill can legitimately map to more than one canonical
+    skill (for example "SQL Server" -> SQL). The first id is kept in ``id`` for
+    backwards compatibility and ``taxonomy_ids`` carries the full match.
+    """
+    import graphrag as G
     entries = []
+    seen = set()
     for skill in profile.get("skills", []) or []:
         name = skill.get("name", "").strip() if isinstance(skill, dict) else str(skill).strip()
         if not name:
             continue
-        matches = E.rule_extract(name)
-        taxonomy_id = matches[0]["id"] if matches else None
+        taxonomy_ids = G.canonical_skill_ids(name)
+        primary = taxonomy_ids[0] if taxonomy_ids else None
+        key = (name.casefold(), primary)
+        if key in seen:
+            continue
+        seen.add(key)
         entries.append({
             "name": name,
-            "id": taxonomy_id,
-            "taxonomy_id": taxonomy_id,
+            "label": G.SKILL_LABELS.get(primary, name) if primary else name,
+            "id": primary,
+            "taxonomy_id": primary,
+            "taxonomy_ids": taxonomy_ids,
         })
     return entries
 
 
-def sync_skill_journey(user_id, profile):
-    """Rebuild the CV/assessment view from the candidate's confirmed profile."""
-    skill_entries = profile_skill_entries(profile)
-    confirmed = list(dict.fromkeys(
-        entry["id"] for entry in skill_entries if entry["id"]
-    ))
-    extracted = [
-        {
-            "id": skill_id,
-            "name": TAXONOMY[skill_id]["name"],
-            "evidence": next(
-                entry["name"] for entry in skill_entries if entry["id"] == skill_id
-            )[:160],
-            "status": "claimed",
-        }
-        for skill_id in confirmed
-    ]
-
+def _profile_evidence_text(profile, entries):
+    """Build profile evidence used for GraphRAG and for the stored redacted CV view."""
     experience = profile.get("experience", []) or []
     projects = profile.get("projects", []) or []
     evidence = [
         "Candidate profile evidence with claimed skills",
         str(profile.get("summary") or ""),
+        str(profile.get("headline") or ""),
         *[
             str(item.get("description") or "")
             for item in experience if isinstance(item, dict)
@@ -328,9 +341,92 @@ def sync_skill_journey(user_id, profile):
             str(item.get("name") or "")
             for item in projects if isinstance(item, dict)
         ],
-        "Skills: " + ", ".join(entry["name"] for entry in skill_entries),
+        "Skills: " + ", ".join(entry["name"] for entry in entries),
     ]
-    text = "\n".join(line for line in evidence if line)
+    return "\n".join(line for line in evidence if line)
+
+
+def profile_cv_skills(profile, confirmed_ids=None):
+    """Return GraphRAG CVSkill objects derived from the confirmed profile.
+
+    This is the bridge that keeps the assessment aligned with the profile and CV:
+    the assessment no longer re-guesses skills from raw text and then intersects
+    two different namespaces. Every confirmed profile skill becomes a CVSkill.
+    """
+    import graphrag as G
+    entries = profile_skill_entries(profile)
+    confirmed = set(confirmed_ids or [])
+    ordered_ids: list[str] = []
+    evidence_by_id: dict[str, list[str]] = {}
+    for entry in entries:
+        ids = entry.get("taxonomy_ids") or ([entry["id"]] if entry.get("id") else [])
+        for skill_id in ids:
+            if confirmed and skill_id not in confirmed:
+                continue
+            if skill_id not in evidence_by_id:
+                ordered_ids.append(skill_id)
+                evidence_by_id[skill_id] = []
+            evidence_by_id[skill_id].append(entry["name"])
+    # A confirmed id may exist without a matching profile skill row (legacy CV
+    # confirmations and direct /api/skills confirmations). Keep it assessable.
+    for skill_id in confirmed:
+        if skill_id not in evidence_by_id and skill_id in G.SKILL_LABELS:
+            ordered_ids.append(skill_id)
+            evidence_by_id[skill_id] = [G.SKILL_LABELS[skill_id]]
+    summary = " ".join(str(profile.get("summary") or "").split())
+    skills = []
+    for skill_id in ordered_ids:
+        names = list(dict.fromkeys(evidence_by_id.get(skill_id, [])))
+        evidence = ", ".join(names)[:500]
+        if summary:
+            evidence = (evidence + " — " + summary)[:500]
+        skills.append(G.CVSkill(
+            skill_id=skill_id,
+            label=G.SKILL_LABELS.get(skill_id, skill_id.replace("_", " ").title()),
+            evidence=evidence,
+            confidence=1.0,
+            source="profile",
+        ))
+    return skills
+
+
+def sync_cv_skill_nodes(user_id, skills):
+    """Persist the candidate's Skill graph nodes (HAS_SKILL) for every source."""
+    import graphrag as G
+    for skill in skills:
+        label = skill.label if hasattr(skill, "label") else G.SKILL_LABELS.get(skill, skill)
+        evidence = getattr(skill, "evidence", "") or ""
+        confidence = float(getattr(skill, "confidence", 1.0) or 1.0)
+        run("""INSERT INTO cv_skill_nodes(user_id,skill_id,label,evidence,confidence)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(user_id,skill_id) DO UPDATE SET
+                 label=excluded.label, evidence=excluded.evidence, confidence=excluded.confidence""",
+            (user_id, skill.skill_id if hasattr(skill, "skill_id") else skill, label, evidence, confidence))
+
+
+def sync_skill_journey(user_id, profile):
+    """Rebuild the CV/assessment view from the candidate's confirmed profile."""
+    skill_entries = profile_skill_entries(profile)
+    confirmed = list(dict.fromkeys(
+        skill_id
+        for entry in skill_entries
+        for skill_id in (entry.get("taxonomy_ids") or ([entry["id"]] if entry.get("id") else []))
+        if skill_id
+    ))
+    extracted = [
+        {
+            "id": skill_id,
+            "name": TAXONOMY[skill_id]["name"],
+            "evidence": next(
+                entry["name"] for entry in skill_entries
+                if skill_id in (entry.get("taxonomy_ids") or [entry.get("id")])
+            )[:160],
+            "status": "claimed",
+        }
+        for skill_id in confirmed
+    ]
+
+    text = _profile_evidence_text(profile, skill_entries)
     redacted, counts = E.redact(text, [str(profile.get("name") or "")])
     run(
         """INSERT INTO profiles(user_id,redacted,redaction,extracted,source,confirmed)
@@ -347,6 +443,10 @@ def sync_skill_journey(user_id, profile):
             json.dumps(confirmed),
         ),
     )
+    # Keep the candidate Skill graph in step with the profile. Skills that are
+    # not in the taxonomy remain visible in the profile but have no graph node.
+    run("DELETE FROM cv_skill_nodes WHERE user_id=?", (user_id,))
+    sync_cv_skill_nodes(user_id, profile_cv_skills(profile, confirmed))
     return skill_entries, confirmed
 
 
@@ -372,7 +472,7 @@ def state(u=Depends(current_user)):
         profile_skills = json.loads(candidate_profile["skills"] or "[]")
         skill_entries = profile_skill_entries({"skills": profile_skills})
     atts = allr("SELECT id,kind,status,result,finished FROM attempts WHERE user_id=? ORDER BY started", (u["id"],))
-    pp = allr("SELECT id,created,revoked FROM passports WHERE user_id=? ORDER BY created DESC", (u["id"],))
+    pp = allr("SELECT id,created,revoked,source_attempt FROM passports WHERE user_id=? ORDER BY created DESC", (u["id"],))
     return {
         "user": {"name": u["name"], "email": u["email"]},
         "consented": bool(one("SELECT 1 FROM consents WHERE user_id=? AND version=?", (u["id"], CONSENT_VERSION))),
@@ -385,8 +485,10 @@ def state(u=Depends(current_user)):
             entry["name"] for entry in skill_entries if not entry["id"]
         ],
         **avatar_metadata(u["id"]),
-        "attempts": [{"id": a["id"], "kind": a["kind"], "status": a["status"], "overall": (json.loads(a["result"])["overall"] if a["result"] else None)} for a in atts],
-        "passports": [{"id": p["id"], "created": p["created"], "revoked": bool(p["revoked"])} for p in pp],
+        "attempts": [{"id": a["id"], "kind": a["kind"], "status": a["status"], "finished": a["finished"], "overall": (json.loads(a["result"])["overall"] if a["result"] else None)} for a in atts],
+        "passports": [{"id": p["id"], "created": p["created"], "revoked": bool(p["revoked"]),
+                       "source_attempt": p["source_attempt"],
+                       "auto": bool(p["source_attempt"])} for p in pp],
     }
 
 
@@ -2080,6 +2182,9 @@ def confirm_skills(b: Confirm, u=Depends(current_user)):
                 "UPDATE profiles SET confirmed=? WHERE user_id=?",
                 (json.dumps(ids), u["id"]),
             )
+            # Keep the candidate Skill graph aligned even when the stored CV
+            # evidence predates the profile update.
+            sync_cv_skill_nodes(u["id"], profile_cv_skills(profile, set(ids)))
         else:
             _, ids = sync_skill_journey(u["id"], profile)
     else:
@@ -2088,6 +2193,11 @@ def confirm_skills(b: Confirm, u=Depends(current_user)):
                ON CONFLICT(user_id) DO UPDATE SET confirmed=excluded.confirmed""",
             (u["id"], json.dumps(ids)),
         )
+        import graphrag as G
+        sync_cv_skill_nodes(u["id"], [
+            G.CVSkill(skill_id=skill_id, label=G.SKILL_LABELS[skill_id])
+            for skill_id in ids if skill_id in G.SKILL_LABELS
+        ])
     return {"confirmed": ids}
 
 # ------------------------------------------------------------------ GraphRAG assessment blueprint
@@ -2101,33 +2211,53 @@ def generate_assessment_blueprint(u=Depends(current_user)):
     confirmed = set(json.loads(prof["confirmed"] or "[]")) if prof["confirmed"] else set()
     if not confirmed:
         raise HTTPException(409, "Confirm your CV skills before generating the assessment")
-    from graphrag import CVSkill, build_assessment, extract_cv_skills
-    extracted = extract_cv_skills(prof["redacted"])
-    skills = [s for s in extracted if s.skill_id in confirmed]
+
+    import graphrag as G
+    from graphrag import build_assessment
+
+    # Profile first: every confirmed profile/CV skill becomes a canonical CVSkill.
+    # This is what keeps the assessment, skill journey, admin coverage and company
+    # view aligned instead of re-guessing skills from raw text.
+    candidate_profile = one("SELECT * FROM candidate_profiles WHERE user_id=?", (u["id"],))
+    profile_data = {}
+    if candidate_profile:
+        profile_data = dict(candidate_profile)
+        for key in ("skills", "experience", "projects"):
+            profile_data[key] = json.loads(profile_data[key] or "[]")
+    skills = profile_cv_skills(profile_data, confirmed)
     if not skills:
-        raise HTTPException(422, "No confirmed technical skills were found in the CV evidence")
+        # Legacy CV confirmations may not have a candidate_profiles row. Build the
+        # canonical skill list directly from the confirmed taxonomy ids.
+        skills = [
+            G.CVSkill(skill_id=skill_id, label=G.SKILL_LABELS.get(skill_id, skill_id.replace("_", " ").title()),
+                      evidence=(prof["redacted"] or "")[:300], confidence=0.9, source="cv")
+            for skill_id in sorted(confirmed) if skill_id in G.SKILL_LABELS
+        ]
+    if not skills:
+        raise HTTPException(422, "No confirmed technical skills were found in the profile or CV evidence")
+
     import enterprise as admin_data
     admin_data._seed_question_bank()
     rows = allr("SELECT * FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated' ORDER BY created_at DESC")
     # Retake filter: never re-serve a question this candidate has already been asked.
     result = build_assessment(rows, skills, retrieval=True, exclude_ids=asked_question_ids(u["id"]))
-    # Persist the CV -> Skill graph edges (HAS_SKILL) for this candidate.
-    for s in skills:
-        run("""INSERT INTO cv_skill_nodes(user_id,skill_id,label,evidence,confidence)
-               VALUES (?,?,?,?,?)
-               ON CONFLICT(user_id,skill_id) DO UPDATE SET
-                 label=excluded.label, evidence=excluded.evidence, confidence=excluded.confidence""",
-            (u["id"], s.skill_id, s.label, s.evidence, s.confidence))
+    # Persist the CV -> Skill graph edges (HAS_SKILL) for every confirmed skill.
+    sync_cv_skill_nodes(u["id"], skills)
+    coverage = G.skill_coverage(rows)
     blueprint_id = uuid.uuid4().hex
-    snapshot = {**result, "user_id": u["id"], "blueprint_id": blueprint_id}
+    snapshot = {**result, "user_id": u["id"], "blueprint_id": blueprint_id,
+                "skill_coverage": {s.skill_id: coverage.get(s.skill_id, {}) for s in skills}}
     run("INSERT INTO assessment_blueprints(id,user_id,status,payload,created) VALUES (?,?,?,?,?)",
         (blueprint_id, u["id"], result["status"], json.dumps(snapshot), time.time()))
     audit(u["id"], "assessment_blueprint_generated",
-          f"{blueprint_id};questions={result['total_questions']};status={result['status']};ms={result['retrieval_ms']};excluded={len(result.get('excluded_ids') or [])}")
+          f"{blueprint_id};questions={result['total_questions']};status={result['status']};ms={result['retrieval_ms']};excluded={len(result.get('excluded_ids') or [])};uncovered={len(result.get('uncovered_skills') or [])}")
     return {
         "blueprint_id": blueprint_id, "status": result["status"],
         "fundamental_count": result["fundamental_count"], "cv_count": result["cv_count"],
         "total_questions": result["total_questions"], "skills": result["skills"],
+        "covered_skill_ids": result.get("covered_skill_ids", []),
+        "uncovered_skills": result.get("uncovered_skills", []),
+        "skill_coverage": snapshot["skill_coverage"],
         "estimated_duration_seconds": result["estimated_duration_seconds"],
         "estimated_duration_minutes": result["estimated_duration_minutes"],
         "difficulty_targets": result["difficulty_targets"],
@@ -2135,8 +2265,8 @@ def generate_assessment_blueprint(u=Depends(current_user)):
         "fundamental_difficulty_matrix": result["fundamental_difficulty_matrix"],
         "per_skill_targets": result["per_skill_targets"], "shortages": result["shortages"],
         "retrieval_ms": result["retrieval_ms"], "retrieval_providers": result["retrieval_providers"],
-        "message": "Assessment question bank is ready." if result["status"] == "ready"
-            else "The approved question bank does not yet contain enough questions for every required quota. No questions were fabricated."
+        "message": ("Assessment question bank is ready." if result["status"] == "ready"
+                    else "The approved question bank does not yet contain enough questions for every required quota. No questions were fabricated.")
     }
 
 
@@ -2148,6 +2278,12 @@ def admin_graphrag_status(u=Depends(current_user)):
     rows = allr("SELECT category_id,difficulty_level,COUNT(*) AS n FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated' GROUP BY category_id,difficulty_level")
     active_rows = allr("SELECT * FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated'")
     fundamental_check = G.build_assessment(active_rows, [], retrieval=False)
+    coverage = G.skill_coverage(active_rows)
+    # The admin panel labels this section "CV skills"; fundamental topics are
+    # already reported by the 25-question fundamental readiness check.
+    cv_coverage = [item for item in coverage.values() if not item["is_fundamental_topic"]]
+    covered = [item for item in cv_coverage if item["covered"]]
+    uncovered = [item for item in cv_coverage if not item["covered"]]
     return {
         "active_question_count": one("SELECT COUNT(*) AS n FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated'")["n"],
         "question_distribution": [dict(r) for r in rows],
@@ -2157,9 +2293,14 @@ def admin_graphrag_status(u=Depends(current_user)):
         "fundamental_targets": G.FUNDAMENTAL_TARGETS,
         "fundamental_difficulty_matrix": G.FUNDAMENTAL_DIFFICULTY_MATRIX,
         "cv_questions_per_skill": G.PER_SKILL_TARGETS,
+        "skill_coverage": list(coverage.values()),
+        "covered_skill_count": len(covered),
+        "uncovered_skill_count": len(uncovered),
+        "covered_skills": [{"skill_id": s["skill_id"], "label": s["label"], "active_questions": s["active_questions"]} for s in covered],
+        "uncovered_skills": [{"skill_id": s["skill_id"], "label": s["label"], "active_questions": s["active_questions"], "missing": s["missing"]} for s in uncovered],
         "meilisearch_configured": bool(os.getenv("MEILISEARCH_URL")),
         "neo4j_configured": bool(os.getenv("NEO4J_URI")),
-        "note": "Only active, curator-approved question-bank records are eligible for retrieval."
+        "note": "Only active, curator-approved question-bank records are eligible for retrieval. Skills without a complete per-difficulty quota are reported, never silently fabricated."
     }
 
 
@@ -2200,20 +2341,227 @@ def topic_scores(uid):
     return json.loads(a["result"])["topics"] if a else {}
 
 
+def _score_for_topic(topics, skill_id):
+    entry = (topics or {}).get(skill_id)
+    if isinstance(entry, dict):
+        return entry.get("score")
+    return None
+
+
+@app.get("/api/skill-journey")
+def skill_journey(u=Depends(current_user)):
+    """The candidate's profile/CV skills aligned to bank coverage and results.
+
+    This is the single view used by the skill journey. It reports claimed skills,
+    what can be verified today (approved question coverage), what has been
+    verified (latest attempt topic score) and which skills still need question
+    bank coverage. The admin coverage report and company application view use the
+    same canonical ids and coverage calculation.
+    """
+    import graphrag as G
+
+    profile_row = one("SELECT * FROM candidate_profiles WHERE user_id=?", (u["id"],))
+    profile = {}
+    if profile_row:
+        profile = dict(profile_row)
+        for key in ("skills", "experience", "projects"):
+            profile[key] = json.loads(profile[key] or "[]")
+    prof = one("SELECT confirmed FROM profiles WHERE user_id=?", (u["id"],))
+    confirmed = set(json.loads(prof["confirmed"] or "[]")) if prof and prof["confirmed"] else set()
+    entries = profile_skill_entries(profile)
+    # Legacy CV-only confirmations may not have candidate_profiles skill rows.
+    entry_ids = {skill_id for entry in entries for skill_id in (entry.get("taxonomy_ids") or [])}
+    for skill_id in sorted(confirmed):
+        if skill_id not in entry_ids and skill_id in G.SKILL_LABELS:
+            entries.append({
+                "name": G.SKILL_LABELS[skill_id],
+                "label": G.SKILL_LABELS[skill_id],
+                "id": skill_id,
+                "taxonomy_id": skill_id,
+                "taxonomy_ids": [skill_id],
+            })
+    attempts = latest_done(u["id"])
+    topics = json.loads(attempts["result"]).get("topics", {}) if attempts and attempts["result"] else {}
+    review = one("SELECT decision,reason,reviewed_at FROM admin_attempt_reviews WHERE attempt_id=?",
+                 (attempts["id"],)) if attempts else None
+    approved = bool(review and review["decision"] == "approved")
+    latest_result = None
+    if attempts:
+        result_data = json.loads(attempts["result"]) if attempts["result"] else {}
+        if not isinstance(result_data, dict):
+            result_data = {}
+        latest_result = {
+            "attempt_id": attempts["id"],
+            "overall": result_data.get("overall"),
+            "level": result_data.get("level"),
+            "trust": result_data.get("trust"),
+            "date": result_data.get("date"),
+            "finished": attempts["finished"],
+            "approved": approved,
+            "review_status": (review["decision"] if review else
+                              (result_data.get("review_status") or "pending_review")),
+            "reviewed_at": review["reviewed_at"] if review else None,
+            "review_reason": review["reason"] if review else None,
+            "section_scores": result_data.get("section_scores"),
+            "scoring_version": result_data.get("scoring_version"),
+        }
+
+    import enterprise as admin_data
+    admin_data._seed_question_bank()
+    rows = allr("SELECT * FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated'")
+    coverage = G.skill_coverage(rows)
+    skill_nodes = {
+        row["skill_id"]: dict(row)
+        for row in allr("SELECT skill_id,label,evidence,confidence FROM cv_skill_nodes WHERE user_id=?", (u["id"],))
+    }
+
+    journey = []
+    seen_ids: set[str] = set()
+    for entry in entries:
+        ids = entry.get("taxonomy_ids") or ([entry["id"]] if entry.get("id") else [])
+        ids = [skill_id for skill_id in ids if skill_id]
+        if not ids:
+            journey.append({
+                "name": entry["name"], "label": entry["name"], "skill_ids": [],
+                "skill_id": None,
+                "status": "not_assessable", "score": None, "level": None,
+                "coverage": None, "reason": "not_in_taxonomy",
+                "evidence": None, "confidence": None,
+            })
+            continue
+        seen_ids.update(ids)
+        scored = [(skill_id, _score_for_topic(topics, skill_id)) for skill_id in ids]
+        scored = [(skill_id, score) for skill_id, score in scored if score is not None]
+        attempted = [skill_id for skill_id in ids if skill_id in topics]
+        if scored:
+            skill_id, score = max(scored, key=lambda item: item[1])
+            status = "verified" if score >= 60 else "needs_practice"
+            level = E.level_of(score)
+        elif attempted:
+            skill_id, score, level, status = attempted[0], None, None, "pending_review"
+        elif any(coverage.get(skill_id, {}).get("covered") for skill_id in ids):
+            skill_id, score, level, status = ids[0], None, None, "ready_to_verify"
+        elif any(skill_id in G.FUNDAMENTAL_SKILL_IDS for skill_id in ids):
+            skill_id, score, level, status = ids[0], None, None, "covered_by_fundamental"
+        else:
+            skill_id, score, level, status = ids[0], None, None, "question_bank_pending"
+        node = skill_nodes.get(skill_id, {})
+        journey.append({
+            "name": entry["name"],
+            "label": entry.get("label") or coverage.get(skill_id, {}).get("label") or entry["name"],
+            "skill_ids": ids,
+            "skill_id": skill_id,
+            "status": status,
+            "score": score,
+            "level": level,
+            "coverage": coverage.get(skill_id),
+            "evidence": node.get("evidence") or "",
+            "confidence": node.get("confidence"),
+        })
+
+    # Fundamental topics already scored in an attempt are part of the journey too.
+    for skill_id in ("dsa", "oop", "networking", "coding", "database", "critical_thinking"):
+        score = _score_for_topic(topics, skill_id)
+        if score is None or skill_id in seen_ids:
+            continue
+        journey.append({
+            "name": G.SKILL_LABELS.get(skill_id, skill_id.replace("_", " ").title()) if skill_id in G.SKILL_LABELS
+                    else skill_id.replace("_", " ").title(),
+            "label": G.SKILL_LABELS.get(skill_id, skill_id.replace("_", " ").title()),
+            "skill_ids": [skill_id], "skill_id": skill_id,
+            "status": "verified" if score >= 60 else "needs_practice",
+            "score": score, "level": E.level_of(score),
+            "coverage": coverage.get(skill_id),
+            "source": "fundamental_section",
+        })
+
+    covered = [item for item in coverage.values() if item["covered"]]
+    passport = one("SELECT id,created,revoked FROM passports WHERE user_id=? AND source_attempt=? ORDER BY created DESC LIMIT 1",
+                   (u["id"], attempts["id"])) if attempts else None
+    return {
+        "profile_skill_count": len(entries),
+        "confirmed_skill_ids": sorted(confirmed),
+        "journey": journey,
+        "verified_count": sum(1 for item in journey if item["status"] == "verified"),
+        "pending_question_bank": [
+            {"name": item["name"], "label": item["label"], "skill_ids": item["skill_ids"]}
+            for item in journey if item["status"] == "question_bank_pending"
+        ],
+        "not_assessable": [item["name"] for item in journey if item["status"] == "not_assessable"],
+        "coverage_summary": {
+            "covered_skill_count": len(covered),
+            "covered_skill_ids": [item["skill_id"] for item in covered],
+            "total_taxonomy_skills": len(coverage),
+        },
+        "based_on_attempt": attempts["id"] if attempts else None,
+        "latest_topics": topics,
+        "latest_result": latest_result,
+        "passport": dict(passport) if passport else None,
+        "approved": bool(approved),
+        "note": "Claimed skills become verified only through approved assessment questions. Skills without question-bank coverage stay visible and are reported here; no questions are invented.",
+    }
+
+
 @app.get("/api/job")
 def job(u=Depends(current_user)):
     prof = one("SELECT confirmed FROM profiles WHERE user_id=?", (u["id"],))
     claimed = set(json.loads(prof["confirmed"])) if prof and prof["confirmed"] else set()
-    rows = E.gap_map(topic_scores(u["id"]))
+    latest = latest_done(u["id"])
+    review = one("SELECT decision FROM admin_attempt_reviews WHERE attempt_id=?", (latest["id"],)) if latest else None
+    verified = bool(review and review["decision"] == "approved")
+    review_status = review["decision"] if review else "pending_review"
+    import enterprise as admin_data
+    import graphrag as G
+    admin_data._seed_question_bank()
+    bank_rows = allr("SELECT * FROM question_bank WHERE status='active' AND subcategory != 'Legacy curated'")
+    coverage = G.skill_coverage(bank_rows)
+
+    def decorate(row):
+        row["verified"] = bool(verified and row.get("score") is not None)
+        row["review_status"] = review_status if row.get("score") is not None else None
+        row["coverage_status"] = ("ready_to_verify"
+                                  if coverage.get(row["skill"], {}).get("covered")
+                                  else "question_bank_pending")
+        return row
+
+    rows = [decorate(r) for r in E.gap_map(topic_scores(u["id"]))]
     for r in rows: r["claimed"] = r["skill"] in claimed
+    # Include profile-only skills so the legacy gap view cannot hide a candidate's
+    # confirmed skills just because the mock job advertises a fixed four topics.
+    profile_row = one("SELECT skills FROM candidate_profiles WHERE user_id=?", (u["id"],))
+    profile_entries = profile_skill_entries(
+        {"skills": json.loads(profile_row["skills"] or "[]")}
+    ) if profile_row else []
+    prof_skill_ids = list(dict.fromkeys(
+        skill_id for entry in profile_entries
+        for skill_id in (entry.get("taxonomy_ids") or [])
+    ))
+    # Legacy CV-only confirmations have no profile skill rows; keep them visible.
+    for skill_id in sorted(claimed):
+        if skill_id not in prof_skill_ids and skill_id in TAXONOMY:
+            prof_skill_ids.append(skill_id)
+    job_skills = {r["skill"] for r in rows}
+    for skill_id in prof_skill_ids:
+        if skill_id in job_skills or skill_id not in TAXONOMY:
+            continue
+        rows.append(decorate({
+            "skill": skill_id, "name": TAXONOMY[skill_id]["name"], "threshold": 60,
+            "score": None, "status": "unverified", "claimed": skill_id in claimed,
+            "source": "profile",
+        }))
     return {"job": {"id": JOB["id"], "title": JOB["title"], "company": JOB["company"], "mock": True,
-                    "preferred": [{"skill": s, "name": TAXONOMY[s]["name"], "claimed": s in claimed} for s in JOB["preferred"]]}, "gap": rows}
+                    "preferred": [{"skill": s, "name": TAXONOMY[s]["name"], "claimed": s in claimed} for s in JOB["preferred"]]},
+            "gap": rows, "approved": verified, "review_status": review_status}
 
 
 # ------------------------------------------------------------------ assessment
 def seen_before(uid):
     s = set()
-    for a in allr("SELECT state FROM attempts WHERE user_id=? AND status='done'", (uid,)): s |= set(json.loads(a["state"])["used"])
+    for a in allr("SELECT state FROM attempts WHERE user_id=? AND status='done'", (uid,)):
+        try:
+            s |= set((json.loads(a["state"]) or {}).get("used", []))
+        except (TypeError, ValueError, AttributeError):
+            continue
     return s
 
 
@@ -2253,7 +2601,7 @@ def sync_skill_question_edges():
         q = dict(r)
         text = " ".join([str(q.get("question_text", "")), str(q.get("subcategory", "")),
                          str(q.get("grading_rubric", ""))]).lower()
-        for sid, aliases in G.SKILL_ALIASES.items():
+        for sid, aliases in G.SKILL_INDEX_ALIASES.items():
             hit = any(re.search(r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])", text)
                       for alias in aliases)
             if hit:
@@ -2319,6 +2667,8 @@ def finalize(att, st):
         answers = st.get("answers", {})
         topics = {}
         review_rows, trust_answers = [], []
+        fundamental_earned = fundamental_possible = 0
+        cv_earned = cv_possible = 0
         for q in st["selected_questions"]:
             raw_answer = answers.get(q["id"], "")
             qtype = str(q.get("question_type", "")).lower()
@@ -2331,13 +2681,30 @@ def finalize(att, st):
                 correct = E.grade_sql(st["seed"], {"ref": q["reference_answer"]}, str(raw_answer or ""))
             else:
                 correct = None
-            topic = q.get("assessment_topic") or "General"
-            metric = topics.setdefault(topic, {"earned": 0, "possible": 0, "n": 0})
+            topic_label = q.get("assessment_topic") or "General"
+            # Store topic scores under the same canonical id used by the profile,
+            # skill journey, learning dashboard and company view. Legacy engine
+            # results already use taxonomy ids, so this keeps both pipelines aligned.
+            topic = q.get("assessment_topic_key") or re.sub(r"[^a-z0-9]+", "_", topic_label.lower()).strip("_")
+            # SQL is a core fundamental skill even though its questions live in the
+            # CV-technology bank. It is counted in the 60% fundamental section.
+            in_fundamental = q.get("assessment_section") == "fundamental" or topic == "sql"
+            metric = topics.setdefault(topic, {"earned": 0, "possible": 0, "n": 0,
+                                               "label": topic_label,
+                                               "section": "fundamental" if in_fundamental else "cv"})
             if objective:
-                metric["possible"] += int(q.get("marks") or 1)
+                marks = int(q.get("marks") or 1)
+                metric["possible"] += marks
                 metric["n"] += 1
-                if correct: metric["earned"] += int(q.get("marks") or 1)
-            review_rows.append({"question_id": q["id"], "topic": topic, "question": q["question_text"],
+                if correct:
+                    metric["earned"] += marks
+                if in_fundamental:
+                    fundamental_possible += marks
+                    fundamental_earned += marks if correct else 0
+                else:
+                    cv_possible += marks
+                    cv_earned += marks if correct else 0
+            review_rows.append({"question_id": q["id"], "topic": topic_label, "topic_key": topic, "question": q["question_text"],
                 "question_type": q.get("question_type"), "answer": raw_answer,
                 "correct_answer": (q.get("correct_answer") if is_mcq else q.get("reference_answer")) if objective else None,
                 "explanation": q.get("explanation") if objective else None,
@@ -2349,13 +2716,29 @@ def finalize(att, st):
         topic_scores = {}
         for topic, metric in topics.items():
             pct = round(100 * metric["earned"] / metric["possible"]) if metric["possible"] else None
-            topic_scores[topic] = {"score": pct, "level": E.level_of(pct or 0), "n": metric["n"]}
-        possible = sum(x["possible"] for x in topics.values())
-        earned = sum(x["earned"] for x in topics.values())
-        overall = round(100 * earned / possible) if possible else None
+            topic_scores[topic] = {"score": pct, "level": E.level_of(pct or 0), "n": metric["n"],
+                                   "label": metric.get("label", topic),
+                                   "section": metric.get("section", "cv")}
+        fundamental_pct = round(100 * fundamental_earned / fundamental_possible) if fundamental_possible else None
+        cv_pct = round(100 * cv_earned / cv_possible) if cv_possible else None
+        # Product rule: 60% of the overall score comes from the fundamental
+        # section (including SQL) and 40% from the merged CV/development section.
+        if fundamental_pct is not None and cv_pct is not None:
+            overall = round(0.6 * fundamental_pct + 0.4 * cv_pct)
+        else:
+            overall = fundamental_pct if fundamental_pct is not None else cv_pct
         integrity = E.trust_label(ev, trust_answers, exam_seconds=exam_seconds)
         manual = any(x["review_status"] == "pending_human_review" for x in review_rows)
         res = {"overall": overall, "level": E.level_of(overall or 0), "topics": topic_scores,
+            "section_scores": {
+                "fundamental": {"score": fundamental_pct, "weight": 0.6,
+                                "earned": fundamental_earned, "possible": fundamental_possible,
+                                "label": "Fundamentals (DSA, SQL, Networking, OOP, Database, Coding, Critical Thinking)"},
+                "cv": {"score": cv_pct, "weight": 0.4,
+                        "earned": cv_earned, "possible": cv_possible,
+                        "label": "CV & development skills (AI/ML, Git, Docker and other confirmed CV skills)"},
+            },
+            "scoring_version": "r1-60-40",
             "trust": integrity["label"], "trust_points": integrity["points"],
             "trust_rule_version": integrity["rule_version"], "trust_reasons": integrity["reasons"],
             "trust_hard_flags": integrity["hard_flags"], "percentile": None,
@@ -2370,7 +2753,8 @@ def finalize(att, st):
         res.update({"trust": integrity["label"], "trust_points": integrity["points"],
             "trust_rule_version": integrity["rule_version"], "trust_reasons": integrity["reasons"],
             "trust_hard_flags": integrity["hard_flags"], "percentile": None,
-            "kind": att["kind"], "date": time.strftime("%Y-%m-%d")})
+            "kind": att["kind"], "date": time.strftime("%Y-%m-%d"),
+            "scoring_version": "legacy-adaptive"})
     run("UPDATE attempts SET status='done', finished=?, result=?, state=? WHERE id=?", (time.time(), json.dumps(res), json.dumps(st), att["id"]))
     audit(att["user_id"], "attempt_done", att["id"])
 
@@ -2436,8 +2820,17 @@ def start_attempt(b: Optional[StartAttempt] = None, u=Depends(current_user)):
         active_now = conn.execute("SELECT * FROM attempts WHERE user_id=? AND status='active'", (u["id"],)).fetchone()
         if active_now:
             raise HTTPException(409, "active_attempt_exists")
-        done = conn.execute("SELECT finished FROM attempts WHERE user_id=? AND status='done' ORDER BY finished DESC", (u["id"],)).fetchall()
+        done = conn.execute("SELECT id,finished FROM attempts WHERE user_id=? AND status='done' ORDER BY finished DESC", (u["id"],)).fetchall()
         recent = [d for d in done if d["finished"] and d["finished"] > now - 90 * 86400]
+        # Retakes are unlocked only after the current result has a human-review
+        # decision. This keeps Verify, Gap, Learn and Passport on one result.
+        if done:
+            latest_review = conn.execute(
+                "SELECT decision FROM admin_attempt_reviews WHERE attempt_id=?",
+                (done[0]["id"],),
+            ).fetchone()
+            if not latest_review:
+                raise HTTPException(409, "result_awaiting_review")
         kind = "post" if done else "pre"
         policy = conn.execute("SELECT cooldown_hours,max_attempts_90d,credits_per_attempt FROM learning_retake_policy WHERE id=1").fetchone()
         cooldown_hours = int(policy["cooldown_hours"]) if policy else int(COOLDOWN_HOURS)
@@ -2629,12 +3022,88 @@ def uplift(u=Depends(current_user)):
     post = latest_done(u["id"], "post")
     if not pre or not post: return {"available": False}
     a, b = json.loads(pre["result"]), json.loads(post["result"])
-    topics = {t: {"pre": a["topics"][t]["score"], "post": b["topics"][t]["score"], "delta": b["topics"][t]["score"] - a["topics"][t]["score"]} for t in a["topics"] if t in b["topics"]}
-    return {"available": True, "overall": {"pre": a["overall"], "post": b["overall"], "delta": b["overall"] - a["overall"]}, "topics": topics,
+    def _num(value):
+        return value if isinstance(value, (int, float)) else None
+    def _delta(x, y):
+        return (y - x) if _num(x) is not None and _num(y) is not None else None
+    topics = {
+        t: {
+            "pre": _num(a["topics"][t].get("score")) if isinstance(a["topics"][t], dict) else None,
+            "post": _num(b["topics"][t].get("score")) if isinstance(b["topics"][t], dict) else None,
+            "delta": _delta(
+                a["topics"][t].get("score") if isinstance(a["topics"][t], dict) else None,
+                b["topics"][t].get("score") if isinstance(b["topics"][t], dict) else None,
+            ),
+            "label": (b["topics"][t].get("label") if isinstance(b["topics"][t], dict) else None)
+                     or TAXONOMY.get(t, {}).get("name", t.replace("_", " ").title()),
+        }
+        for t in a["topics"] if t in b["topics"]
+    }
+    return {"available": True, "overall": {"pre": _num(a.get("overall")), "post": _num(b.get("overall")),
+            "delta": _delta(a.get("overall"), b.get("overall"))}, "topics": topics,
             "note": "Single-user result from a prototype question pool; not a validated learning-effect estimate."}
 
 
 # ------------------------------------------------------------------ Skill Passport
+def create_passport_for_attempt(user_id, attempt_id, *, issued_by="admin_approved"):
+    """Create (or reuse) a passport for a human-approved assessment attempt.
+
+    The score is copied from the stored deterministic result; this helper never
+    changes marks. It is idempotent so re-approving a result does not duplicate
+    the passport.
+    """
+    row = one("""SELECT a.result,a.finished,a.kind,u.name
+                 FROM attempts a JOIN users u ON u.id=a.user_id
+                 WHERE a.id=? AND a.user_id=? AND a.status='done'""",
+              (attempt_id, user_id))
+    if not row or not row["result"]:
+        return None
+    result = json.loads(row["result"])
+    topics = result.get("topics", {}) if isinstance(result, dict) else {}
+    skills = []
+    for topic, entry in topics.items():
+        if not isinstance(entry, dict) or entry.get("score") is None:
+            continue
+        skills.append({
+            "skill": topic,
+            "name": TAXONOMY.get(topic, {}).get("name", entry.get("label") or topic.replace("_", " ").title()),
+            "score": entry["score"],
+            "level": entry.get("level"),
+            "trust": result.get("trust"),
+            "date": result.get("date"),
+        })
+    if not skills:
+        return None
+    existing = one("""SELECT id FROM passports
+                      WHERE user_id=? AND source_attempt=? AND revoked=0
+                      ORDER BY created DESC LIMIT 1""", (user_id, attempt_id))
+    if existing:
+        return existing["id"]
+    pid = secrets.token_urlsafe(9)
+    now = time.time()
+    payload = {
+        "pid": pid,
+        "issued": time.strftime("%Y-%m-%d", time.localtime(now)),
+        "expires": time.strftime("%Y-%m-%d", time.localtime(now + 365 * 86400)),
+        "holder": "Anonymous candidate",
+        "skills": skills,
+        "overall": result.get("overall"),
+        "level": result.get("level"),
+        "trust": result.get("trust"),
+        "section_scores": result.get("section_scores"),
+        "scoring_version": result.get("scoring_version"),
+        "attempt_id": attempt_id,
+        "verification": issued_by,
+        "verified_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+        "issuer": "SkillBridge Global R0 prototype",
+    }
+    run("""INSERT INTO passports(id,user_id,payload,signature,created,source_attempt)
+           VALUES (?,?,?,?,?,?)""",
+        (pid, user_id, json.dumps(payload), E.sign_payload(payload, SECRET), now, attempt_id))
+    audit(user_id, "passport_auto_created", pid + ":" + attempt_id)
+    return pid
+
+
 class PassBody(BaseModel):
     topics: List[str]
     show_name: bool = False
@@ -2646,15 +3115,17 @@ def make_passport(b: PassBody, u=Depends(current_user)):
     a = latest_done(u["id"])
     if not a: raise HTTPException(409, "Take the assessment first")
     r = json.loads(a["result"])
-    skills = [{"skill": t, "name": TAXONOMY[t]["name"], "score": r["topics"][t]["score"], "level": r["topics"][t]["level"], "trust": r["trust"], "date": r["date"]}
+    skills = [{"skill": t, "name": TAXONOMY.get(t, {}).get("name", t.replace("_", " ").title()), "score": r["topics"][t]["score"], "level": r["topics"][t]["level"], "trust": r["trust"], "date": r["date"]}
               for t in b.topics if t in r["topics"]]
     if not skills: raise HTTPException(422, "Choose at least one verified skill")
     up = uplift(u)
     pid = secrets.token_urlsafe(9)
     payload = {"pid": pid, "issued": time.strftime("%Y-%m-%d"), "expires": time.strftime("%Y-%m-%d", time.localtime(time.time() + 365 * 86400)),
                "holder": u["name"] if b.show_name else "Anonymous candidate", "skills": skills,
+               "attempt_id": a["id"], "verification": "candidate_selected",
                "uplift": up["overall"] if up["available"] else None, "issuer": "SkillBridge Global R0 prototype"}
-    run("INSERT INTO passports(id,user_id,payload,signature,created) VALUES (?,?,?,?,?)", (pid, u["id"], json.dumps(payload), E.sign_payload(payload, SECRET), time.time()))
+    run("INSERT INTO passports(id,user_id,payload,signature,created,source_attempt) VALUES (?,?,?,?,?,?)",
+        (pid, u["id"], json.dumps(payload), E.sign_payload(payload, SECRET), time.time(), a["id"]))
     audit(u["id"], "passport_create", pid)
     return {"id": pid}
 
