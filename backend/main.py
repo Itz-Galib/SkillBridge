@@ -464,12 +464,14 @@ def get_attempt(aid: str, u=Depends(current_user)): return view(get_att(aid, u["
 class Ans(BaseModel):
     question_id: str
     answer: Optional[str] = None
+    session_id: str = Field(min_length=20, max_length=100)
 
 
 @app.post("/api/attempts/{aid}/answer")
 def answer(aid: str, b: Ans, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     if att["status"] != "active": raise HTTPException(409, "Attempt already finished")
+    _check_exam_session(att, b.session_id)
     require_screen_share(aid)
     st = json.loads(att["state"])
     if time.time() > att["started"] + E.TEST_SECONDS + E.GRACE:      # server owns the timer
@@ -490,7 +492,8 @@ def answer(aid: str, b: Ans, u=Depends(current_user)):
 
 
 class SqlRun(BaseModel):
-    sql: str
+    sql: str = Field(max_length=12000)
+    session_id: str = Field(min_length=20, max_length=100)
 
 
 @app.post("/api/attempts/{aid}/sql-run")
@@ -498,6 +501,7 @@ def sql_run(aid: str, b: SqlRun, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     st = json.loads(att["state"])
     if att["status"] != "active" or not st["current"] or QBYID[st["current"]]["type"] != "sql": raise HTTPException(409, "No SQL question active")
+    _check_exam_session(att, b.session_id)
     require_screen_share(aid)
     return E.run_query(att["seed"], b.sql)                  # visible dataset only; scoring uses hidden datasets
 
@@ -550,7 +554,8 @@ def _accept_sequence(att, seq, aid, request, event_type, client_ts=None, metadat
         run("INSERT INTO events(attempt_id,type,ts,question_id,question_index,seq,client_ts,metadata) VALUES (?,?,?,?,?,?,?,?)",
             (aid, "network_ip_changed", now, None, None, None, None, json.dumps({"previous_ip_changed": True})))
     st = json.loads(att["state"])
-    safe_meta = {k: v for k, v in (metadata or {}).items() if k in EVENT_META_KEYS and isinstance(v, (str, int, float, bool))}
+    safe_meta = {k: (v[:100] if isinstance(v, str) else v) for k, v in list((metadata or {}).items())[:8]
+                 if k in EVENT_META_KEYS and isinstance(v, (str, int, float, bool))}
     run("INSERT INTO events(attempt_id,type,ts,question_id,question_index,seq,client_ts,metadata) VALUES (?,?,?,?,?,?,?,?)",
         (aid, event_type, now, st.get("current"), st.get("index"), seq,
          float(client_ts) if client_ts is not None else None, json.dumps(safe_meta)))
