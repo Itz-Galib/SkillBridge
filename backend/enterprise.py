@@ -1000,9 +1000,12 @@ def admin_integrity_attempt_detail(attempt_id: str, user=Depends(current_user)):
     } for i, a in enumerate(state.get("answers", []))]
     item.pop("state", None)
     item["events"] = [dict(e) for e in allr(
-        "SELECT id,type,ts AS server_ts,question_id,question_index FROM events WHERE attempt_id=? ORDER BY ts,id",
+        "SELECT id,type,ts AS server_ts,question_id,question_index,seq,client_ts,metadata FROM events WHERE attempt_id=? ORDER BY ts,id",
         (attempt_id,)
     )]
+    for event in item["events"]:
+        try: event["metadata"] = json.loads(event.get("metadata") or "{}")
+        except Exception: event["metadata"] = {}
     interval_pairs = {"tab_hidden": "tab_visible", "blur": "focus", "fullscreen_exit": "fullscreen_enter", "screen_share_stopped": "screen_share_started", "screen_share_unavailable": "screen_share_started"}
     pending = {}
     now_ts = time.time()
