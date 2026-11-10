@@ -46,7 +46,7 @@ def test_full_attempt_and_adaptivity():
 def test_trust_never_fails():
     lab = trust_label({"paste": 5, "blur": 9}, [])
     assert lab["label"] == "Needs review" and lab["points"] > 0
-    assert lab["rule_version"] == "phase1-v1"
+    assert lab["rule_version"] == "phase2-v1"
     assert trust_label({}, [])["label"] == "High trust"
 
 def test_trust_integrity_events_are_advisory_and_explainable():
@@ -54,7 +54,7 @@ def test_trust_integrity_events_are_advisory_and_explainable():
     label = trust_label(events, [])
     assert label["label"] == "Needs review"
     assert label["points"] >= 7
-    assert label["rule_version"] == "phase1-v1"
+    assert label["rule_version"] == "phase2-v1"
     assert trust_label({}, [])["label"] == "High trust"
 
 
@@ -126,3 +126,19 @@ def test_trust_leave_window_duration_points():
     assert leave["duration_seconds"] == 121
     assert leave["points"] == 3
     assert len([r for r in result["reasons"] if r["key"] == "fullscreen_exit"]) == 0
+
+
+def test_ai_proctor_signals_are_capped_advisory_and_never_hard_flags():
+    events = (
+        [{"type": "ai_gaze_away", "server_ts": i, "metadata": {"confidence": 0.9}} for i in range(8)]
+        + [{"type": "ai_multiple_faces", "server_ts": 20, "metadata": {"confidence": 0.8}}]
+        + [{"type": "ai_phone_detected", "server_ts": 21, "metadata": {"confidence": 0.7}}]
+    )
+    result = trust_label(events, [], {"rule_version": "phase2-test", "normalize_per_30_minutes": False})
+    reasons = {r["key"]: r for r in result["reasons"]}
+    assert reasons["ai_gaze_away"]["n"] == 3
+    assert reasons["ai_gaze_away"]["advisory"] is True
+    assert reasons["ai_multiple_faces"]["advisory"] is True
+    assert reasons["ai_phone_detected"]["advisory"] is True
+    assert result["hard_flags"] == []
+    assert result["label"] != "Needs review"
