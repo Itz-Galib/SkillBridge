@@ -318,16 +318,21 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
         const files = await vision.FilesetResolver.forVisionTasks(
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
         );
-        const face = await vision.FaceLandmarker.createFromOptions(files, {
-          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
+        const faceOptions = {
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
           runningMode: "VIDEO", numFaces: 3
-        });
+        };
+        let face;
+        try { face = await vision.FaceLandmarker.createFromOptions(files, { ...faceOptions, baseOptions: { ...faceOptions.baseOptions, delegate: "GPU" } }); }
+        catch { face = await vision.FaceLandmarker.createFromOptions(files, { ...faceOptions, baseOptions: { ...faceOptions.baseOptions, delegate: "CPU" } }); }
         let objects = null;
+        const objectOptions = {
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/1.tflite" },
+          runningMode: "VIDEO", scoreThreshold: 0.55, maxResults: 10
+        };
         try {
-          objects = await vision.ObjectDetector.createFromOptions(files, {
-            baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/1.tflite", delegate: "GPU" },
-            runningMode: "VIDEO", scoreThreshold: 0.55, maxResults: 10
-          });
+          try { objects = await vision.ObjectDetector.createFromOptions(files, { ...objectOptions, baseOptions: { ...objectOptions.baseOptions, delegate: "GPU" } }); }
+          catch { objects = await vision.ObjectDetector.createFromOptions(files, { ...objectOptions, baseOptions: { ...objectOptions.baseOptions, delegate: "CPU" } }); }
         } catch { /* Face/gaze checks can still run when object model fails. */ }
         if (cancelled) { face.close(); objects?.close(); return; }
         modelRef.current = { face, objects };
