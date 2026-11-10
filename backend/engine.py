@@ -130,13 +130,18 @@ def public_question(q, state):
     else: d["schema"] = SQL_SCHEMA
     return d
 
-def record_answer(state, q, answer, seconds):
+def record_answer(state, q, answer, seconds, answer_text=None, started_at=None, submitted_at=None):
     if q["type"] == "mcq":
         try: correct = int(answer) == q["answer"]
         except (TypeError, ValueError): correct = False
     else:
         correct = grade_sql(state["seed"], q, str(answer or ""))
-    state["answers"].append({"qid": q["id"], "topic": q["topic"], "difficulty": q["difficulty"], "type": q["type"], "correct": correct, "seconds": round(seconds, 1)})
+    state["answers"].append({
+        "qid": q["id"], "topic": q["topic"], "difficulty": q["difficulty"], "type": q["type"],
+        "correct": correct, "seconds": round(max(0, seconds), 1),
+        "answer": str(answer_text if answer_text is not None else answer or ""),
+        "started_at": started_at, "submitted_at": submitted_at,
+    })
     state["used"].append(q["id"])
     if q["topic"] == "sql": state["sql_taken"] += 1
     state["level"] = max(1, min(3, state["level"] + (1 if correct else -1)))
