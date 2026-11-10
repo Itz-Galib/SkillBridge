@@ -169,13 +169,13 @@ TRUST_RULES = {
         "external_clipboard": 2, "leave_window": 1,
         "fullscreen_exit": 1, "screen_share_stopped": 3,
         "wrong_share_surface": 3, "heartbeat_gap": 2,
-        "ai_gaze_away": 1, "ai_multiple_faces": 2, "ai_no_face": 1, "ai_phone_detected": 2,
+        "ai_gaze_away": 0.5, "ai_multiple_faces": 1, "ai_no_face": 0.5, "ai_phone_detected": 1,
     },
     "caps": {
         "external_clipboard": 3, "leave_window": 4,
         "fullscreen_exit": 3, "screen_share_stopped": 2,
         "wrong_share_surface": 1, "heartbeat_gap": 3, "fast": 4,
-        "ai_gaze_away": 3, "ai_multiple_faces": 2, "ai_no_face": 3, "ai_phone_detected": 2,
+        "ai_gaze_away": 2, "ai_multiple_faces": 1, "ai_no_face": 2, "ai_phone_detected": 1,
     },
 }
 
