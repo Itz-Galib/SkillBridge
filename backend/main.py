@@ -489,7 +489,7 @@ def event(aid: str, b: Ev, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     if att["status"] == "active" and b.type in {
         "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
-        "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
+        "screen_share_started", "screen_share_stopped", "screen_share_unavailable", "fullscreen_enter", "focus",
     }:
         st = json.loads(att["state"])
         run("INSERT INTO events(attempt_id,type,ts,question_id,question_index) VALUES (?,?,?,?,?)",
