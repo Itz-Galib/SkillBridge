@@ -163,17 +163,19 @@ def score(answers):
     return {"overall": overall, "level": level_of(overall), "topics": out}
 
 TRUST_RULES = {
-    "rule_version": "phase1-v1",
+    "rule_version": "phase2-v1",
     "normalize_per_30_minutes": True,
     "weights": {
         "external_clipboard": 2, "leave_window": 1,
         "fullscreen_exit": 1, "screen_share_stopped": 3,
         "wrong_share_surface": 3, "heartbeat_gap": 2,
+        "ai_gaze_away": 1, "ai_multiple_faces": 2, "ai_no_face": 1, "ai_phone_detected": 2,
     },
     "caps": {
         "external_clipboard": 3, "leave_window": 4,
         "fullscreen_exit": 3, "screen_share_stopped": 2,
         "wrong_share_surface": 1, "heartbeat_gap": 3, "fast": 4,
+        "ai_gaze_away": 3, "ai_multiple_faces": 2, "ai_no_face": 3, "ai_phone_detected": 2,
     },
 }
 
@@ -264,6 +266,14 @@ def trust_label(events, answers, rules=None, exam_seconds=1200, question_times=N
             value = charged * weights.get(reason_key, 2 if reason_key == "heartbeat_gap" else 1)
             points += value
             reasons.append({"key": reason_key, "n": charged, "points": value})
+    # Client-side AI signals are advisory only, capped and never treated as hard flags.
+    for kind in ("ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected"):
+        n = sum(1 for e in events if _event_value(e, "type") == kind)
+        charged = min(n, caps.get(kind, 1))
+        if charged:
+            value = charged * weights.get(kind, 1)
+            points += value
+            reasons.append({"key": kind, "n": charged, "points": value, "advisory": True})
     for event in events:
         flag = _event_value(event, "hard_flag")
         if flag:
