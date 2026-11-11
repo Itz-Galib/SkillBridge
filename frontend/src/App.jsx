@@ -276,6 +276,7 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const [status, setStatus] = useState("Loading local vision models…");
+  const [cameraStatus, setCameraStatus] = useState("Waiting for camera video…");
   const [detections, setDetections] = useState({ face: "Starting", objects: "Starting" });
   const lastAlert = useRef({});
   const modelRef = useRef(null);
@@ -310,22 +311,31 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
     let cancelled = false, timer = null;
     const video = videoRef.current;
     if (!cameraStream || !video) return;
-    video.srcObject = cameraStream;
+    video.muted = true;
+    video.autoplay = true;
+    video.playsInline = true;
     const playPreview = async () => {
       try {
-        if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
-          await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error("Camera video did not provide metadata.")), 8000);
-            video.onloadedmetadata = () => { clearTimeout(timeout); resolve(); };
-            video.onerror = () => { clearTimeout(timeout); reject(new Error("Camera preview could not be opened.")); };
-          });
-        }
         await video.play();
+        if (!cancelled) setCameraStatus("Camera preview live");
       } catch (previewError) {
-        if (!cancelled) setStatus("Camera preview unavailable: " + (previewError?.message || "playback failed"));
+        if (!cancelled) setCameraStatus("Preview blocked: " + (previewError?.message || "click to allow playback"));
       }
     };
-    playPreview();
+    const onVideoReady = () => { if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) playPreview(); };
+    const onPlaying = () => { if (!cancelled) setCameraStatus("Camera preview live"); };
+    const onWaiting = () => { if (!cancelled) setCameraStatus("Waiting for camera frames…"); };
+    video.addEventListener("loadedmetadata", onVideoReady);
+    video.addEventListener("loadeddata", onVideoReady);
+    video.addEventListener("playing", onPlaying);
+    video.addEventListener("waiting", onWaiting);
+    video.srcObject = cameraStream;
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) playPreview();
+    const track = cameraStream.getVideoTracks()[0];
+    if (track) {
+      if (track.readyState !== "live") setCameraStatus("Camera track is not live");
+      else if (track.muted) setCameraStatus("Camera is starting…");
+    }
     const load = async () => {
       try {
         const vision = await import("@mediapipe/tasks-vision");
@@ -391,6 +401,12 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
     return () => {
       cancelled = true;
       if (timer) cancelAnimationFrame(timer);
+      video.removeEventListener("loadedmetadata", onVideoReady);
+      video.removeEventListener("loadeddata", onVideoReady);
+      video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("waiting", onWaiting);
+      video.pause();
+      video.srcObject = null;
       modelRef.current?.face?.close();
       modelRef.current?.objects?.close();
       modelRef.current = null;
@@ -405,6 +421,7 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
     <canvas ref={canvasRef} hidden />
     <div style={{display:"grid",gap:5,minWidth:180,flex:"1 1 180px"}}>
       <strong style={{fontSize:14}}>On-device AI</strong>
+      <span style={{fontSize:12,opacity:.95}}>{cameraStatus}</span>
       <span style={{fontSize:12,opacity:.9}}>{status}</span>
       <small style={{fontSize:11,opacity:.75}}>Face: {detections.face} · Object: {detections.objects}</small>
     </div>
