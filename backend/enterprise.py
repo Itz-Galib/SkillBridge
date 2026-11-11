@@ -1012,7 +1012,20 @@ def admin_integrity_attempt_detail(attempt_id: str, user=Depends(current_user)):
     for event in item["events"]:
         question = QBYID.get(event.get("question_id"))
         event["question"] = question.get("prompt") if question else None
-        event["elapsed_seconds"] = round(max(0, float(event["server_ts"]) - float(item["started"])), 1)
+        # All database timestamps are Unix seconds. Normalize legacy millisecond
+        # values defensively so old attempts cannot collapse to 00:00.
+        started_ts = float(item.get("started") or 0)
+        event_ts = float(event.get("server_ts") or 0)
+        if started_ts > 100_000_000_000:
+            started_ts /= 1000
+        if event_ts > 100_000_000_000:
+            event_ts /= 1000
+        event["elapsed_seconds"] = round(max(0, event_ts - started_ts), 1)
+        event["elapsed_label"] = (
+            f"{int(event['elapsed_seconds'] // 3600):02d}:"
+            f"{int((event['elapsed_seconds'] % 3600) // 60):02d}:"
+            f"{int(event['elapsed_seconds'] % 60):02d}"
+        )
         event["duration_seconds"] = None
         event["duration_status"] = "instant" if event["type"] in {"copy", "cut", "paste"} else None
         if event["type"] in interval_pairs:
