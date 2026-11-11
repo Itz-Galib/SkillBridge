@@ -566,7 +566,7 @@ def sql_run(aid: str, b: SqlRun, u=Depends(current_user)):
 EVENT_TYPES = {
     "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
     "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
-    "fullscreen_enter", "focus", "wrong_share_surface", "ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected", "ai_audio_level", "ai_model_unavailable"
+    "fullscreen_enter", "focus", "wrong_share_surface", "camera_stopped", "ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected", "ai_audio_level", "ai_model_unavailable"
 }
 EVENT_META_KEYS = {"surface", "editor", "reason", "visibility", "supported", "confidence", "model", "duration_ms", "local_only"}
 
