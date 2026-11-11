@@ -795,6 +795,15 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     return () => track.removeEventListener("ended", syncShare);
   }, [screenStream]);
 
+  // Revoke readiness immediately if the camera disconnects during setup.
+  useEffect(() => {
+    const track = cameraStream?.getVideoTracks()[0];
+    if (!track) return;
+    const onEnded = () => { setCameraReady(false); setCameraStream(null); setErr(new Error("Your webcam disconnected. Reconnect it and verify the camera before starting.")); };
+    track.addEventListener("ended", onEnded);
+    return () => track.removeEventListener("ended", onEnded);
+  }, [cameraStream]);
+
   // Stop pending camera capture if setup is abandoned.
   useEffect(() => () => { cameraStream?.getTracks().forEach(track => track.stop()); }, [cameraStream]);
 
@@ -803,7 +812,33 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     try {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access is not supported in this browser.");
       const media = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
-      setCameraStream(media); setCameraReady(true);
+      // Permission + a live track are not enough: verify that the browser can
+      // actually decode camera frames before allowing the assessment to start.
+      const probe = document.createElement("video");
+      probe.muted = true;
+      probe.autoplay = true;
+      probe.playsInline = true;
+      probe.srcObject = media;
+      try {
+        await probe.play();
+        await new Promise((resolve, reject) => {
+          const deadline = Date.now() + 7000;
+          const checkFrame = () => {
+            if (probe.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && probe.videoWidth > 0 && probe.videoHeight > 0) return resolve();
+            if (Date.now() >= deadline) return reject(new Error("Camera permission was granted, but no live video frames were received. Check that your webcam is not being used by another application."));
+            requestAnimationFrame(checkFrame);
+          };
+          checkFrame();
+        });
+      } catch (probeError) {
+        media.getTracks().forEach(track => track.stop());
+        throw probeError;
+      } finally {
+        probe.pause();
+        probe.srcObject = null;
+      }
+      setCameraStream(media);
+      setCameraReady(true);
     } catch (e) { setCameraReady(false); setErr(new Error(e?.name === "NotAllowedError" ? "Camera permission is required for this assessment." : e.message || "Unable to start camera.")); }
   };
 
