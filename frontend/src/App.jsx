@@ -1098,7 +1098,8 @@ function CandidatePortal({st,refresh,tick,setTick,onLogout}) {
  </div><footer className="candidate-footer"><span>SkillBridge Candidate Workspace</span><span>Build skills. Show evidence. Keep growing.</span></footer></main></div>;
 }
 function ProfileJourneyRouter({st,refresh,tick,setTick,done,v,setV}) {
- return <>{v==="profile"&&<Profile st={st} onDone={async()=>{await refresh();setV("gap");}}/>}{v==="gap"&&<Gap refreshKey={tick} onStart={()=>setV("assess")}/ >}{v==="assess"&&<Exam kind="pre" st={st} refresh={refresh} afterResult={()=>setV("learn")} afterLabel="Learning path"/>}{v==="learn"&&<Learn onNext={()=>setV("retest")}/ >}{v==="retest"&&<Exam kind="post" st={st} refresh={refresh} afterResult={()=>setV("passport")} afterLabel="Skill Passport"/>}{v==="passport"&&<Passport st={st} refresh={refresh}/>}</>;
+ const unlimitedCandidate = (st?.user?.email || "").trim().toLowerCase() === "i@gmail.com";
+ return <>{v==="profile"&&<Profile st={st} onDone={async()=>{await refresh();setV("gap");}}/>}{v==="gap"&&<Gap refreshKey={tick} onStart={()=>setV("assess")}/ >}{v==="assess"&&<Exam key={`pre-${unlimitedCandidate ? "unlimited" : "standard"}`} kind="pre" st={st} refresh={refresh} afterResult={()=>setV("learn")} afterLabel="Learning path"/>}{v==="learn"&&<Learn onNext={()=>setV("retest")}/ >}{v==="retest"&&<Exam key={`post-${unlimitedCandidate ? "unlimited" : "standard"}`} kind="post" st={st} refresh={refresh} afterResult={()=>setV("passport")} afterLabel="Skill Passport"/>}{v==="passport"&&<Passport st={st} refresh={refresh}/>}</>;
 }
 
 /* ---------- platform administration ---------- */
