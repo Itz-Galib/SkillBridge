@@ -311,7 +311,21 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
     const video = videoRef.current;
     if (!cameraStream || !video) return;
     video.srcObject = cameraStream;
-    video.play().catch(() => {});
+    const playPreview = async () => {
+      try {
+        if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+          await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error("Camera video did not provide metadata.")), 8000);
+            video.onloadedmetadata = () => { clearTimeout(timeout); resolve(); };
+            video.onerror = () => { clearTimeout(timeout); reject(new Error("Camera preview could not be opened.")); };
+          });
+        }
+        await video.play();
+      } catch (previewError) {
+        if (!cancelled) setStatus("Camera preview unavailable: " + (previewError?.message || "playback failed"));
+      }
+    };
+    playPreview();
     const load = async () => {
       try {
         const vision = await import("@mediapipe/tasks-vision");
@@ -327,7 +341,7 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
         catch { face = await vision.FaceLandmarker.createFromOptions(files, { ...faceOptions, baseOptions: { ...faceOptions.baseOptions, delegate: "CPU" } }); }
         let objects = null;
         const objectOptions = {
-          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/1.tflite" },
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite" },
           runningMode: "VIDEO", scoreThreshold: 0.55, maxResults: 10
         };
         try {
