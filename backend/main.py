@@ -43,8 +43,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT, salt TEXT, pw_hash TEXT, created REAL);
 CREATE TABLE IF NOT EXISTS consents(id INTEGER PRIMARY KEY, user_id INT, version TEXT, lang TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY, redacted TEXT, redaction TEXT, extracted TEXT, source TEXT, confirmed TEXT);
-CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, user_id INT, kind TEXT, seed INT, status TEXT, state TEXT, started REAL, finished REAL, result TEXT, appeal TEXT, session_id TEXT, last_event_seq INTEGER NOT NULL DEFAULT 0, last_heartbeat REAL, session_ip TEXT, session_ua TEXT);
-CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, attempt_id TEXT, type TEXT, ts REAL, question_id TEXT, question_index INTEGER, seq INTEGER, client_ts REAL, metadata TEXT);
+CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, user_id INT, kind TEXT, seed INT, status TEXT, state TEXT, started DOUBLE PRECISION, finished DOUBLE PRECISION, result TEXT, appeal TEXT, session_id TEXT, last_event_seq INTEGER NOT NULL DEFAULT 0, last_heartbeat DOUBLE PRECISION, session_ip TEXT, session_ua TEXT);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, attempt_id TEXT, type TEXT, ts DOUBLE PRECISION, question_id TEXT, question_index INTEGER, seq INTEGER, client_ts DOUBLE PRECISION, metadata TEXT);
 CREATE TABLE IF NOT EXISTS passports(id TEXT PRIMARY KEY, user_id INT, payload TEXT, signature TEXT, created REAL, revoked INT DEFAULT 0);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL, actor INT, action TEXT, target TEXT);
 CREATE TABLE IF NOT EXISTS user_roles(user_id INTEGER PRIMARY KEY, role TEXT NOT NULL DEFAULT 'candidate');
@@ -123,6 +123,26 @@ def init_db():
         }.items():
             if column not in attempt_columns:
                 c.execute(f"ALTER TABLE attempts ADD COLUMN {column} {definition}")
+
+        # PostgreSQL REAL cannot preserve sub-minute Unix timestamp precision at
+        # current epoch magnitudes. Promote existing proctoring timestamp columns
+        # to DOUBLE PRECISION; SQLite already stores these values as floating point.
+        if DATABASE_URL:
+            timestamp_columns = {
+                "attempts": ("started", "finished", "last_heartbeat"),
+                "events": ("ts", "client_ts"),
+            }
+            for table, columns in timestamp_columns.items():
+                types = {row["column_name"]: row["data_type"] for row in c.execute(
+                    f"SELECT column_name, data_type FROM information_schema.columns "
+                    f"WHERE table_schema=current_schema() AND table_name='{table}'"
+                ).fetchall()}
+                for column in columns:
+                    if types.get(column) == "real":
+                        c.execute(
+                            f"ALTER TABLE {table} ALTER COLUMN {column} "
+                            f"TYPE DOUBLE PRECISION USING {column}::double precision"
+                        )
 
 
 def one(sql, args=()):
