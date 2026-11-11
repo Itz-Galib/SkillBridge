@@ -730,7 +730,10 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const mobileDevice = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
   const browserSupported = Boolean(navigator.mediaDevices?.getDisplayMedia && document.documentElement.requestFullscreen);
   const done = st.attempts.filter((a) => a.status === "done");
-  const mine = kind === "pre" ? done[0] : done.length > 1 ? done[done.length - 1] : null;
+  // Local test account can start a fresh assessment/retest instead of being
+  // permanently routed to its most recent completed result.
+  const unlimitedCandidate = (st.user?.email || "").trim().toLowerCase() === "i@gmail.com";
+  const mine = unlimitedCandidate ? null : (kind === "pre" ? done[0] : done.length > 1 ? done[done.length - 1] : null);
   const act = st.attempts.find((a) => a.status === "active");
 
   // Keep the setup status in sync if the candidate exits full-screen.
