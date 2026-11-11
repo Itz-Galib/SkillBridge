@@ -398,6 +398,7 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
   const [left, setLeft] = useState(initial.remaining);
+  const [unlimitedTime, setUnlimitedTime] = useState(Boolean(initial.unlimited_time));
   const [stream, setStream] = useState(screenStream || null);
   const [shareActive, setShareActive] = useState(Boolean(screenStream?.getVideoTracks().some((track) => track.readyState === "live")));
   const [fullscreenActive, setFullscreenActive] = useState(Boolean(document.fullscreenElement));
@@ -464,7 +465,11 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
     return () => { clearInterval(timer); window.removeEventListener("pagehide", flushOnExit); };
   }, [aid, flushEvents]);
 
-  useEffect(() => { const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000); return () => clearInterval(i); }, []);
+  useEffect(() => {
+    if (unlimitedTime) return;
+    const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000);
+    return () => clearInterval(i);
+  }, [unlimitedTime]);
   useEffect(() => { setAns(""); setOut(null); }, [v.question?.id]);
 
   // Block clipboard actions throughout the exam, not only in the SQL editor.
@@ -584,7 +589,7 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
     setBusy(true); setErr(null);
     try {
       const r = await api(`/attempts/${aid}/answer`, { method: "POST", body: { question_id: q.id, answer: String(ans), session_id: sessionId.current } });
-      setV(r); setLeft(r.remaining);
+      setV(r); setLeft(r.remaining); setUnlimitedTime(Boolean(r.unlimited_time));
       if (r.status === "done") onFinished(aid);
     } catch (e) { setErr(e); } finally { setBusy(false); }
   };
@@ -599,7 +604,7 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
       <div className="examhead">
         <span>{t("q")} {q.index + 1} {t("of")} {q.total}</span>
         <progress value={q.index} max={q.total} />
-        <span className={"timer" + (left < 120 ? " low" : "")}>{t("timeLeft")}: {fmt(left)}</span>
+        <span className={"timer" + (!unlimitedTime && left < 120 ? " low" : "")}>{t("timeLeft")}: {unlimitedTime ? "Unlimited" : fmt(left)}</span>
       </div>
       <LocalProctor cameraStream={cameraStream} aid={aid} sessionId={sessionId} nextSeq={nextSeq} report={report} flushEventsForEvidence={flushEvents} />
       <div className={"exam-integrity-banner" + (shareActive ? " active" : " warning")} role="status">
