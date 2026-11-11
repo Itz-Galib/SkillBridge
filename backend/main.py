@@ -18,6 +18,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 COOLDOWN_HOURS = float(os.getenv("RETEST_COOLDOWN_HOURS", "0"))   # spec default is 14 days (336h); 0 for demos
 MAX_ATTEMPTS_90D = int(os.getenv("MAX_ATTEMPTS_90D", "3"))
+UNLIMITED_EXAM_EMAILS = {"i@gmail.com"}
 EVIDENCE_RETENTION_DAYS = max(1, min(90, int(os.getenv("EVIDENCE_RETENTION_DAYS", "30"))))
 MAX_EVIDENCE_BYTES = 180 * 1024
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -408,10 +409,16 @@ def seen_before(uid):
     return s
 
 
+def unlimited_exam_user(uid):
+    user = one("SELECT email FROM users WHERE id=?", (uid,))
+    return bool(user and (user["email"] or "").strip().lower() in UNLIMITED_EXAM_EMAILS)
+
+
 def view(att, include_session=False):
     st = json.loads(att["state"])
-    remaining = max(0, int(att["started"] + E.TEST_SECONDS - time.time()))
-    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "answered": len(st["answers"]), "total": len(E.SLOTS), "session_id": att.get("session_id") if include_session else None, "last_event_seq": int(att.get("last_event_seq") or 0)}
+    unlimited_time = unlimited_exam_user(att["user_id"])
+    remaining = 0 if unlimited_time else max(0, int(att["started"] + E.TEST_SECONDS - time.time()))
+    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "unlimited_time": unlimited_time, "answered": len(st["answers"]), "total": len(E.SLOTS), "session_id": att.get("session_id") if include_session else None, "last_event_seq": int(att.get("last_event_seq") or 0)}
     if att["status"] == "active" and st["current"]:
         out["question"] = E.public_question(QBYID[st["current"]], st)
     return out
@@ -456,9 +463,10 @@ def require_screen_share(att_id):
 @app.post("/api/attempts")
 def start_attempt(u=Depends(current_user)):
     need_consent(u)
+    unlimited_time = (u.get("email") or "").strip().lower() in UNLIMITED_EXAM_EMAILS
     act = one("SELECT * FROM attempts WHERE user_id=? AND status='active'", (u["id"],))
     if act:
-        if time.time() > act["started"] + E.TEST_SECONDS + E.GRACE:
+        if not unlimited_time and time.time() > act["started"] + E.TEST_SECONDS + E.GRACE:
             finalize(dict(act), json.loads(act["state"]))
         else:
             # A fresh page/session takes ownership; the previous tab is rejected from this point.
@@ -468,9 +476,9 @@ def start_attempt(u=Depends(current_user)):
             act = get_att(act["id"], u["id"])
             return view(dict(act), include_session=True)  # resume while invalidating any older tab
     done = allr("SELECT finished FROM attempts WHERE user_id=? AND status='done' ORDER BY finished DESC", (u["id"],))
-    if len([d for d in done if d["finished"] > time.time() - 90 * 86400]) >= MAX_ATTEMPTS_90D:
+    if not unlimited_time and len([d for d in done if d["finished"] > time.time() - 90 * 86400]) >= MAX_ATTEMPTS_90D:
         raise HTTPException(429, "attempt_cap")
-    if done and COOLDOWN_HOURS > 0 and time.time() < done[0]["finished"] + COOLDOWN_HOURS * 3600:
+    if not unlimited_time and done and COOLDOWN_HOURS > 0 and time.time() < done[0]["finished"] + COOLDOWN_HOURS * 3600:
         raise HTTPException(429, "cooldown")
     seed = secrets.randbelow(10**9)
     st = E.new_state(seed)
@@ -503,7 +511,7 @@ def answer(aid: str, b: Ans, u=Depends(current_user)):
     _check_exam_session(att, b.session_id)
     require_screen_share(aid)
     st = json.loads(att["state"])
-    if time.time() > att["started"] + E.TEST_SECONDS + E.GRACE:      # server owns the timer
+    if not unlimited_exam_user(u["id"]) and time.time() > att["started"] + E.TEST_SECONDS + E.GRACE:      # server owns the timer
         finalize(att, st); return view(get_att(aid, u["id"]))
     if b.question_id != st["current"]: raise HTTPException(409, "Question mismatch")
     q = QBYID[st["current"]]
