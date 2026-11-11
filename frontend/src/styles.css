@@ -487,3 +487,17 @@ summary { cursor: pointer; font-weight: 600; margin: .4rem 0; }
 .ai-evidence-grid img { display: block; width: 100%; max-height: 190px; object-fit: contain; border-radius: 6px; background: #17252a; }
 .ai-evidence-grid figcaption { margin-top: 6px; color: var(--muted); font-size: .78rem; }
 @media (max-width: 520px) { .ai-proctor-panel { align-items: flex-start; } .ai-proctor-panel video { width: 68px; height: 54px; } }
+
+
+/* Candidate assessment review status and verified score history */
+.assessment-history{margin:22px 0}
+.assessment-featured{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:18px;padding:20px;margin:12px 0;border:1px solid #b8d9c8;border-radius:14px;background:linear-gradient(120deg,#f0faf5,#fff)}
+.assessment-featured h3{margin:5px 0}.assessment-featured p,.assessment-history-row small{display:block;margin:4px 0 0;color:var(--muted);font-size:.82rem}
+.assessment-featured>strong{font-size:2rem;color:#176b4a}.assessment-featured>strong small,.assessment-history-row>strong small{font-size:.78rem;color:var(--muted);margin-left:3px}
+.assessment-pending-banner{padding:16px 18px;margin:12px 0;border:1px solid #edc98d;border-radius:12px;background:#fff8eb;color:#80520b}
+.assessment-pending-banner p{margin:5px 0 0;font-size:.86rem}
+.assessment-history-list{display:grid;gap:8px;margin-top:10px}
+.assessment-history-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:14px;padding:13px 15px;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+.assessment-history-row>strong{font-size:1.1rem}
+.status-valid{background:#e8f7f0;color:#116047}.status-review{background:#fff4e5;color:#80520b}.status-invalid{background:#fdecec;color:#9b2525}
+@media(max-width:560px){.assessment-featured,.assessment-history-row{grid-template-columns:1fr auto}.assessment-featured>.status-pill,.assessment-history-row>.status-pill{justify-self:start;grid-column:1/-1}}
