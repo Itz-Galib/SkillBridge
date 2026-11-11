@@ -296,14 +296,28 @@ def latest_done(uid, kind=None):
 @app.get("/api/state")
 def state(u=Depends(current_user)):
     prof = one("SELECT * FROM profiles WHERE user_id=?", (u["id"],))
-    atts = allr("SELECT id,kind,status,result,finished FROM attempts WHERE user_id=? ORDER BY started", (u["id"],))
+    atts = allr("""SELECT a.id,a.kind,a.status,a.result,a.finished,
+                   r.decision AS review_decision,r.reviewed_at
+                   FROM attempts a LEFT JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+                   WHERE a.user_id=? ORDER BY a.finished DESC,a.started DESC""", (u["id"],))
     pp = allr("SELECT id,created,revoked FROM passports WHERE user_id=? ORDER BY created DESC", (u["id"],))
+    attempt_items = []
+    for a in atts:
+        try:
+            result = json.loads(a["result"]) if a["result"] else {}
+        except Exception:
+            result = {}
+        attempt_items.append({
+            "id": a["id"], "kind": a["kind"], "status": a["status"],
+            "overall": result.get("overall"), "finished": a["finished"],
+            "review_decision": a["review_decision"], "reviewed_at": a["reviewed_at"],
+        })
     return {
         "user": {"name": u["name"], "email": u["email"]},
         "consented": bool(one("SELECT 1 FROM consents WHERE user_id=? AND version=?", (u["id"], CONSENT_VERSION))),
         "has_cv": bool(prof and prof["extracted"]),
         "confirmed": json.loads(prof["confirmed"]) if prof and prof["confirmed"] else None,
-        "attempts": [{"id": a["id"], "kind": a["kind"], "status": a["status"], "overall": (json.loads(a["result"])["overall"] if a["result"] else None)} for a in atts],
+        "attempts": attempt_items,
         "passports": [{"id": p["id"], "created": p["created"], "revoked": bool(p["revoked"])} for p in pp],
     }
 
