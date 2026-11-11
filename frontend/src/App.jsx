@@ -382,10 +382,18 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
       modelRef.current = null;
     };
   }, [cameraStream, evidence, report]);
-  return <div className="ai-proctor-panel">
-    <video ref={videoRef} muted playsInline aria-label="Local webcam analysis" />
+  return <div className="ai-proctor-panel" style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap",padding:12,border:"1px solid #d7dce3",borderRadius:12,background:"#111827",color:"#f9fafb"}}>
+    <div style={{position:"relative",width:190,maxWidth:"100%",aspectRatio:"16 / 10",flexShrink:0,overflow:"hidden",borderRadius:9,background:"#030712"}}>
+      <video ref={videoRef} muted playsInline autoPlay aria-label="Live webcam preview" style={{display:"block",width:"100%",height:"100%",objectFit:"cover",transform:"scaleX(-1)"}} />
+      <span style={{position:"absolute",left:8,top:8,padding:"3px 7px",borderRadius:5,background:"#b91c1c",color:"#fff",fontSize:10,fontWeight:700,letterSpacing:".04em"}}>LIVE</span>
+      <span style={{position:"absolute",left:8,bottom:7,color:"#fff",fontSize:11,textShadow:"0 1px 3px #000"}}>Camera preview</span>
+    </div>
     <canvas ref={canvasRef} hidden />
-    <div><strong>On-device AI</strong><span>{status}</span><small>Face: {detections.face} · Object: {detections.objects}</small></div>
+    <div style={{display:"grid",gap:5,minWidth:180,flex:"1 1 180px"}}>
+      <strong style={{fontSize:14}}>On-device AI</strong>
+      <span style={{fontSize:12,opacity:.9}}>{status}</span>
+      <small style={{fontSize:11,opacity:.75}}>Face: {detections.face} · Object: {detections.objects}</small>
+    </div>
   </div>;
 }
 
