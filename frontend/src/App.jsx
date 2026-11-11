@@ -1625,6 +1625,7 @@ function Result({ aid, next, nextLabel }) {
                   <th>Question</th>
                   <th>Your answer</th>
                   <th>Expected answer / review</th>
+                  <th>Marks</th>
                   <th>Status</th>
                 </tr>
               </thead>
@@ -1637,6 +1638,11 @@ function Result({ aid, next, nextLabel }) {
                       <td>{item.question}</td>
                       <td>{item.answer || "No answer"}</td>
                       <td>{item.correct_answer || "Pending human review"}</td>
+                      <td>
+                        {item.awarded_marks == null
+                          ? "Pending"
+                          : `${item.awarded_marks} / ${item.max_marks ?? 1}`}
+                      </td>
                       <td>{String(item.review_status).replaceAll("_", " ")}</td>
                     </tr>
                   ))}
@@ -3176,7 +3182,9 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
               .map((n) => (
                 <button
                   key={n.id}
+                  type="button"
                   className={section === n.id ? "active" : ""}
+                  aria-current={section === n.id ? "page" : undefined}
                   onClick={() => go(n.id)}
                 >
                   <span>{n.icon}</span>
@@ -3225,11 +3233,29 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
               ownerKey={st.user?.email}
               className="topbar-avatar"
             />
-            <button className="candidate-logout" onClick={onLogout}>
+            <button
+              type="button"
+              className="candidate-logout"
+              onClick={onLogout}
+            >
               Sign out
             </button>
           </div>
         </header>
+        <nav className="candidate-mobile-nav" aria-label="Candidate workspace">
+          {nav.map((n) => (
+            <button
+              key={n.id}
+              type="button"
+              className={section === n.id ? "active" : ""}
+              aria-current={section === n.id ? "page" : undefined}
+              onClick={() => go(n.id)}
+            >
+              <span>{n.icon}</span>
+              {n.label}
+            </button>
+          ))}
+        </nav>
         <div className="candidate-page">
           {section === "overview" && (
             <>
@@ -3585,6 +3611,9 @@ function AdminConsole({ onLogout }) {
     [integrityKind, setIntegrityKind] = useState("all"),
     [integrityTrust, setIntegrityTrust] = useState("all");
   const [selectedReport, setSelectedReport] = useState(null);
+  const [reportEvaluations, setReportEvaluations] = useState({});
+  const [evaluationBusy, setEvaluationBusy] = useState(false);
+  const [evaluationError, setEvaluationError] = useState("");
   const [questionCategory, setQuestionCategory] = useState("all"),
     [questionQuery, setQuestionQuery] = useState(""),
     [questionStatus, setQuestionStatus] = useState("all");
@@ -3715,6 +3744,135 @@ function AdminConsole({ onLogout }) {
       setCreatingAdmin(false);
     }
   };
+  const syncEvaluationEdits = (report) => {
+    const next = {};
+    (report?.answer_evidence || []).forEach((q) => {
+      if (!q.evaluation) return;
+      next[q.question_id] = {
+        marks:
+          q.evaluation.final_marks != null
+            ? q.evaluation.final_marks
+            : q.evaluation.ai_marks,
+        admin_note: q.evaluation.admin_note || "",
+        additional_info: q.evaluation.additional_info || "",
+      };
+    });
+    setReportEvaluations(next);
+  };
+  const runEvaluation = async (report) => {
+    if (!report) return;
+    setEvaluationBusy(true);
+    setEvaluationError("");
+    try {
+      const res = await api(
+        "/admin/attempts/" + encodeURIComponent(report.id) + "/evaluate",
+        { method: "POST", body: {} },
+      );
+      const byId = {};
+      (res.items || []).forEach((item) => {
+        byId[item.question_id] = item;
+      });
+      const merged = {
+        ...report,
+        evaluations: res.items || [],
+        evaluation_summary: {
+          ...(report.evaluation_summary || {}),
+          llm_configured: res.llm_configured,
+        },
+        answer_evidence: (report.answer_evidence || []).map((q) => {
+          const evaluation = byId[q.question_id] || q.evaluation;
+          if (!evaluation) return q;
+          return {
+            ...q,
+            evaluation,
+            max_marks: evaluation.max_marks,
+            ai_marks: evaluation.ai_marks,
+            awarded_marks:
+              evaluation.status === "approved"
+                ? evaluation.final_marks
+                : q.awarded_marks,
+            evaluation_status: evaluation.status,
+          };
+        }),
+      };
+      setSelectedReport(merged);
+      syncEvaluationEdits(merged);
+      await load();
+    } catch (x) {
+      setEvaluationError(x.message || "Could not run the AI evaluation.");
+    } finally {
+      setEvaluationBusy(false);
+    }
+  };
+  const openReport = (report) => {
+    setSelectedReport(report);
+    setEvaluationError("");
+    syncEvaluationEdits(report);
+    const hasSubjective = (report.answer_evidence || []).some(
+      (q) => !["mcq", "multiple choice"].includes(String(q.type).toLowerCase()),
+    );
+    const alreadyEnriched = (report.evaluations || []).some(
+      (e) => e.llm_provider,
+    );
+    if (
+      hasSubjective &&
+      !alreadyEnriched &&
+      ["pending_human_review", "auto_graded", undefined].includes(
+        report.result?.review_status,
+      )
+    ) {
+      runEvaluation(report);
+    }
+  };
+  const saveEvaluation = async (report, questionId) => {
+    const edit = reportEvaluations[questionId];
+    if (!edit) return;
+    setEvaluationBusy(true);
+    setEvaluationError("");
+    try {
+      const saved = await api(
+        "/admin/attempts/" +
+          encodeURIComponent(report.id) +
+          "/evaluations/" +
+          encodeURIComponent(questionId),
+        {
+          method: "PATCH",
+          body: {
+            question_id: questionId,
+            marks: edit.marks === "" ? null : Number(edit.marks),
+            admin_note: edit.admin_note || "",
+            additional_info: edit.additional_info || "",
+            status: "approved",
+          },
+        },
+      );
+      const merged = {
+        ...report,
+        answer_evidence: (report.answer_evidence || []).map((q) =>
+          q.question_id === questionId
+            ? {
+                ...q,
+                evaluation: saved,
+                awarded_marks: saved.final_marks,
+                evaluation_status: saved.status,
+                review_status: "human_approved",
+              }
+            : q,
+        ),
+        evaluations: (report.evaluations || []).map((e) =>
+          e.question_id === questionId ? saved : e,
+        ),
+      };
+      setSelectedReport(merged);
+      syncEvaluationEdits(merged);
+      flash("Evaluation mark saved and approved for this answer.");
+      await load();
+    } catch (x) {
+      setEvaluationError(x.message || "Could not save this evaluation.");
+    } finally {
+      setEvaluationBusy(false);
+    }
+  };
   const openAction = (kind, id, decision) => {
     setAction({ kind, id, decision });
     setReason("");
@@ -3762,6 +3920,17 @@ function AdminConsole({ onLogout }) {
       }
       if (action.kind === "assessment") {
         body.decision = action.decision;
+        if (selectedReport?.id === action.id) {
+          body.evaluations = Object.entries(reportEvaluations).map(
+            ([question_id, edit]) => ({
+              question_id,
+              marks: edit.marks === "" ? null : Number(edit.marks),
+              admin_note: edit.admin_note || "",
+              additional_info: edit.additional_info || "",
+              status: "approved",
+            }),
+          );
+        }
         actionResult = await api("/admin/attempts/" + action.id + "/review", {
           method: "POST",
           body,
@@ -4057,7 +4226,7 @@ function AdminConsole({ onLogout }) {
     const questions = evidence
       .map(
         (q) =>
-          `<article class="question"><h3>Question ${esc(q.number)} · ${esc(q.topic)} · ${esc(q.type)}</h3><p class="prompt">${esc(q.question)}</p>${q.options?.length ? `<ol>${q.options.map((o) => `<li>${esc(o)}</li>`).join("")}</ol>` : ""}<div class="answer"><b>Candidate response</b><pre>${esc(q.selected_option ?? q.candidate_answer ?? "Not captured in this attempt")}</pre></div><div class="meta">Automated result: ${q.automated_correct === true ? "Correct" : q.automated_correct === false ? "Incorrect" : "Not available"} · Difficulty: ${esc(q.difficulty)} · Response time: ${esc(q.time_seconds)} sec</div></article>`,
+          `<article class="question"><h3>Question ${esc(q.number)} · ${esc(q.topic)} · ${esc(q.type)}</h3><p class="prompt">${esc(q.question)}</p>${q.options?.length ? `<ol>${q.options.map((o) => `<li>${esc(o)}</li>`).join("")}</ol>` : ""}<div class="answer"><b>Candidate response</b><pre>${esc(q.selected_option ?? q.candidate_answer ?? "Not captured in this attempt")}</pre></div><div class="meta">Automated result: ${q.automated_correct === true ? "Correct" : q.automated_correct === false ? "Incorrect" : "Not available"} · Difficulty: ${esc(q.difficulty)} · Response time: ${esc(q.time_seconds)} sec</div>${q.evaluation ? `<div class="meta"><b>AI-assisted draft (${esc(q.evaluation.status)}):</b> ${esc(q.evaluation.ai_marks)}/${esc(q.evaluation.max_marks)} partial marks · ${esc(q.evaluation.rationale)}</div>` : ""}</article>`,
       )
       .join("");
     const html = `<!doctype html><html><head><meta charset="utf-8"><title>Assessment evaluation report</title><style>body{font:14px/1.55 Arial,sans-serif;color:#18232b;margin:34px}h1{font-size:26px;margin:0}h2{margin-top:28px} .sub{color:#61717b}.summary{display:flex;gap:16px;margin:22px 0}.metric{padding:14px;border:1px solid #dce4e8;border-radius:10px;min-width:120px}.metric b{display:block;font-size:24px}.question{border:1px solid #dce4e8;border-radius:10px;padding:16px;margin:14px 0;break-inside:avoid}.prompt{font-weight:600}.answer{background:#f4f7f8;padding:12px;border-radius:8px}.answer pre{white-space:pre-wrap;font:13px/1.5 monospace;margin:8px 0}.meta{font-size:12px;color:#61717b;margin-top:10px}.notice{background:#fff8e8;border-left:4px solid #d59a35;padding:12px;margin:18px 0} @media print{body{margin:15mm}.question{break-inside:avoid}}</style></head><body><h1>SkillBridge · Assessment evaluation report</h1><p class="sub">Candidate: ${esc(report.candidate_name)} · ${esc(report.email)}<br>Attempt: ${esc(report.id)} · Type: ${esc(report.kind)} · Completed: ${esc(stamp(report.finished))}</p><div class="summary"><div class="metric"><b>${esc(report.result?.overall ?? "—")}/100</b>Overall score</div><div class="metric"><b>${esc(report.result?.level ?? "—")}</b>Estimated level</div><div class="metric"><b>${esc(report.result?.trust ?? "—")}</b>Integrity signal</div></div><div class="notice"><b>Evaluation method:</b> ${esc(report.evaluation_method || "Automated grading details unavailable.")} The score is a support signal, not a final hiring decision. Manual review is required.</div><h2>Topic breakdown</h2><ul>${Object.entries(
@@ -4191,11 +4360,14 @@ function AdminConsole({ onLogout }) {
         <div className="ad-admin-label">
           <span className="ad-online-dot" /> ADMIN CONSOLE
         </div>
-        <nav className="ad-nav">
+        <nav className="ad-nav" aria-label="Admin console">
           {visibleNav.map(([id, label, icon]) => (
             <button
               key={id}
+              type="button"
               className={page === id ? "active" : ""}
+              aria-current={page === id ? "page" : undefined}
+              title={label}
               onClick={() => {
                 setPage(id);
                 setSearch("");
@@ -4890,9 +5062,11 @@ function AdminConsole({ onLogout }) {
                 </span>
               </div>
               <div className="ad-info-banner">
-                The current assessment engine uses deterministic answer-key /
-                SQL grading. This report shows that automated evaluation and
-                source evidence; it does not claim an LLM-generated judgement.
+                MCQs and reference-answer SQL are graded deterministically.
+                Descriptive, scenario, coding and analytical answers receive an
+                AI-assisted hybrid draft (keyword coverage + reference similarity
+                + optional LLM opinion) with partial marks. Every draft waits for
+                your approval and can be edited before it affects the score.
                 Approving a result updates the candidate's verified learning path
                 and issues a Skill Passport automatically. Invalidating or
                 requesting more information revokes that passport. Older attempts
@@ -4936,7 +5110,7 @@ function AdminConsole({ onLogout }) {
                     <td>{pill(x.review_decision || "pending_review")}</td>
                     <td>
                       <div className="ad-row-actions">
-                        <button onClick={() => setSelectedReport(x)}>
+                        <button onClick={() => openReport(x)}>
                           View report
                         </button>
                         <button
@@ -5833,7 +6007,9 @@ function AdminConsole({ onLogout }) {
                             return (
                               <article
                                 className={
-                                  "ad-staging-row" + (sel ? " selected" : "")
+                                  "ad-staging-row" +
+                                  (sel ? " selected" : "") +
+                                  (invalid || dup ? " locked" : "")
                                 }
                                 key={q.id}
                               >
@@ -7162,9 +7338,30 @@ function AdminConsole({ onLogout }) {
             <div className="ad-info-banner">
               {selectedReport.evaluation_method ||
                 "Automated evaluation method unavailable."}{" "}
-              This is a deterministic grading summary, not a generative AI
-              judgement. Use your own judgement for the final manual review.
+              AI-assisted drafts are advisory evidence. The score changes only
+              after you approve or edit each mark.
+              {selectedReport.evaluation_summary?.llm_configured === false &&
+                " No LLM provider is configured, so the draft uses keyword coverage and reference similarity only."}
             </div>
+            <div className="ad-eval-toolbar">
+              <button
+                type="button"
+                className="ad-mini-primary"
+                onClick={() => runEvaluation(selectedReport)}
+                disabled={evaluationBusy}
+              >
+                {evaluationBusy
+                  ? "Running hybrid evaluation…"
+                  : "Re-run keyword + similarity + LLM evaluation"}
+              </button>
+              <span>
+                {selectedReport.evaluation_summary?.pending_admin_approval ?? 0}{" "}
+                draft(s) pending approval
+              </span>
+            </div>
+            {evaluationError && (
+              <div className="ad-warning-banner">{evaluationError}</div>
+            )}
             {!selectedReport.answer_evidence_complete && (
               <div className="ad-warning-banner">
                 Some or all candidate responses were not captured for this older
@@ -7228,16 +7425,163 @@ function AdminConsole({ onLogout }) {
                       Rubric: {q.grading_rubric}
                     </p>
                   )}
-                  <div className="ad-report-qmeta">
-                    Evaluation:{" "}
-                    {q.review_status ||
-                      (q.automated_correct === true
-                        ? "Correct"
-                        : q.automated_correct === false
-                          ? "Incorrect"
-                          : "Unavailable")}{" "}
-                    · Response time: {q.time_seconds ?? "—"} sec
-                  </div>
+                  {q.evaluation ? (
+                    <div className="ad-eval-card">
+                      <div className="ad-eval-head">
+                        <b>AI-assisted evaluation draft</b>
+                        <span
+                          className={
+                            "ad-eval-status " +
+                            (q.evaluation.status === "approved"
+                              ? "approved"
+                              : "pending")
+                          }
+                        >
+                          {q.evaluation.status === "approved"
+                            ? "Administrator approved"
+                            : "Awaiting administrator approval"}
+                        </span>
+                      </div>
+                      <div className="ad-eval-score">
+                        <strong>
+                          {q.evaluation.ai_marks}
+                          <small> / {q.evaluation.max_marks}</small>
+                        </strong>
+                        <span>
+                          Suggested partial marks ·{" "}
+                          {Math.round((q.evaluation.confidence || 0) * 100)}%
+                          confidence · {q.evaluation.method}
+                          {q.evaluation.llm_model
+                            ? ` · ${q.evaluation.llm_provider}/${q.evaluation.llm_model}`
+                            : " · LLM opinion unavailable"}
+                        </span>
+                      </div>
+                      <div className="ad-eval-bars">
+                        {[
+                          ["Keyword coverage", q.evaluation.components?.keyword],
+                          ["Reference similarity", q.evaluation.components?.similarity],
+                          ["LLM judgement", q.evaluation.components?.llm],
+                        ].map(([label, component]) => (
+                          <div key={label}>
+                            <span>{label}</span>
+                            <div>
+                              <i
+                                style={{
+                                  width:
+                                    Math.round((component?.score || 0) * 100) +
+                                    "%",
+                                }}
+                              />
+                            </div>
+                            <b>
+                              {Math.round((component?.score || 0) * 100)}%
+                            </b>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="ad-eval-keywords">
+                        {(q.evaluation.keywords?.matched || []).map((k) => (
+                          <span className="hit" key={"m-" + k}>
+                            ✓ {k}
+                          </span>
+                        ))}
+                        {(q.evaluation.keywords?.missing || []).map((k) => (
+                          <span className="miss" key={"x-" + k}>
+                            ✕ {k}
+                          </span>
+                        ))}
+                      </div>
+                      <p className="ad-eval-rationale">
+                        {q.evaluation.rationale}
+                      </p>
+                      {q.evaluation.flags?.length > 0 && (
+                        <p className="ad-eval-flags">
+                          Flags: {q.evaluation.flags.join(", ")}
+                        </p>
+                      )}
+                      <div className="ad-eval-edit">
+                        <label>
+                          <span>Approved marks (0–{q.evaluation.max_marks})</span>
+                          <input
+                            type="number"
+                            min="0"
+                            max={q.evaluation.max_marks}
+                            step="0.25"
+                            value={
+                              reportEvaluations[q.question_id]?.marks ?? ""
+                            }
+                            onChange={(e) =>
+                              setReportEvaluations((prev) => ({
+                                ...prev,
+                                [q.question_id]: {
+                                  ...(prev[q.question_id] || {}),
+                                  marks: e.target.value,
+                                },
+                              }))
+                            }
+                          />
+                        </label>
+                        <label>
+                          <span>Administrator note (reason for the mark)</span>
+                          <textarea
+                            rows="2"
+                            value={
+                              reportEvaluations[q.question_id]?.admin_note || ""
+                            }
+                            onChange={(e) =>
+                              setReportEvaluations((prev) => ({
+                                ...prev,
+                                [q.question_id]: {
+                                  ...(prev[q.question_id] || {}),
+                                  admin_note: e.target.value,
+                                },
+                              }))
+                            }
+                          />
+                        </label>
+                        <label>
+                          <span>Additional information for the audit trail</span>
+                          <textarea
+                            rows="2"
+                            value={
+                              reportEvaluations[q.question_id]
+                                ?.additional_info || ""
+                            }
+                            onChange={(e) =>
+                              setReportEvaluations((prev) => ({
+                                ...prev,
+                                [q.question_id]: {
+                                  ...(prev[q.question_id] || {}),
+                                  additional_info: e.target.value,
+                                },
+                              }))
+                            }
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          className="ad-mini-primary"
+                          disabled={evaluationBusy}
+                          onClick={() =>
+                            saveEvaluation(selectedReport, q.question_id)
+                          }
+                        >
+                          Save & approve this mark
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="ad-report-qmeta">
+                      Evaluation:{" "}
+                      {q.review_status ||
+                        (q.automated_correct === true
+                          ? "Correct"
+                          : q.automated_correct === false
+                            ? "Incorrect"
+                            : "Unavailable")}{" "}
+                      · Response time: {q.time_seconds ?? "—"} sec
+                    </div>
+                  )}
                 </article>
               ))}
             </div>
@@ -7582,30 +7926,44 @@ function HiringWorkspace({ role, onLogout }) {
     setBusy(true);
     setError("");
     try {
+      // Core workspace data must load; secondary panels are independent so one
+      // unavailable report endpoint cannot blank the rest of the company page.
       const w = await api("/company/workspace");
       setWorkspace(w);
       setCompanyName(w.company.name);
       setWebsite(w.company.website || "");
       const j = await api("/company/jobs");
       setJobs(j.items || []);
+      const optional = [];
       if (w.company.verified && w.permissions.manage_pipeline) {
-        const a = await api("/company/applications");
-        setApplications(a.items || []);
+        optional.push(
+          api("/company/applications")
+            .then((a) => setApplications(a.items || []))
+            .catch(() => setApplications([])),
+        );
       } else {
         setApplications([]);
       }
       if (w.permissions.view_reports) {
-        const x = await api("/company/analytics");
-        setAnalytics(x);
+        optional.push(
+          api("/company/analytics")
+            .then((x) => setAnalytics(x))
+            .catch(() => setAnalytics(null)),
+        );
+        optional.push(
+          api("/company/phase-two")
+            .then((p) => setPhaseTwo(p.items || []))
+            .catch(() => setPhaseTwo([])),
+        );
       }
       if (w.permissions.manage_team) {
-        const t = await api("/company/team");
-        setTeam(t.items || []);
+        optional.push(
+          api("/company/team")
+            .then((t) => setTeam(t.items || []))
+            .catch(() => setTeam([])),
+        );
       }
-      if (w.permissions.view_reports) {
-        const p = await api("/company/phase-two");
-        setPhaseTwo(p.items || []);
-      }
+      await Promise.allSettled(optional);
     } catch (e) {
       fail(e);
     } finally {
@@ -7613,7 +7971,7 @@ function HiringWorkspace({ role, onLogout }) {
     }
   };
   useEffect(() => {
-    load();
+    if (role !== "admin") load();
   }, [role]);
   const openApplication = async (id) => {
     try {
@@ -8025,11 +8383,14 @@ function HiringWorkspace({ role, onLogout }) {
           <span className="cr-chevron">⌄</span>
         </div>
         <div className="cr-nav-label">WORKSPACE</div>
-        <nav className="cr-nav">
+        <nav className="cr-nav" aria-label="Company workspace">
           {nav.map(([id, label, icon]) => (
             <button
               key={id}
+              type="button"
               className={page === id ? "active" : ""}
+              aria-current={page === id ? "page" : undefined}
+              title={label}
               onClick={() => {
                 setPage(id);
                 setSelected(null);
@@ -8654,7 +9015,9 @@ function HiringWorkspace({ role, onLogout }) {
                 >
                   <option value="all">All jobs</option>
                   {jobs.map((j) => (
-                    <option value={j.id}>{j.title}</option>
+                    <option key={j.id} value={j.id}>
+                      {j.title}
+                    </option>
                   ))}
                 </select>
                 <span>{filteredApps.length} applicants</span>
@@ -9731,6 +10094,12 @@ function Shell({ lang, setLang }) {
 
   let body;
   if (!authed) body = <Landing onAuthed={() => setAuthed(true)} />;
+  // Admin and company accounts have their own onboarding and do not need the
+  // candidate consent/state gate. This also removes a loading flash where the
+  // marketing header appeared above the operational panels.
+  else if (role === "admin") body = <AdminConsole onLogout={logout} />;
+  else if (role && role !== "candidate")
+    body = <HiringWorkspace role={role} onLogout={logout} />;
   else if (!st || !view)
     body = (
       <main className="wrap">
@@ -9743,8 +10112,6 @@ function Shell({ lang, setLang }) {
         <Consent lang={lang} onDone={refresh} />
       </main>
     );
-  else if (role && role !== "candidate")
-    body = <HiringWorkspace role={role} onLogout={logout} />;
   else
     body = (
       <CandidatePortal
@@ -9755,11 +10122,13 @@ function Shell({ lang, setLang }) {
         onLogout={logout}
       />
     );
-  const modernCandidateShell =
-    authed && role === "candidate" && !!st?.consented;
+  // Authenticated workspaces own their full-viewport shell (sidebar + topbar).
+  // Rendering the marketing header as well caused duplicate sign-out controls
+  // and pushed the three panels to different heights.
+  const modernWorkspace = authed && !!role;
   return (
     <>
-      {!modernCandidateShell && Head}
+      {!modernWorkspace && Head}
 
       {body}
     </>

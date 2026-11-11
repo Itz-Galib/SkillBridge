@@ -1,4 +1,8 @@
-"""SkillBridge Global R0 API (FastAPI). Scores come from stored answer keys + server logic; AI never grades."""
+"""SkillBridge Global R0 API (FastAPI).
+
+Scores come from stored answer keys + deterministic server logic. For descriptive
+answers an AI-assisted hybrid draft is advisory only: every mark stays pending
+until a human administrator approves or edits it."""
 import os, io, re, json, time, uuid, base64, hmac, hashlib, secrets, sqlite3, zipfile, logging
 from datetime import date
 from pathlib import Path
@@ -55,6 +59,18 @@ CREATE TABLE IF NOT EXISTS candidate_avatars(user_id INTEGER PRIMARY KEY, storag
 CREATE TABLE IF NOT EXISTS assessment_blueprints(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS assessment_answer_events(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, question_id TEXT NOT NULL, revision INTEGER NOT NULL, answer_hash TEXT NOT NULL, answer_length INTEGER NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS attempt_questions(attempt_id TEXT NOT NULL, question_id TEXT NOT NULL, PRIMARY KEY(attempt_id, question_id));
+CREATE TABLE IF NOT EXISTS answer_evaluations(
+  attempt_id TEXT NOT NULL, question_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending_approval',
+  max_marks REAL NOT NULL DEFAULT 1, ai_marks REAL NOT NULL DEFAULT 0,
+  final_marks REAL, method TEXT NOT NULL DEFAULT '',
+  components TEXT NOT NULL DEFAULT '{}', keywords TEXT NOT NULL DEFAULT '{}',
+  rationale TEXT NOT NULL DEFAULT '', confidence REAL,
+  llm_provider TEXT NOT NULL DEFAULT '', llm_model TEXT NOT NULL DEFAULT '',
+  flags TEXT NOT NULL DEFAULT '[]', admin_note TEXT NOT NULL DEFAULT '',
+  additional_info TEXT NOT NULL DEFAULT '', evaluated_at REAL NOT NULL,
+  reviewed_by INTEGER, reviewed_at REAL,
+  PRIMARY KEY(attempt_id, question_id));
 CREATE TABLE IF NOT EXISTS cv_skill_nodes(user_id INTEGER NOT NULL, skill_id TEXT NOT NULL, label TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.8, PRIMARY KEY(user_id, skill_id));
 CREATE TABLE IF NOT EXISTS skill_question_edges(skill_id TEXT NOT NULL, question_id TEXT NOT NULL, PRIMARY KEY(skill_id, question_id));
 """
@@ -527,6 +543,9 @@ def export_data(u=Depends(current_user)):
     d["cv_documents"] = cv_store.list_documents(u["id"])
     d["cv_extractions"] = cv_store.list_extractions(u["id"])
     d["applications"] = [dict(r) for r in allr("SELECT * FROM applications WHERE candidate_id=?", (u["id"],))]
+    d["answer_evaluations"] = [evaluation_view(r) for r in allr(
+        "SELECT * FROM answer_evaluations WHERE attempt_id IN "
+        "(SELECT id FROM attempts WHERE user_id=?)", (u["id"],))]
     audit(u["id"], "export")
     return d
 
@@ -543,7 +562,9 @@ def delete_me(u=Depends(current_user)):
             raise HTTPException(503, "Could not remove the profile photo, please try again")
         run("DELETE FROM candidate_avatars WHERE user_id=?", (u["id"],))
     ids = [r["id"] for r in allr("SELECT id FROM attempts WHERE user_id=?", (u["id"],))]
-    for i in ids: run("DELETE FROM events WHERE attempt_id=?", (i,))
+    for i in ids:
+        for table in ("events", "answer_evaluations", "attempt_questions", "assessment_answer_events"):
+            run(f"DELETE FROM {table} WHERE attempt_id=?", (i,))
     import cv_store
     cv_store.delete_user_documents(u["id"])   # removes the stored CV files and extraction drafts too
     for t in (
@@ -2653,6 +2674,169 @@ def save(att_id, st, **kw):
     run(f"UPDATE attempts SET {', '.join(sets)} WHERE id=?", (*args, att_id))
 
 
+# ------------------------------------------------------------------ answer evaluations
+def _json_field(value, default):
+    try:
+        return json.loads(value) if value else default
+    except (TypeError, ValueError):
+        return default
+
+
+def evaluation_view(row):
+    """Serialize an answer_evaluations row for the admin console."""
+    if not row:
+        return None
+    data = dict(row)
+    data["components"] = _json_field(data.get("components"), {})
+    data["keywords"] = _json_field(data.get("keywords"), {})
+    data["flags"] = _json_field(data.get("flags"), [])
+    data["requires_admin_approval"] = data.get("status") == "pending_approval"
+    return data
+
+
+def attempt_evaluations(attempt_id):
+    rows = allr("SELECT * FROM answer_evaluations WHERE attempt_id=? ORDER BY question_id", (attempt_id,))
+    return [evaluation_view(r) for r in rows]
+
+
+def upsert_answer_evaluation(attempt_id, question_id, evaluation, *, status="pending_approval",
+                             final_marks=None, admin_note=None, additional_info=None,
+                             reviewer_id=None):
+    """Persist one AI-assisted evaluation draft.
+
+    A draft can be refreshed repeatedly, but an evaluation an administrator has
+    already approved/edited is never silently overwritten by a new AI run.
+    """
+    existing = one("SELECT * FROM answer_evaluations WHERE attempt_id=? AND question_id=?",
+                   (attempt_id, question_id))
+    if existing and existing["status"] != "pending_approval" and status == "pending_approval":
+        return evaluation_view(existing)
+    now = time.time()
+    max_marks = float(evaluation.get("max_marks", 1) or 1)
+    ai_marks = float(evaluation.get("ai_marks", 0) or 0)
+    ai_marks = max(0.0, min(max_marks, ai_marks))
+    if final_marks is not None:
+        final_marks = max(0.0, min(max_marks, float(final_marks)))
+    if status == "pending_approval":
+        # A re-run replaces the draft but keeps any administrator annotation.
+        final_marks = existing["final_marks"] if existing else None
+        admin_note = admin_note if admin_note is not None else (existing["admin_note"] if existing else "")
+        additional_info = (additional_info if additional_info is not None
+                           else (existing["additional_info"] if existing else ""))
+        reviewer_id = existing["reviewed_by"] if existing else None
+    llm = evaluation.get("llm") or {
+        "provider": evaluation.get("llm_provider", ""),
+        "model": evaluation.get("llm_model", ""),
+    }
+    run("""INSERT INTO answer_evaluations(
+              attempt_id,question_id,status,max_marks,ai_marks,final_marks,method,
+              components,keywords,rationale,confidence,llm_provider,llm_model,flags,
+              admin_note,additional_info,evaluated_at,reviewed_by,reviewed_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(attempt_id,question_id) DO UPDATE SET
+              status=excluded.status,max_marks=excluded.max_marks,ai_marks=excluded.ai_marks,
+              final_marks=excluded.final_marks,method=excluded.method,
+              components=excluded.components,keywords=excluded.keywords,
+              rationale=excluded.rationale,confidence=excluded.confidence,
+              llm_provider=excluded.llm_provider,llm_model=excluded.llm_model,
+              flags=excluded.flags,admin_note=excluded.admin_note,
+              additional_info=excluded.additional_info,evaluated_at=excluded.evaluated_at,
+              reviewed_by=excluded.reviewed_by,reviewed_at=excluded.reviewed_at""",
+        (attempt_id, question_id, status, max_marks, ai_marks, final_marks,
+         evaluation.get("method", ""), json.dumps(evaluation.get("components", {})),
+         json.dumps(evaluation.get("keywords", {})), evaluation.get("rationale", ""),
+         evaluation.get("confidence"), llm.get("provider", ""), llm.get("model", ""),
+         json.dumps(evaluation.get("flags", [])), admin_note or "", additional_info or "",
+         now, reviewer_id, now if status != "pending_approval" else None))
+    return evaluation_view(one("SELECT * FROM answer_evaluations WHERE attempt_id=? AND question_id=?",
+                               (attempt_id, question_id)))
+
+
+def _question_is_objective(question_result):
+    qtype = str(question_result.get("question_type", "")).lower()
+    if qtype in ("mcq", "multiple choice"):
+        return True
+    return "sql" in qtype and bool(question_result.get("correct_answer"))
+
+
+def recompute_attempt_scores(result, evaluations):
+    """Recompute scores using only objective answers and human-approved marks.
+
+    Pending AI drafts are attached for the admin console but excluded from the
+    score denominators, so a draft can never change a candidate's result.
+    """
+    if not isinstance(result, dict):
+        return result
+    eval_map = {e.get("question_id"): e for e in (evaluations or [])}
+    rows, pending = [], 0
+    for question_result in result.get("question_results", []) or []:
+        qid = question_result.get("question_id")
+        marks = float(question_result.get("max_marks") or 1)
+        section = question_result.get("section") or (
+            "fundamental" if question_result.get("topic_key") == "sql" else "cv")
+        objective = question_result.get("objective")
+        if objective is None:
+            objective = _question_is_objective(question_result)
+        if objective:
+            awarded = question_result.get("awarded_marks")
+            if awarded is None:
+                status = str(question_result.get("review_status", "")).lower()
+                awarded = marks if status == "correct" else 0.0 if status == "incorrect" else None
+        else:
+            evaluation = eval_map.get(qid) or {}
+            if evaluation.get("status") == "approved" and evaluation.get("final_marks") is not None:
+                awarded = float(evaluation["final_marks"])
+            else:
+                awarded = None
+                pending += 1
+        rows.append({
+            "topic_key": question_result.get("topic_key"),
+            "topic": question_result.get("topic"),
+            "section": section,
+            "marks": marks,
+            "awarded_marks": awarded,
+        })
+    existing_summary = result.get("evaluation_summary") if isinstance(result.get("evaluation_summary"), dict) else {}
+    scored = E.compute_result_scores(rows)
+    result.update(scored)
+    result["manual_review_required"] = pending > 0
+    result["evaluation_summary"] = {
+        "subjective_questions": len(eval_map),
+        "pending_admin_approval": pending,
+        "approved_evaluations": sum(1 for e in (evaluations or []) if e.get("status") == "approved"),
+        "proposed_marks": round(sum(float(e.get("ai_marks") or 0) for e in (evaluations or [])), 2),
+        "max_subjective_marks": round(sum(float(e.get("max_marks") or 0) for e in (evaluations or [])), 2),
+        "awarded_marks": round(sum(float(e.get("final_marks") or 0) for e in (evaluations or [])
+                                   if e.get("status") == "approved"), 2),
+        "llm_configured": existing_summary.get("llm_configured"),
+        "note": ("AI-assisted partial-mark drafts are advisory. Only administrator-approved "
+                 "marks are counted in the candidate score."),
+    }
+    return result
+
+
+def candidate_result(result):
+    """Strip grading-key detail that must not be shown to candidates."""
+    if not isinstance(result, dict):
+        return result
+    clean = json.loads(json.dumps(result))
+    for item in clean.get("question_results", []) or []:
+        if _question_is_objective(item):
+            continue
+        item.pop("ai_marks", None)
+        item.pop("ai_confidence", None)
+        item.pop("ai_method", None)
+        item.pop("evaluation", None)
+    summary = clean.get("evaluation_summary")
+    if isinstance(summary, dict):
+        clean["evaluation_summary"] = {
+            key: summary.get(key) for key in
+            ("subjective_questions", "pending_admin_approval", "approved_evaluations", "note")
+            if key in summary
+        }
+    return clean
+
+
 def finalize(att, st):
     event_rows = allr("SELECT type, ts FROM events WHERE attempt_id=? ORDER BY ts, id", (att["id"],))
     ev = [{"type": r["type"], "server_ts": r["ts"]} for r in event_rows]
@@ -2665,10 +2849,13 @@ def finalize(att, st):
             times = st.setdefault("question_time_seconds", {})
             times[current_id] = round(float(times.get(current_id, 0)) + elapsed, 1)
         answers = st.get("answers", {})
-        topics = {}
         review_rows, trust_answers = [], []
-        fundamental_earned = fundamental_possible = 0
-        cv_earned = cv_possible = 0
+        evaluations = []
+        try:
+            import ai_providers as AIP
+            llm_ready = AIP.any_provider_configured()
+        except Exception:
+            llm_ready = False
         for q in st["selected_questions"]:
             raw_answer = answers.get(q["id"], "")
             qtype = str(q.get("question_type", "")).lower()
@@ -2689,56 +2876,44 @@ def finalize(att, st):
             # SQL is a core fundamental skill even though its questions live in the
             # CV-technology bank. It is counted in the 60% fundamental section.
             in_fundamental = q.get("assessment_section") == "fundamental" or topic == "sql"
-            metric = topics.setdefault(topic, {"earned": 0, "possible": 0, "n": 0,
-                                               "label": topic_label,
-                                               "section": "fundamental" if in_fundamental else "cv"})
-            if objective:
-                marks = int(q.get("marks") or 1)
-                metric["possible"] += marks
-                metric["n"] += 1
-                if correct:
-                    metric["earned"] += marks
-                if in_fundamental:
-                    fundamental_possible += marks
-                    fundamental_earned += marks if correct else 0
-                else:
-                    cv_possible += marks
-                    cv_earned += marks if correct else 0
-            review_rows.append({"question_id": q["id"], "topic": topic_label, "topic_key": topic, "question": q["question_text"],
+            marks = float(q.get("marks") or 1)
+            row = {"question_id": q["id"], "topic": topic_label, "topic_key": topic,
+                "section": "fundamental" if in_fundamental else "cv",
                 "question_type": q.get("question_type"), "answer": raw_answer,
+                "objective": objective, "max_marks": marks,
                 "correct_answer": (q.get("correct_answer") if is_mcq else q.get("reference_answer")) if objective else None,
                 "explanation": q.get("explanation") if objective else None,
                 "review_status": ("correct" if correct else "incorrect") if objective else "pending_human_review",
-                "time_seconds": st.get("question_time_seconds", {}).get(q["id"], 0)})
+                "awarded_marks": (marks if correct else 0.0) if objective else None,
+                "time_seconds": st.get("question_time_seconds", {}).get(q["id"], 0)}
+            if not objective:
+                # Deterministic draft now; the optional LLM opinion is added later
+                # from the admin console. Either way the draft waits for a human.
+                draft = E.evaluate_descriptive_answer(
+                    raw_answer,
+                    reference=str(q.get("correct_answer") or ""),
+                    rubric=" ".join(part for part in (q.get("grading_rubric"), q.get("reference_answer")) if part),
+                    question=str(q.get("question_text") or ""),
+                    max_marks=marks,
+                    llm=None,
+                )
+                draft["llm_configured"] = llm_ready
+                evaluations.append(upsert_answer_evaluation(att["id"], q["id"], draft))
+                row["evaluation_status"] = "pending_admin_approval"
+                row["ai_marks"] = draft["ai_marks"]
+                row["ai_confidence"] = draft["confidence"]
+                row["ai_method"] = draft["method"]
+            else:
+                row["evaluation_status"] = row["review_status"]
+            review_rows.append(row)
             trust_answers.append({"qid": q["id"], "type": "mcq" if is_mcq else ("sql" if is_sql_auto else "subjective"), "correct": bool(correct),
                 "difficulty": {"Easy": 1, "Medium": 2, "Hard": 3}.get(q.get("difficulty_level"), 2),
                 "seconds": st.get("question_time_seconds", {}).get(q["id"], 0)})
-        topic_scores = {}
-        for topic, metric in topics.items():
-            pct = round(100 * metric["earned"] / metric["possible"]) if metric["possible"] else None
-            topic_scores[topic] = {"score": pct, "level": E.level_of(pct or 0), "n": metric["n"],
-                                   "label": metric.get("label", topic),
-                                   "section": metric.get("section", "cv")}
-        fundamental_pct = round(100 * fundamental_earned / fundamental_possible) if fundamental_possible else None
-        cv_pct = round(100 * cv_earned / cv_possible) if cv_possible else None
-        # Product rule: 60% of the overall score comes from the fundamental
-        # section (including SQL) and 40% from the merged CV/development section.
-        if fundamental_pct is not None and cv_pct is not None:
-            overall = round(0.6 * fundamental_pct + 0.4 * cv_pct)
-        else:
-            overall = fundamental_pct if fundamental_pct is not None else cv_pct
         integrity = E.trust_label(ev, trust_answers, exam_seconds=exam_seconds)
         manual = any(x["review_status"] == "pending_human_review" for x in review_rows)
-        res = {"overall": overall, "level": E.level_of(overall or 0), "topics": topic_scores,
-            "section_scores": {
-                "fundamental": {"score": fundamental_pct, "weight": 0.6,
-                                "earned": fundamental_earned, "possible": fundamental_possible,
-                                "label": "Fundamentals (DSA, SQL, Networking, OOP, Database, Coding, Critical Thinking)"},
-                "cv": {"score": cv_pct, "weight": 0.4,
-                        "earned": cv_earned, "possible": cv_possible,
-                        "label": "CV & development skills (AI/ML, Git, Docker and other confirmed CV skills)"},
-            },
+        res = {
             "scoring_version": "r1-60-40",
+            "evaluation_version": "hybrid-v1",
             "trust": integrity["label"], "trust_points": integrity["points"],
             "trust_rule_version": integrity["rule_version"], "trust_reasons": integrity["reasons"],
             "trust_hard_flags": integrity["hard_flags"], "percentile": None,
@@ -2746,7 +2921,20 @@ def finalize(att, st):
             "review_status": "pending_human_review" if manual else "auto_graded",
             "manual_review_required": manual, "question_results": review_rows,
             "blueprint_id": st["blueprint_id"], "total_questions": len(st["selected_questions"]),
-            "answered_questions": len(answers)}
+            "answered_questions": len(answers),
+            "evaluation_summary": {
+                "subjective_questions": len(evaluations),
+                "pending_admin_approval": len(evaluations),
+                "approved_evaluations": 0,
+                "proposed_marks": round(sum(float(e["ai_marks"] or 0) for e in evaluations), 2),
+                "max_subjective_marks": round(sum(float(e["max_marks"] or 0) for e in evaluations), 2),
+                "awarded_marks": 0,
+                "llm_configured": llm_ready,
+                "note": ("AI-assisted partial-mark drafts are advisory. Only administrator-approved "
+                         "marks are counted in the candidate score."),
+            },
+        }
+        recompute_attempt_scores(res, evaluations)
     else:
         res = E.score(st["answers"])
         integrity = E.trust_label(ev, st["answers"], exam_seconds=exam_seconds)
@@ -2992,7 +3180,7 @@ def event(aid: str, b: Ev, u=Depends(current_user)):
 def result(aid: str, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     if att["status"] != "done": raise HTTPException(409, "Attempt not finished")
-    r = json.loads(att["result"]); r["appeal"] = att["appeal"]; r["attempt_id"] = aid
+    r = candidate_result(json.loads(att["result"])); r["appeal"] = att["appeal"]; r["attempt_id"] = aid
     return r
 
 

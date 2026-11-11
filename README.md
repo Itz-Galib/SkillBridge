@@ -105,7 +105,7 @@ The experimental GraphRAG blueprint path is built around the existing, curator-g
 - **Question formats:** the approved bank must cover scenario-based, explanation, SQL and coding questions in the fundamental section. Each assessable CV skill should have practical (coding/SQL) and scenario/explanation coverage.
 - **Duration:** the server calculates the assessment duration by summing each selected question's configured `time_allocation`; it is not a fixed exam duration.
 - **Candidate experience:** five questions are shown per page in a table, with previous/next page navigation, per-question answer saving, a server-side timer and post-submit answer review. Correct answers are not exposed during the exam. Topic scores are stored under canonical skill ids so the learning path, uplift and Skill Passport stay aligned with the skill journey.
-- **Auditability:** each generated blueprint stores the selected question IDs, CV skill evidence, covered and pending skills, retrieval trace, provider status, quota gaps and retrieval latency. Attempt answers and submission results are stored in the existing attempt record. MCQs and SQL questions with a canonical reference query are automatically graded; SQL questions without a reference query, coding, scenario and explanation responses are flagged for human review.
+- **Auditability:** each generated blueprint stores the selected question IDs, CV skill evidence, covered and pending skills, retrieval trace, provider status, quota gaps and retrieval latency. Attempt answers and submission results are stored in the existing attempt record. MCQs and SQL questions with a canonical reference query are automatically graded. Coding, scenario, descriptive and analytical responses get an **advisory hybrid draft** (expected-keyword coverage + reference-answer similarity + an optional PII-redacted LLM opinion) with partial marks. The draft is always stored as `pending_approval`; an administrator must approve or edit it before it affects the score, and every edit is audited.
 
 ### Retrieval architecture
 
@@ -173,7 +173,10 @@ After configuring both services, sign in as an admin, open **Question Governance
 - `POST /api/attempts` with `{"blueprint_id":"..." }` — start/resume the official attempt and consume existing retake credits under the existing policy.
 - `POST /api/attempts/{attempt_id}/answer` — save a question answer without revealing correctness.
 - `POST /api/attempts/{attempt_id}/navigate` — navigate to a question index.
-- `POST /api/attempts/{attempt_id}/submit` — submit the assessment; requires every question to be answered unless the server timer expires.
+- `POST /api/attempts/{attempt_id}/submit` - submit the assessment; requires every question to be answered unless the server timer expires.
+- `POST /api/admin/attempts/{attempt_id}/evaluate` - run the advisory hybrid keyword + similarity + LLM evaluation for descriptive answers (admin only).
+- `PATCH /api/admin/attempts/{attempt_id}/evaluations/{question_id}` - edit the awarded partial marks, administrator note and additional audit information for one answer.
+- `POST /api/admin/attempts/{attempt_id}/review` - approve, request more information or invalidate the result; approving folds administrator-approved partial marks into the final score.
 - `GET /api/admin/assessment/graphrag/status` and `POST /api/admin/assessment/graphrag/reindex` — admin readiness and index maintenance.
 
 This implementation is an initial GraphRAG assessment slice. Meilisearch/Neo4j must be provisioned and configured separately, the approved question bank must meet every quota, and production end-to-end testing is still required before public use.

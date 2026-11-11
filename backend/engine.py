@@ -1,6 +1,7 @@
 """Pure-Python core logic: PII redaction, skill extraction (rules), sandboxed SQL, adaptive selection,
 server-side scoring, trust label, learning path, passport signing. No web framework imports -> unit-testable."""
-import re, random, sqlite3, json, hmac, hashlib
+import re, random, sqlite3, json, hmac, hashlib, difflib, math
+from collections import Counter
 from content import *
 
 # ---------- PII redaction (runs BEFORE any text reaches an LLM) ----------
@@ -9,7 +10,7 @@ URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.I)
 PHONE_RE = re.compile(r"(?<![\w])\+?\d[\d\s\-().]{8,}\d(?![\w])")
 ADDR_RE = re.compile(r"^.*\b(house|road|rd\.|block|sector|flat|village|post office)\b.*\d.*$", re.I | re.M)
 
-def redact(text, known_names=()):
+def redact(text, known_names=(), assume_first_line_name=True):
     counts = {"email": 0, "phone": 0, "url": 0, "address": 0, "name": 0}
     def sub(rx, tag, key, s):
         s, n = rx.subn(tag, s); counts[key] += n; return s
@@ -20,11 +21,12 @@ def redact(text, known_names=()):
     for part in {p for n in known_names for p in n.split() if len(p) >= 3}:
         text, n = re.subn(re.escape(part), "[NAME]", text, flags=re.I); counts["name"] += n
     lines = text.splitlines()
-    for i, ln in enumerate(lines):          # heuristic: a short first line without digits is usually the candidate's name
-        if ln.strip():
-            if len(ln.split()) <= 4 and not re.search(r"\d|\[", ln) and not any(a in ln.lower() for al in TAXONOMY.values() for a in al["aliases"]):
-                lines[i] = "[NAME]"; counts["name"] += 1
-            break
+    if assume_first_line_name:
+        for i, ln in enumerate(lines):      # heuristic: a short first line without digits is usually the candidate's name
+            if ln.strip():
+                if len(ln.split()) <= 4 and not re.search(r"\d|\[", ln) and not any(a in ln.lower() for al in TAXONOMY.values() for a in al["aliases"]):
+                    lines[i] = "[NAME]"; counts["name"] += 1
+                break
     return "\n".join(lines), counts
 
 # ---------- skill extraction (offline rule-based fallback) ----------
@@ -284,6 +286,382 @@ def trust_label(events, answers, rules=None, exam_seconds=1200, question_times=N
         "label": label, "points": points, "rule_version": rules.get("rule_version", "unknown"),
         "reasons": reasons, "hard_flags": sorted(hard_flags),
     }
+
+# ---------- descriptive / analytical answer evaluation (AI-assisted draft) ----------
+# The official score never comes from a live model. This section produces an
+# explainable, deterministic draft from the stored reference answer + rubric, and
+# optionally fuses a validated LLM opinion as one evidence signal. The draft is
+# always marked ``pending_approval``; an administrator must approve or edit it
+# before any mark is counted in the candidate result.
+DESCRIPTIVE_METHOD = "hybrid:keyword+similarity+llm"
+DESCRIPTIVE_FALLBACK_METHOD = "hybrid:keyword+similarity"
+
+_WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+#._]*")
+DESCRIPTIVE_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "because", "been", "but", "by",
+    "can", "could", "did", "do", "does", "for", "from", "had", "has", "have",
+    "how", "if", "in", "into", "is", "it", "its", "may", "might", "more", "most",
+    "must", "of", "on", "or", "our", "should", "so", "some", "such", "than",
+    "that", "the", "their", "them", "then", "there", "these", "they", "this",
+    "those", "to", "was", "we", "were", "what", "when", "where", "which", "while",
+    "who", "why", "will", "with", "would", "you", "your",
+}
+_GENERIC_RUBRIC_WORDS = {
+    "award", "marks", "mark", "score", "scoring", "mention", "mentions", "expected",
+    "expect", "explain", "explains", "explanation", "correct", "correctly", "answer",
+    "answers", "candidate", "should", "needs", "required", "require", "clear",
+    "clarity", "accurate", "accuracy", "identify", "identifies", "describe",
+    "describes", "define", "defines", "definition", "use", "used", "using", "good",
+    "well", "strong", "weak", "appropriate", "relevant", "basic", "simple",
+}
+_INJECTION_PATTERNS = (
+    re.compile(r"ignore\s+(all\s+|any\s+)?(previous|prior|above)\s+instructions", re.I),
+    re.compile(r"(give|award)\s+(me\s+)?(full|maximum|max|all)\s+marks", re.I),
+    re.compile(r"(you\s+are|act\s+as)\s+(now\s+)?(an?\s+)?(admin|grader|system)", re.I),
+    re.compile(r"(reveal|show|print)\s+(the\s+)?(system\s+prompt|answer\s+key|rubric)", re.I),
+)
+
+
+_STEM_SYNONYMS = {
+    "logarithm": "log", "logarithmic": "log", "logarithmically": "log",
+    "balanc": "balance", "complexities": "complexity", "queries": "query", "indices": "index",
+}
+
+
+def _stem(word):
+    """Small, deterministic stemmer so paraphrase matching is not exact-word only."""
+    w = (word or "").lower().strip("._-")
+    if not w:
+        return w
+    if len(w) <= 4:
+        return _STEM_SYNONYMS.get(w, w)
+    if w.endswith("ies") and len(w) > 5:
+        w = w[:-3] + "y"
+    elif w.endswith("s") and not w.endswith("ss"):
+        w = w[:-1]
+    if w.endswith("ing") and len(w) > 6:
+        w = w[:-3]
+    elif w.endswith("ed") and len(w) > 5:
+        w = w[:-2]
+    if w.endswith("e") and len(w) > 5:
+        w = w[:-1]
+    return _STEM_SYNONYMS.get(w, w)
+
+
+def _words(text):
+    return [m.group(0).lower().strip(".-") for m in _WORD_RE.finditer(text or "")
+            if m.group(0).strip(".-")]
+
+
+def _content_tokens(text):
+    return [_stem(w) for w in _words(text) if w not in DESCRIPTIVE_STOPWORDS and len(w) > 2]
+
+
+def _normalized_tokens(text):
+    return " ".join(_content_tokens(text))
+
+
+def _phrases(tokens, n):
+    return {" ".join(tokens[i:i + n]) for i in range(max(0, len(tokens) - n + 1))}
+
+
+def extract_expected_keywords(reference="", rubric="", limit=24):
+    """Extract weighted expected concepts from the stored model answer and rubric.
+
+    Unigrams are always retained; a small number of high-value two-word phrases
+    are added so concept phrases can match without dominating the set. Returns
+    display terms the administrator can audit rather than opaque model features.
+    """
+    reference = reference or ""
+    rubric = rubric or ""
+    ref_tokens = _content_tokens(reference)
+    rub_tokens = _content_tokens(rubric)
+    if not ref_tokens and not rub_tokens:
+        return []
+    terms = {}
+
+    def add(display, key, weight):
+        key = " ".join(key.split())
+        if not key or len(key) < 3:
+            return
+        if key in terms:
+            terms[key]["weight"] = max(terms[key]["weight"], float(weight))
+            return
+        terms[key] = {"term": display, "key": key, "weight": float(weight)}
+
+    counts = Counter(ref_tokens)
+    for token, count in counts.items():
+        if token not in _GENERIC_RUBRIC_WORDS:
+            add(token, token, 1.0 + min(count - 1, 3) * 0.15)
+    # A rubric keyword is a strong signal even when the model answer words it differently.
+    for token in dict.fromkeys(rub_tokens):
+        if token not in _GENERIC_RUBRIC_WORDS:
+            add(token, token, 1.35)
+    unigrams = sorted((x for x in terms.values() if " " not in x["key"]),
+                      key=lambda x: (-x["weight"], x["key"]))[:16]
+    phrases = []
+    for phrase in dict.fromkeys(_phrases(ref_tokens, 2)):
+        parts = phrase.split()
+        if any(part in _GENERIC_RUBRIC_WORDS for part in parts):
+            continue
+        phrases.append({"term": phrase, "key": phrase, "weight": 1.6})
+    phrases = phrases[:8]
+    combined = unigrams + phrases
+    combined.sort(key=lambda x: (-x["weight"], -len(x["key"]), x["key"]))
+    return combined[:max(1, int(limit))]
+
+
+def keyword_coverage(answer, keywords):
+    """Measure which expected concepts the candidate actually expressed."""
+    answer_tokens = _content_tokens(answer)
+    token_set = set(answer_tokens)
+    phrase_sets = {n: _phrases(answer_tokens, n) for n in (2, 3, 4)}
+    matched, missing, total, hit = [], [], 0.0, 0.0
+    for item in keywords or []:
+        weight = float(item.get("weight", 1.0))
+        total += weight
+        parts = item["key"].split()
+        found = (item["key"] in phrase_sets.get(len(parts), set())
+                 if len(parts) > 1 else item["key"] in token_set)
+        if found:
+            hit += weight
+            matched.append(item["term"])
+        else:
+            missing.append(item["term"])
+    return {
+        "score": round(hit / total, 4) if total else 0.0,
+        "matched": matched,
+        "missing": missing,
+        "expected": [x["term"] for x in (keywords or [])],
+        "total_weight": round(total, 3),
+        "matched_weight": round(hit, 3),
+    }
+
+
+def text_similarity(answer, reference):
+    """Blend token cosine and sequence similarity for paraphrase-tolerant matching."""
+    a, b = _content_tokens(answer), _content_tokens(reference)
+    if not a or not b:
+        return {"score": 0.0, "cosine": 0.0, "sequence": 0.0}
+    ca, cb = Counter(a), Counter(b)
+    dot = sum(ca[t] * cb.get(t, 0) for t in ca)
+    denom = math.sqrt(sum(v * v for v in ca.values())) * math.sqrt(sum(v * v for v in cb.values()))
+    cosine = dot / denom if denom else 0.0
+    sequence = difflib.SequenceMatcher(None, " ".join(a), " ".join(b)).ratio()
+    return {
+        "score": round(0.6 * cosine + 0.4 * sequence, 4),
+        "cosine": round(cosine, 4),
+        "sequence": round(sequence, 4),
+    }
+
+
+def _round_marks(value, max_marks):
+    max_marks = float(max_marks) if max_marks else 1.0
+    granularity = 0.25 if max_marks <= 2 else 0.5 if max_marks <= 10 else 1.0
+    value = max(0.0, min(max_marks, float(value or 0)))
+    rounded = round(value / granularity) * granularity
+    return round(max(0.0, min(max_marks, rounded)), 2)
+
+
+def _validate_llm_grading(llm, max_marks):
+    """Only accept a bounded, structured LLM opinion; ignore everything else."""
+    if not isinstance(llm, dict) or llm.get("error"):
+        return None
+    raw = llm.get("marks", llm.get("score"))
+    if raw is None:
+        return None
+    try:
+        marks = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if (float(raw) > float(max_marks) * 5 and float(raw) <= 100 and max_marks <= 10):
+        # A large value is almost certainly a 0-100 score; small overshoots are clamped.
+        marks = float(raw) * float(max_marks) / 100.0
+    marks = max(0.0, min(float(max_marks), marks))
+    confidence = llm.get("confidence", 0.5)
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    def _clean_list(value, limit=12):
+        if not isinstance(value, list):
+            return []
+        return [str(x).strip()[:160] for x in value if str(x).strip()][:limit]
+    return {
+        "marks": round(marks, 2),
+        "percentage": round(100 * marks / float(max_marks), 1) if max_marks else 0.0,
+        "rationale": str(llm.get("rationale", "")).strip()[:1200],
+        "matched_points": _clean_list(llm.get("matched_points")),
+        "missing_points": _clean_list(llm.get("missing_points")),
+        "confidence": round(confidence, 3),
+        "flags": _clean_list(llm.get("flags")),
+        "provider": str(llm.get("provider", ""))[:40],
+        "model": str(llm.get("model", ""))[:80],
+    }
+
+
+def evaluate_descriptive_answer(answer, *, reference="", rubric="", question="", max_marks=1, llm=None):
+    """Produce an explainable partial-mark draft for one descriptive response.
+
+    Weights when an LLM opinion is available: keyword 30%, similarity 20%, LLM 50%.
+    Without an LLM the evidence is renormalised to keyword 60% / similarity 40%.
+    The returned ``ai_marks`` is never authoritative: ``status`` is always
+    ``pending_approval`` and ``requires_admin_approval`` is always true.
+    """
+    answer = str(answer or "")
+    reference = str(reference or "")
+    rubric = str(rubric or "")
+    max_marks = float(max_marks or 1)
+    keywords = extract_expected_keywords(reference, rubric)
+    coverage = keyword_coverage(answer, keywords)
+    similarity = text_similarity(answer, reference)
+    llm_view = _validate_llm_grading(llm, max_marks)
+
+    flags = []
+    if not answer.strip():
+        flags.append("empty_answer")
+    elif len(answer.split()) < 5:
+        flags.append("short_answer")
+    if coverage["score"] < 0.25 and similarity["score"] < 0.2:
+        flags.append("low_relevance")
+    for pattern in _INJECTION_PATTERNS:
+        if pattern.search(answer):
+            flags.append("possible_prompt_injection")
+            break
+    if isinstance(llm, dict) and llm.get("error"):
+        flags.append("llm_unavailable")
+    if coverage["score"] < 0.2:
+        flags.append("low_keyword_coverage")
+
+    if llm_view:
+        pct = (0.30 * coverage["score"] + 0.20 * similarity["score"]
+               + 0.50 * (llm_view["marks"] / max_marks if max_marks else 0))
+        deterministic = 0.60 * coverage["score"] + 0.40 * similarity["score"]
+        if abs((llm_view["marks"] / max_marks if max_marks else 0) - deterministic) > 0.35:
+            flags.append("llm_disagrees_with_evidence")
+        method = DESCRIPTIVE_METHOD
+        weights = {"keyword": 0.30, "similarity": 0.20, "llm": 0.50}
+    else:
+        pct = 0.60 * coverage["score"] + 0.40 * similarity["score"]
+        method = DESCRIPTIVE_FALLBACK_METHOD
+        weights = {"keyword": 0.60, "similarity": 0.40, "llm": 0.0}
+
+    if not answer.strip():
+        pct = 0.0
+    percentage = round(100 * max(0.0, min(1.0, pct)), 1)
+    ai_marks = _round_marks(max_marks * percentage / 100.0, max_marks)
+
+    if answer.strip():
+        confidence = 0.30 + 0.25 * coverage["score"] + 0.20 * similarity["score"]
+        if llm_view:
+            confidence += 0.20 * llm_view["confidence"]
+        if "llm_disagrees_with_evidence" in flags:
+            confidence -= 0.15
+        confidence = round(max(0.05, min(0.97, confidence)), 3)
+    else:
+        confidence = 1.0
+
+    rationale_bits = []
+    if coverage["matched"]:
+        rationale_bits.append("Matched expected concepts: " + ", ".join(coverage["matched"][:6]) + ".")
+    if coverage["missing"]:
+        rationale_bits.append("Not evidenced: " + ", ".join(coverage["missing"][:6]) + ".")
+    rationale_bits.append(
+        f"Reference similarity {similarity['score'] * 100:.0f}% "
+        f"(cosine {similarity['cosine'] * 100:.0f}%, sequence {similarity['sequence'] * 100:.0f}%)."
+    )
+    if llm_view and llm_view["rationale"]:
+        rationale_bits.append("LLM reviewer: " + llm_view["rationale"])
+    if not answer.strip():
+        rationale_bits.append("No answer was submitted.")
+    rationale_bits.append(
+        f"Hybrid draft {ai_marks}/{max_marks:g} ({percentage:g}%). "
+        "An administrator must approve or edit this draft before it affects the score."
+    )
+
+    return {
+        "status": "pending_approval",
+        "method": method,
+        "max_marks": round(max_marks, 2),
+        "ai_marks": ai_marks,
+        "percentage": percentage,
+        "components": {
+            "keyword": {"score": round(coverage["score"], 4), "weight": weights["keyword"]},
+            "similarity": {"score": round(similarity["score"], 4), "weight": weights["similarity"],
+                           "cosine": similarity["cosine"], "sequence": similarity["sequence"]},
+            "llm": {"score": round(llm_view["marks"] / max_marks, 4) if llm_view and max_marks else 0.0,
+                    "weight": weights["llm"], "used": bool(llm_view),
+                    "confidence": llm_view["confidence"] if llm_view else None},
+        },
+        "keywords": coverage,
+        "llm": llm_view,
+        "rationale": " ".join(rationale_bits),
+        "confidence": confidence,
+        "flags": sorted(set(flags)),
+        "requires_admin_approval": True,
+    }
+
+
+def compute_result_scores(rows, fundamental_weight=0.6):
+    """Recompute topic/section/overall scores from human-approved awarded marks.
+
+    ``rows`` entries: ``topic_key``, ``topic`` (label), ``section``
+    (``fundamental``/``cv``), ``marks`` (maximum) and ``awarded_marks``.
+    A ``None`` awarded mark means "not approved yet" and is excluded from both the
+    earned and possible totals, so an AI draft can never move a score.
+    """
+    topics = {}
+    fundamental_earned = fundamental_possible = 0.0
+    cv_earned = cv_possible = 0.0
+    for row in rows or []:
+        awarded = row.get("awarded_marks")
+        if awarded is None:
+            continue
+        marks = float(row.get("marks") or 1)
+        awarded = max(0.0, min(marks, float(awarded)))
+        topic = row.get("topic_key") or "general"
+        metric = topics.setdefault(topic, {
+            "earned": 0.0, "possible": 0.0, "n": 0,
+            "label": row.get("topic") or topic,
+            "section": "fundamental" if row.get("section") == "fundamental" else "cv",
+        })
+        metric["earned"] += awarded
+        metric["possible"] += marks
+        metric["n"] += 1
+        if row.get("section") == "fundamental":
+            fundamental_earned += awarded
+            fundamental_possible += marks
+        else:
+            cv_earned += awarded
+            cv_possible += marks
+    topic_scores = {}
+    for topic, metric in topics.items():
+        pct = round(100 * metric["earned"] / metric["possible"]) if metric["possible"] else None
+        topic_scores[topic] = {
+            "score": pct, "level": level_of(pct or 0), "n": metric["n"],
+            "label": metric.get("label", topic), "section": metric.get("section", "cv"),
+        }
+    fundamental_pct = round(100 * fundamental_earned / fundamental_possible) if fundamental_possible else None
+    cv_pct = round(100 * cv_earned / cv_possible) if cv_possible else None
+    if fundamental_pct is not None and cv_pct is not None:
+        overall = round(fundamental_weight * fundamental_pct + (1 - fundamental_weight) * cv_pct)
+    else:
+        overall = fundamental_pct if fundamental_pct is not None else cv_pct
+    return {
+        "overall": overall,
+        "level": level_of(overall or 0),
+        "topics": topic_scores,
+        "section_scores": {
+            "fundamental": {"score": fundamental_pct, "weight": fundamental_weight,
+                            "earned": round(fundamental_earned, 2),
+                            "possible": round(fundamental_possible, 2),
+                            "label": "Fundamentals (DSA, SQL, Networking, OOP, Database, Coding, Critical Thinking)"},
+            "cv": {"score": cv_pct, "weight": round(1 - fundamental_weight, 2),
+                   "earned": round(cv_earned, 2), "possible": round(cv_possible, 2),
+                   "label": "CV & development skills (AI/ML, Git, Docker and other confirmed CV skills)"},
+        },
+    }
+
 
 # ---------- gap map + learning path ----------
 def gap_map(topic_scores):

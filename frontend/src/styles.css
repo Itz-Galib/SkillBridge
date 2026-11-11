@@ -627,7 +627,7 @@ summary { cursor: pointer; font-weight: 600; margin: .4rem 0; }
 .ad-staging-head{align-items:flex-start;flex-wrap:wrap}
 .ad-staging-actions{display:flex;justify-content:flex-end;flex-wrap:wrap}
 .ad-staging-ready{display:block;margin-top:5px;color:#26754b;font-size:.52rem;font-weight:700}
-.ad-staging-row:has(.ad-staging-check input:disabled){background:#fffdf9}
+.ad-staging-row.locked{background:#fffdf9}
 .ad-staging-row .ad-staging-check input:disabled+span{opacity:.35}
 .ad-staging-main{overflow-wrap:anywhere}
 @media(max-width:700px){
@@ -1003,3 +1003,124 @@ button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: no
 
 /* 60/40 verified scorecard */
 .score-split{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px;margin:14px 0}.score-split article{display:grid;gap:5px;padding:15px;border:1px solid #e2ebe4;border-radius:13px;background:#fff}.score-split small{color:#7f9085;font-size:.55rem;font-weight:800;letter-spacing:.04em}.score-split strong{color:#1f5b43;font-size:1.45rem;letter-spacing:-.04em}.score-split span{color:#94a198;font-size:.53rem;line-height:1.5}@media(max-width:600px){.score-split{grid-template-columns:1fr}}
+
+/* Hybrid descriptive-answer evaluation (admin review) */
+.ad-eval-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:12px 0;padding:10px 12px;border:1px solid #dfe9e5;border-radius:10px;background:#f7faf8;font-size:.62rem;color:#5f7268}
+.ad-eval-card{margin-top:14px;padding:14px;border:1px solid #dfe7ea;border-radius:12px;background:#fbfcfd}
+.ad-eval-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.ad-eval-status{padding:4px 9px;border-radius:20px;font-size:.5rem;font-weight:800;letter-spacing:.03em;text-transform:uppercase}
+.ad-eval-status.pending{background:#fff4df;color:#9a6a22;border:1px solid #f0dfbe}
+.ad-eval-status.approved{background:#e8f6ee;color:#267251;border:1px solid #cfe6d8}
+.ad-eval-score{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.ad-eval-score strong{font-size:1.5rem;color:#1f5b43;letter-spacing:-.04em}
+.ad-eval-score strong small{font-size:.7rem;color:#7f9085}
+.ad-eval-score span{font-size:.56rem;color:#6f8176;line-height:1.5}
+.ad-eval-bars{display:grid;gap:7px;margin:10px 0}
+.ad-eval-bars>div{display:grid;grid-template-columns:130px 1fr 38px;align-items:center;gap:8px;font-size:.55rem;color:#60746a}
+.ad-eval-bars>div>div{height:7px;border-radius:20px;background:#e7eeea;overflow:hidden}
+.ad-eval-bars i{display:block;height:100%;border-radius:20px;background:linear-gradient(90deg,#3f8f68,#84c6a3)}
+.ad-eval-bars b{text-align:right;font-size:.55rem;color:#3f6653}
+.ad-eval-keywords{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0}
+.ad-eval-keywords span{padding:3px 7px;border-radius:20px;font-size:.5rem;font-weight:700}
+.ad-eval-keywords .hit{background:#eaf7ef;color:#267251;border:1px solid #cfe6d8}
+.ad-eval-keywords .miss{background:#fff7ef;color:#96652a;border:1px solid #f0e0c8}
+.ad-eval-rationale{font-size:.6rem;line-height:1.7;color:#526a5e;margin:8px 0}
+.ad-eval-flags{font-size:.55rem;color:#9a6a22}
+.ad-eval-edit{display:grid;gap:8px;margin-top:12px;padding-top:12px;border-top:1px dashed #dbe5e0}
+.ad-eval-edit label{display:grid;gap:4px;font-size:.55rem;color:#61746a}
+.ad-eval-edit input,.ad-eval-edit textarea{border:1px solid #d9e3de;border-radius:8px;padding:8px 9px;font:inherit;font-size:.62rem;background:#fff;color:#33473c;resize:vertical}
+.ad-eval-edit button{justify-self:start;margin-top:2px}
+@media(max-width:640px){.ad-eval-toolbar{flex-direction:column;align-items:flex-start}.ad-eval-bars>div{grid-template-columns:105px 1fr 34px}}
+
+/* ---------------------------------------------------------------------------
+   Unified application shell — candidate / company / admin
+   The three workspaces share the same sidebar width, topbar height, content
+   width, mobile navigation pattern and viewport units. This block is last so it
+   also resolves older per-panel media-query conflicts.
+--------------------------------------------------------------------------- */
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+.candidate-shell,.cr-app,.ad-app{min-height:100vh;min-height:100dvh}
+.candidate-sidebar,.cr-sidebar,.ad-sidebar{
+  height:100vh;height:100dvh;min-height:100vh;min-height:100dvh;
+  overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;
+}
+.candidate-sidebar{position:sticky;top:0;align-self:start}
+.candidate-main,.cr-main,.ad-main{min-width:0}
+.candidate-topbar,.cr-topbar,.ad-topbar{
+  height:66px;min-height:66px;
+  padding-left:clamp(20px,3vw,42px);padding-right:clamp(20px,3vw,42px);
+  background:#ffffffed;
+  -webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);
+}
+.ad-signout{border:1px solid #dce8e1;background:#fff;color:#52627a}
+.ad-signout:hover{background:#fff4f2;border-color:#e5b8b3;color:#a33b37}
+.ad-sidebar-signout{border-color:rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#fff}
+.candidate-page,.cr-content,.ad-content{
+  max-width:1500px;
+  padding-left:clamp(20px,3vw,42px);padding-right:clamp(20px,3vw,42px);
+}
+.candidate-page{padding-top:30px;padding-bottom:46px}
+.ad-page-heading h1{max-width:none}
+.candidate-mobile-nav{display:none}
+.sidebar-group button:focus-visible,.cr-nav button:focus-visible,.ad-nav button:focus-visible{
+  outline:2px solid #f0c66e;outline-offset:2px;
+}
+.cr-table-wrap,.ad-table-wrap,.cr-pipeline,.candidate-mobile-nav,.cr-nav,.ad-nav{
+  -webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;scrollbar-width:thin;
+}
+@media(max-width:1200px){
+  .candidate-shell{grid-template-columns:232px minmax(0,1fr)}
+  .cr-app{grid-template-columns:232px minmax(0,1fr)}
+  .ad-sidebar{width:232px;flex-basis:232px}
+}
+@media(max-width:760px){
+  .candidate-shell,.cr-app{display:block}
+  .candidate-sidebar{display:none}
+  .candidate-mobile-nav{
+    display:flex;gap:5px;overflow-x:auto;padding:8px 14px;background:#fff;
+    border-bottom:1px solid var(--sb-border);position:sticky;top:58px;z-index:4;
+  }
+  .candidate-mobile-nav button{
+    display:inline-flex;align-items:center;gap:7px;flex:0 0 auto;
+    padding:8px 10px;border:1px solid transparent;border-radius:9px;
+    background:transparent;color:#65738a;
+    font:700 .7rem Inter,"Segoe UI",system-ui,sans-serif;
+    white-space:nowrap;cursor:pointer;
+  }
+  .candidate-mobile-nav button>span{font-size:.92rem}
+  .candidate-mobile-nav button.active{background:#edf1ff;border-color:#dbe3ff;color:#315ce8}
+  .candidate-topbar,.cr-topbar,.ad-topbar{height:58px;min-height:58px;padding-left:15px;padding-right:15px}
+  .candidate-page,.cr-content,.ad-content{padding-left:14px;padding-right:14px}
+  .candidate-page{padding-top:20px;padding-bottom:30px}
+  .cr-content,.ad-content{padding-top:22px;padding-bottom:28px}
+  .cr-sidebar{
+    position:relative;width:100%;height:auto;min-height:0;overflow:visible;
+    padding:12px 14px 8px;
+  }
+  .ad-app{display:flex;flex-direction:column}
+  .ad-sidebar{
+    position:relative;top:auto;width:100%;height:auto;min-height:0;flex:0 0 auto;
+    padding:10px 14px 9px;overflow:visible;
+  }
+  .ad-brand{padding:0 4px 9px}
+  .ad-brand>span:last-child{font-size:1rem}
+  .ad-brand small{font-size:.52rem}
+  .ad-nav{display:flex;gap:5px;overflow-x:auto;padding:2px 0 4px}
+  .ad-nav button,.ad-nav button.active,.ad-nav button:not(.active){
+    width:auto;min-height:36px;padding:8px 11px;font-size:.72rem;
+    white-space:nowrap;justify-content:flex-start;
+  }
+  .ad-nav button>span{width:auto;font-size:.9rem}
+  .ad-nav button>b{position:static;margin-left:3px;min-width:18px;height:18px;font-size:.58rem}
+  .ad-topbar{position:sticky;top:0;z-index:30}
+}
+@media(max-width:430px){
+  .candidate-mobile-nav{padding-left:10px;padding-right:10px}
+  .ad-topbar>div:first-child{font-size:.68rem}
+}
+
+/* Cross-browser form + long-content guards */
+button,input,select,textarea{font-family:inherit}
+select{max-width:100%}
+.cr-table td,.ad-table td,.cr-applicant-table td{overflow-wrap:anywhere}
+.cr-panel,.ad-panel{overflow-wrap:anywhere}
