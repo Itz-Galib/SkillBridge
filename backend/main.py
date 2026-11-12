@@ -3,16 +3,17 @@
 Scores come from stored answer keys + deterministic server logic. For descriptive
 answers an AI-assisted hybrid draft is advisory only: every mark stays pending
 until a human administrator approves or edits it."""
-import os, io, re, json, time, uuid, base64, hmac, hashlib, secrets, sqlite3, zipfile, logging, asyncio
+import os, io, re, json, time, uuid, base64, hmac, hashlib, secrets, sqlite3, zipfile, logging, asyncio, threading
 from datetime import date
 from pathlib import Path
 from typing import Optional, List
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form, Request
+from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 import engine as E
@@ -82,8 +83,9 @@ CREATE TABLE IF NOT EXISTS skill_question_edges(skill_id TEXT NOT NULL, question
 
 class PgCompatConnection:
     """Small DB-API adapter so the prototype can keep parameterized SQL on PostgreSQL."""
-    def __init__(self, connection):
+    def __init__(self, connection, pool=None):
         self.connection = connection
+        self._pool = pool
     def execute(self, sql, args=()):
         return self.connection.execute(sql.replace("?", "%s"), args)
     def executescript(self, script):
@@ -93,22 +95,64 @@ class PgCompatConnection:
     def commit(self):
         self.connection.commit()
     def close(self):
+        if self._pool is not None:
+            pool, connection = self._pool, self.connection
+            self._pool = None
+            try:
+                pool.putconn(connection)
+            except Exception:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+            return
         self.connection.close()
     def __enter__(self):
         return self
     def __exit__(self, exc_type, exc, tb):
-        if exc_type:
-            self.connection.rollback()
-        else:
-            self.connection.commit()
-        self.connection.close()
+        try:
+            if exc_type:
+                self.connection.rollback()
+            else:
+                self.connection.commit()
+        finally:
+            self.close()
+
+
+_pg_pool = None
+_pg_pool_lock = threading.Lock()
+
+
+def _connection_pool():
+    """Reuse PostgreSQL connections; a fresh TLS connection per query is very slow."""
+    global _pg_pool
+    if _pg_pool is None:
+        with _pg_pool_lock:
+            if _pg_pool is None:
+                from psycopg_pool import ConnectionPool
+                from psycopg.rows import dict_row
+                _pg_pool = ConnectionPool(
+                    DATABASE_URL,
+                    min_size=1,
+                    max_size=10,
+                    max_idle=240,
+                    timeout=15,
+                    open=False,
+                    kwargs={"row_factory": dict_row, "prepare_threshold": 5, "autocommit": True},
+                )
+                _pg_pool.open(wait=False)
+    return _pg_pool
 
 
 def db():
     if DATABASE_URL:
-        import psycopg
-        from psycopg.rows import dict_row
-        return PgCompatConnection(psycopg.connect(DATABASE_URL, row_factory=dict_row))
+        try:
+            pool = _connection_pool()
+            return PgCompatConnection(pool.getconn(timeout=15), pool)
+        except Exception:
+            import psycopg
+            from psycopg.rows import dict_row
+            return PgCompatConnection(psycopg.connect(DATABASE_URL, row_factory=dict_row))
     c = sqlite3.connect(DB_PATH, timeout=10)
     c.row_factory = sqlite3.Row
     return c
@@ -123,14 +167,21 @@ def init_db():
             schema = schema.replace("events(id INTEGER PRIMARY KEY", "events(id BIGSERIAL PRIMARY KEY")
             schema = schema.replace("audit(id INTEGER PRIMARY KEY", "audit(id BIGSERIAL PRIMARY KEY")
         c.executescript(schema)
-        c.execute("CREATE TABLE IF NOT EXISTS exam_evidence(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, event_id INTEGER, captured_at REAL NOT NULL, mime_type TEXT NOT NULL, image_data BYTEA NOT NULL, size_bytes INTEGER NOT NULL, expires_at REAL NOT NULL)")
+        # Hot-path indexes (idempotent on SQLite and PostgreSQL).
+        for index_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_events_attempt_ts ON events(attempt_id, ts)",
+            "CREATE INDEX IF NOT EXISTS idx_attempts_user_status ON attempts(user_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_attempts_status_finished ON attempts(status, finished)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts)",
+        ):
+            c.execute(index_sql)
+        c.execute("CREATE TABLE IF NOT EXISTS exam_evidence(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, event_id INTEGER, captured_at REAL NOT NULL, mime_type TEXT NOT NULL, image_data BYTEA NOT NULL, size_bytes INTEGER NOT NULL, expires_at REAL NOT NULL, vision_json TEXT, vision_model TEXT, vision_at DOUBLE PRECISION)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_exam_evidence_attempt ON exam_evidence(attempt_id, captured_at)")
         # Additive migration for existing databases.
         if DATABASE_URL:
             event_columns = {row["column_name"] for row in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='events'").fetchall()}
         else:
             event_columns = {row["name"] for row in c.execute("PRAGMA table_info(events)").fetchall()}
-        if "question_id" not in event_columns:
-            c.execute("ALTER TABLE events ADD COLUMN question_id TEXT")
         for column, definition in {
             "question_id": "TEXT", "question_index": "INTEGER", "seq": "INTEGER",
             "client_ts": "REAL", "metadata": "TEXT"
@@ -147,6 +198,16 @@ def init_db():
         }.items():
             if column not in attempt_columns:
                 c.execute(f"ALTER TABLE attempts ADD COLUMN {column} {definition}")
+        if DATABASE_URL:
+            evidence_columns = {row["column_name"] for row in c.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='exam_evidence'").fetchall()}
+        else:
+            evidence_columns = {row["name"] for row in c.execute("PRAGMA table_info(exam_evidence)").fetchall()}
+        for column, definition in {
+            "vision_json": "TEXT", "vision_model": "TEXT", "vision_at": "DOUBLE PRECISION"
+        }.items():
+            if column not in evidence_columns:
+                c.execute(f"ALTER TABLE exam_evidence ADD COLUMN {column} {definition}")
 
         # PostgreSQL REAL cannot preserve sub-minute Unix timestamp precision at
         # current epoch magnitudes. Promote existing proctoring timestamp columns
@@ -308,6 +369,7 @@ def need_consent(u):
 
 # ------------------------------------------------------------------ app
 app = FastAPI(title="SkillBridge Global R0 API", version="0.1.0")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:8080").split(","),
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -328,6 +390,13 @@ _evidence_cleanup_task = None
 async def _startup():
     global _evidence_cleanup_task
     init_db()
+    if DATABASE_URL:
+        # Warm the pool so the first page load does not pay TLS setup costs.
+        try:
+            pool = _connection_pool()
+            pool.wait(timeout=10)
+        except Exception:
+            log.warning("Database connection pool warm-up failed", exc_info=True)
     _evidence_cleanup_task = asyncio.create_task(_purge_expired_exam_evidence())
 
 
@@ -584,15 +653,19 @@ def state(u=Depends(current_user)):
             "appeal_decision": a["appeal_decision"], "appeal_reason": a["appeal_reason"],
             "appeal_decided_at": a["appeal_decided_at"],
         })
+    approved_attempt_ids = {
+        row["attempt_id"] for row in allr(
+            """SELECT r.attempt_id FROM attempts a
+               JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+               WHERE a.user_id=? AND a.status='done' AND r.decision='approved'""",
+            (u["id"],),
+        )
+    }
     passport_items = []
     for p in pp:
         payload = json.loads(p["payload"])
         attempt_id = p["source_attempt"] or payload.get("assessment", {}).get("attempt_id") or payload.get("attempt_id")
-        reviewed = bool(attempt_id and one(
-            """SELECT 1 FROM attempts a JOIN admin_attempt_reviews r ON r.attempt_id=a.id
-               WHERE a.id=? AND a.user_id=? AND a.status='done' AND r.decision='approved'""",
-            (attempt_id, u["id"]),
-        ))
+        reviewed = bool(attempt_id and attempt_id in approved_attempt_ids)
         passport_items.append({
             "id": p["id"], "created": p["created"], "revoked": bool(p["revoked"]),
             "reviewed": reviewed,
@@ -3308,9 +3381,10 @@ def sql_run(aid: str, b: SqlRun, u=Depends(current_user)):
 EVENT_TYPES = {
     "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
     "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
-    "fullscreen_enter", "focus", "wrong_share_surface", "camera_stopped", "ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected", "ai_audio_level", "ai_model_unavailable"
+    "fullscreen_enter", "focus", "wrong_share_surface", "camera_stopped", "ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected", "ai_audio_level", "ai_model_unavailable",
+    "identity_verified", "identity_mismatch", "identity_skipped", "microphone_stopped"
 }
-EVENT_META_KEYS = {"surface", "editor", "reason", "visibility", "supported", "confidence", "model", "duration_ms", "local_only"}
+EVENT_META_KEYS = {"surface", "editor", "reason", "visibility", "supported", "confidence", "model", "duration_ms", "local_only", "similarity", "distance", "faces", "threshold", "level"}
 
 
 class Ev(BaseModel):
@@ -3391,8 +3465,28 @@ def event_beacon(aid: str, b: BeaconEv, request: Request):
     return {"ok": True, "server_ts": now, "seq": b.seq}
 
 
+def _vision_review_evidence(evidence_id: str, payload: bytes):
+    """Optional Groq vision review of one stored alert snapshot (never a stream)."""
+    try:
+        import ai_providers as AIP
+        result = AIP.classify_exam_evidence(payload)
+    except Exception:
+        log.warning("Evidence vision review failed", exc_info=True)
+        return
+    if not result:
+        return
+    try:
+        run(
+            "UPDATE exam_evidence SET vision_json=?,vision_model=?,vision_at=? WHERE id=?",
+            (json.dumps(result), AIP.evidence_vision_model(), time.time(), evidence_id),
+        )
+    except Exception:
+        log.exception("Could not store the evidence vision result")
+
+
 @app.post("/api/attempts/{aid}/evidence")
-async def upload_exam_evidence(aid: str, request: Request, session_id: str = Form(...), seq: int = Form(...),
+async def upload_exam_evidence(aid: str, request: Request, background: BackgroundTasks,
+                              session_id: str = Form(...), seq: int = Form(...),
                               event_type: str = Form(...), confidence: float = Form(...),
                               image: UploadFile = File(...), u=Depends(current_user)):
     att = get_att(aid, u["id"])
@@ -3421,6 +3515,7 @@ async def upload_exam_evidence(aid: str, request: Request, session_id: str = For
     event_row = one("SELECT id FROM events WHERE attempt_id=? AND seq=? ORDER BY id DESC LIMIT 1", (aid, seq))
     run("INSERT INTO exam_evidence(id,attempt_id,event_id,captured_at,mime_type,image_data,size_bytes,expires_at) VALUES (?,?,?,?,?,?,?,?)",
         (evidence_id, aid, event_row["id"] if event_row else None, server_ts, "image/jpeg", payload, len(payload), expires))
+    background.add_task(_vision_review_evidence, evidence_id, payload)
     run("DELETE FROM exam_evidence WHERE expires_at<?", (server_ts,))
     return {"ok": True, "evidence_id": evidence_id, "server_ts": server_ts, "size_bytes": len(payload), "retention_days": EVIDENCE_RETENTION_DAYS}
 

@@ -930,3 +930,79 @@ def test_retake_locked_until_current_result_has_human_review():
     blocked = client.post("/api/attempts", headers=headers)
     assert blocked.status_code == 409, blocked.text
     assert blocked.json()["detail"] == "result_awaiting_review"
+def test_honesty_score_default_review_and_decision():
+    uid, headers = _user("honesty-candidate@example.com")
+    admin_reg = client.post(
+        "/api/auth/register",
+        json={"email": "honesty-admin@example.com", "name": "Honesty Reviewer",
+              "password": "password123", "role": "candidate"},
+    )
+    admin_headers = {"Authorization": "Bearer " + admin_reg.json()["token"]}
+    admin_uid = main.one("SELECT id FROM users WHERE email=?", ("honesty-admin@example.com",))["id"]
+    main.run("UPDATE user_roles SET role='admin' WHERE user_id=?", (admin_uid,))
+    main.run("INSERT INTO admin_staff_roles(user_id,admin_role,updated_by,updated_at) VALUES (?,?,?,?)",
+             (admin_uid, "super_admin", admin_uid, 0))
+
+    attempt_id = "honesty-flow-attempt"
+    main.run(
+        """INSERT INTO attempts(id,user_id,kind,seed,status,state,started,finished,result,appeal)
+           VALUES (?,?,?,?,?,?,?,?,?,NULL)""",
+        (attempt_id, uid, "pre", 1, "done", json.dumps({"answers": []}), 100, 700,
+         json.dumps({"overall": 70, "trust": "Medium", "trust_points": 3.5,
+                     "trust_hard_flags": [], "topics": {}})),
+    )
+    for i, event_type in enumerate(["ai_gaze_away", "ai_audio_level", "ai_audio_level", "paste"]):
+        main.run("INSERT INTO events(attempt_id,type,ts) VALUES (?,?,?)", (attempt_id, event_type, 200 + i))
+
+    detail = client.get("/api/admin/integrity/attempts/" + attempt_id, headers=admin_headers)
+    assert detail.status_code == 200, detail.text
+    detail = detail.json()
+    assert detail["honesty"]["auto_score"] == 65
+    assert detail["honesty"]["score"] == 65
+    assert detail["honesty"]["status"] == "pending"
+    assert detail["honesty"]["source"] == "system"
+    flags = {f["type"]: f["count"] for f in detail["flags"]}
+    assert flags["ai_audio_level"] == 2 and flags["paste"] == 1
+
+    queue = client.get("/api/admin/integrity/attempts", headers=admin_headers)
+    assert queue.status_code == 200, queue.text
+    row = next(x for x in queue.json()["items"] if x["id"] == attempt_id)
+    assert row["honesty_score"] == 65
+    assert row["honesty_status"] == "pending"
+
+    saved = client.post(
+        "/api/admin/integrity/attempts/" + attempt_id + "/honesty",
+        json={"decision": "pending", "score": 80, "reason": "Adjusted after reading the timeline."},
+        headers=admin_headers,
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["honesty"]["score"] == 80
+
+    missing_reason = client.post(
+        "/api/admin/integrity/attempts/" + attempt_id + "/honesty",
+        json={"decision": "approved", "reason": ""},
+        headers=admin_headers,
+    )
+    assert missing_reason.status_code == 422
+
+    approved = client.post(
+        "/api/admin/integrity/attempts/" + attempt_id + "/honesty",
+        json={"decision": "approved", "reason": "Timeline reviewed; score accepted."},
+        headers=admin_headers,
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["honesty"]["status"] == "approved"
+    assert approved.json()["honesty"]["score"] == 80
+
+    reloaded = client.get("/api/admin/integrity/attempts/" + attempt_id, headers=admin_headers).json()
+    assert reloaded["honesty"]["source"] == "admin"
+    assert reloaded["honesty"]["status"] == "approved"
+    assert reloaded["honesty"]["score"] == 80
+
+    rejected = client.post(
+        "/api/admin/integrity/attempts/" + attempt_id + "/honesty",
+        json={"decision": "rejected", "reason": "Integrity review rejected this score."},
+        headers=admin_headers,
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["honesty"]["status"] == "rejected"

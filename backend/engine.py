@@ -172,12 +172,14 @@ TRUST_RULES = {
         "fullscreen_exit": 1, "screen_share_stopped": 3,
         "wrong_share_surface": 3, "heartbeat_gap": 2,
         "ai_gaze_away": 0.5, "ai_multiple_faces": 1, "ai_no_face": 0.5, "ai_phone_detected": 1,
+        "ai_audio_level": 0.5, "identity_mismatch": 2, "microphone_stopped": 2,
     },
     "caps": {
         "external_clipboard": 3, "leave_window": 4,
         "fullscreen_exit": 3, "screen_share_stopped": 2,
         "wrong_share_surface": 1, "heartbeat_gap": 3, "fast": 4,
         "ai_gaze_away": 2, "ai_multiple_faces": 1, "ai_no_face": 2, "ai_phone_detected": 1,
+        "ai_audio_level": 2, "identity_mismatch": 1, "microphone_stopped": 1,
     },
 }
 
@@ -270,7 +272,7 @@ def trust_label(events, answers, rules=None, exam_seconds=1200, question_times=N
             points += value
             reasons.append({"key": reason_key, "n": charged, "points": value})
     # Client-side AI signals are advisory only, capped and never treated as hard flags.
-    for kind in ("ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected"):
+    for kind in ("ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected", "ai_audio_level", "identity_mismatch", "microphone_stopped"):
         n = sum(1 for e in events if _event_value(e, "type") == kind)
         charged = min(n, caps.get(kind, 1))
         if charged:
@@ -302,6 +304,18 @@ def trust_label(events, answers, rules=None, exam_seconds=1200, question_times=N
         "label": label, "points": points, "rule_version": rules.get("rule_version", "unknown"),
         "reasons": reasons, "hard_flags": sorted(hard_flags),
     }
+
+def honesty_score(points, hard_flags=None):
+    """Default advisory honesty score (0-100) derived from integrity points.
+
+    This is a review signal, not a technical score. Administrators can edit it
+    and approve or reject it; it never changes the assessment score by itself.
+    """
+    score = 100 - int(round(max(0.0, float(points or 0)) * 10))
+    score = max(0, min(100, score))
+    if hard_flags:
+        score = min(score, 40)
+    return score
 
 # ---------- descriptive / analytical answer evaluation (AI-assisted draft) ----------
 # The official score never comes from a live model. This section produces an

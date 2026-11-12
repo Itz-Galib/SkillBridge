@@ -5,6 +5,7 @@ python-multipart==0.0.20
 httpx==0.28.1
 pypdf==5.1.0
 psycopg[binary]==3.2.4
+psycopg_pool==3.2.6
 spacy==3.8.5
 meilisearch==0.36.0
 neo4j==5.27.0

@@ -1,6 +1,7 @@
 """Multi-provider CV profile extraction with evidence-backed validation."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -1242,3 +1243,106 @@ def extract_cv_profile(
     raise AIExtractionError(
         "All configured AI providers failed. " + "; ".join(errors)
     )
+
+# ---------------------------------------------------------
+# Optional vision review of exam alert snapshots
+# ---------------------------------------------------------
+
+EVIDENCE_VISION_PROMPT = (
+    "You review one still frame captured from a candidate exam webcam. "
+    "Return strict JSON only with exactly these keys: phone (boolean), "
+    "people (integer 0-5), face (boolean), summary (one short factual sentence, "
+    "max 90 characters). Describe only what is visibly present. Do not infer "
+    "emotion, identity, age, gender, ethnicity, health or intent. If the image is "
+    "unusable, set face=false, people=0, phone=false and explain briefly."
+)
+
+
+def _normalize_vision_result(data: Any) -> Optional[dict]:
+    if not isinstance(data, dict):
+        return None
+    phone, face = data.get("phone"), data.get("face")
+    if not isinstance(phone, bool) or not isinstance(face, bool):
+        return None
+    try:
+        people = max(0, min(5, int(data.get("people", 1 if face else 0))))
+    except (TypeError, ValueError):
+        people = 1 if face else 0
+    summary = re.sub(r"\s+", " ", str(data.get("summary") or "")).strip()[:160]
+    return {"phone": phone, "face": face, "people": people, "summary": summary}
+
+
+def evidence_vision_model() -> str:
+    provider = os.getenv("EVIDENCE_VISION_PROVIDER", "").strip().lower()
+    configured = os.getenv("EVIDENCE_VISION_MODEL", "").strip()
+    if configured:
+        return configured
+    return {
+        "gemini": "gemini-2.5-flash",
+        "groq": "meta-llama/llama-4-scout-17b-16e-instruct",
+    }.get(provider, "")
+
+
+def classify_exam_evidence(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optional[dict]:
+    """Optional vision check of one already-captured alert snapshot.
+
+    Disabled unless EVIDENCE_VISION_PROVIDER names a supported provider
+    (gemini or groq). Only the alert JPEG is sent (never a live stream or
+    audio). Returns a narrow, validated JSON object or None. Results are
+    advisory evidence for human review, never an auto-fail.
+    """
+    provider = os.getenv("EVIDENCE_VISION_PROVIDER", "").strip().lower()
+    if provider not in PROVIDERS:
+        return None
+    keys = get_provider_keys(provider)
+    model = evidence_vision_model()
+    if not keys or not model:
+        return None
+    try:
+        timeout = float(os.getenv("EVIDENCE_VISION_TIMEOUT_SECONDS", "25"))
+    except ValueError:
+        timeout = 25.0
+    data_url = "data:" + mime_type + ";base64," + base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 400,
+        "messages": [
+            {"role": "system", "content": EVIDENCE_VISION_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Classify this exam webcam frame."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+    }
+    endpoint = PROVIDERS[provider]["base_url"].rstrip("/") + "/chat/completions"
+    for key in keys:
+        try:
+            response = httpx.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+        except httpx.HTTPError:
+            continue
+        if response.status_code >= 500:
+            continue
+        if response.status_code >= 400:
+            logger.warning(
+                "Evidence vision request rejected: provider=%s status=%s",
+                provider,
+                response.status_code,
+            )
+            return None
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+            parsed = parse_json_response(content)
+        except (ValueError, KeyError, IndexError, TypeError):
+            return None
+        return _normalize_vision_result(parsed)
+    return None
+

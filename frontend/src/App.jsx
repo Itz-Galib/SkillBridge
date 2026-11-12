@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { api, getToken, setToken } from "./api.js";
 import { LangCtx, useT } from "./i18n.js";
 import CandidateProfileWorkspace from "./CandidateProfileWorkspace.jsx";
-import Avatar from "./Avatar.jsx";
+import Avatar, { useAvatar } from "./Avatar.jsx";
 
 const SAMPLE_CV = `Sadia Rahman
 House 14, Road 3, Mirpur, Dhaka
@@ -15,8 +15,15 @@ Skills: SQL, Python, Excel, Git. Presentation and report writing for class proje
 
 /* ---------- small helpers ---------- */
 const STEPS = ["profile", "assess", "gap", "learn", "retest", "passport"];
-const fmt = (s) =>
-  `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+const fmt = (s) => {
+  const n = Math.max(0, Math.floor(Number(s) || 0));
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const sec = n % 60;
+  return h
+    ? `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+    : `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+};
 
 function Err({ e }) {
   const t = useT();
@@ -878,15 +885,82 @@ function useExamIntegrity(initial, screenStream) {
   );
   const [notice, setNotice] = useState("");
   const [shareError, setShareError] = useState("");
+  const [alerts, setAlerts] = useState([]);
+  const pendingEvents = useRef([]);
+  const flushPromise = useRef(null);
+
+  const flushEvents = useCallback(async () => {
+    if (flushPromise.current) return flushPromise.current;
+    flushPromise.current = (async () => {
+      while (pendingEvents.current.length) {
+        const item = pendingEvents.current[0];
+        try {
+          await api(`/attempts/${aid}/event`, { method: "POST", body: item });
+          pendingEvents.current.shift();
+        } catch (error) {
+          // A 409 means this event is stale (replayed sequence or a session that
+          // was replaced in another tab). Drop it instead of retrying forever.
+          if (error?.status === 409) {
+            pendingEvents.current.shift();
+            continue;
+          }
+          break;
+        }
+      }
+    })();
+    try {
+      await flushPromise.current;
+    } finally {
+      flushPromise.current = null;
+    }
+  }, [aid]);
+
+  const nextSeq = useCallback(() => ++sequence.current, []);
+
   const report = useCallback(
-    (type) => {
-      api("/attempts/" + aid + "/event", {
-        method: "POST",
-        body: { type, session_id: sessionId.current, seq: ++sequence.current, client_ts: Date.now() },
-      }).catch(() => {});
+    (type, metadata = {}) => {
+      pendingEvents.current.push({
+        type,
+        session_id: sessionId.current,
+        seq: ++sequence.current,
+        client_ts: Date.now(),
+        metadata,
+      });
+      flushEvents();
+      const info = ALERT_MAP[type];
+      if (info) {
+        const now = Date.now();
+        setAlerts((current) => {
+          const fresh = current.filter((alert) => !(alert.type === type && now - alert.at < 4000));
+          return [...fresh.slice(-2), { id: type + "-" + now, type, at: now, ...info }];
+        });
+      }
     },
-    [aid],
+    [flushEvents],
   );
+  useEffect(() => {
+    const heartbeat = async () => {
+      try {
+        await flushEvents();
+        if (pendingEvents.current.length) return;
+        const body = {
+          session_id: sessionId.current,
+          seq: ++sequence.current,
+          client_ts: Date.now(),
+        };
+        await api(`/attempts/${aid}/heartbeat`, { method: "POST", body });
+      } catch {
+        /* the next successful heartbeat records the monitoring gap */
+      }
+    };
+    const timer = setInterval(heartbeat, 10000);
+    return () => clearInterval(timer);
+  }, [aid, flushEvents]);
+  useEffect(() => {
+    if (!alerts.length) return undefined;
+    const timer = setTimeout(() => setAlerts((current) => current.slice(1)), 6500);
+    return () => clearTimeout(timer);
+  }, [alerts]);
   useEffect(() => {
     const clipboard = (e) => {
       e.preventDefault();
@@ -970,9 +1044,12 @@ function useExamIntegrity(initial, screenStream) {
     fullscreenActive,
     notice,
     shareError,
+    alerts,
     setNotice,
     restartFullscreen,
     report,
+    flushEvents,
+    nextSeq,
   };
 }
 function ExamIntegrityBanner({ integrity, onRestartShare }) {
@@ -1034,13 +1111,15 @@ function ExamIntegrityBanner({ integrity, onRestartShare }) {
 }
 
 /* ---------- exam ---------- */
-function ExamRun({ initial, onFinished, screenStream, cameraStream, onRestartShare }) {
+function ExamRun({ initial, onFinished, screenStream, cameraStream, micStream, onRestartShare }) {
   if (initial.graphrag)
     return (
       <GraphRAGExamRunGate
         initial={initial}
         onFinished={onFinished}
         screenStream={screenStream}
+        cameraStream={cameraStream}
+        micStream={micStream}
         onRestartShare={onRestartShare}
       />
     );
@@ -1050,30 +1129,34 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream, onRestartSha
       onFinished={onFinished}
       screenStream={screenStream}
       cameraStream={cameraStream}
+      micStream={micStream}
     />
   );
 }
 
-function GraphRAGExamRunGate({ initial, onFinished, screenStream, onRestartShare }) {
+function GraphRAGExamRunGate({ initial, onFinished, screenStream, cameraStream, micStream, onRestartShare }) {
   const integrity = useExamIntegrity(initial, screenStream);
   return (
     <GraphRAGExamRun
       initial={initial}
       onFinished={onFinished}
       integrity={integrity}
+      cameraStream={cameraStream}
+      micStream={micStream}
       onRestartShare={onRestartShare}
     />
   );
 }
 
 /* ---------- local-only AI proctoring ---------- */
-function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEventsForEvidence }) {
+function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEventsForEvidence, inline = false }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const [status, setStatus] = useState("Loading local vision models…");
   const [cameraStatus, setCameraStatus] = useState("Waiting for camera video…");
   const [detections, setDetections] = useState({ face: "Starting", objects: "Starting" });
   const lastAlert = useRef({});
+  const noFaceSince = useRef(0);
   const modelRef = useRef(null);
 
   const evidence = useCallback(async (type, confidence) => {
@@ -1147,7 +1230,7 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
         let objects = null;
         const objectOptions = {
           baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite" },
-          runningMode: "VIDEO", scoreThreshold: 0.55, maxResults: 10
+          runningMode: "VIDEO", scoreThreshold: 0.45, maxResults: 10
         };
         try {
           try { objects = await vision.ObjectDetector.createFromOptions(files, { ...objectOptions, baseOptions: { ...objectOptions.baseOptions, delegate: "GPU" } }); }
@@ -1157,15 +1240,32 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
         modelRef.current = { face, objects };
         setStatus(objects ? "Local AI monitoring active" : "Face analysis active; object model unavailable");
         let lastVideoTime = -1;
+        let lastFaceRun = 0;
+        let lastObjectRun = 0;
+        let lastFaceLabel = "";
+        let lastObjectLabel = "";
         const loop = () => {
           if (cancelled) return;
-          if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+          const now = performance.now();
+          // Analyser runs ~5x/second rather than once per animation frame, and
+          // state is only updated when a label changes. This keeps the page
+          // smooth (no 60fps React re-renders) while detection stays responsive.
+          if (video.readyState >= 2 && video.currentTime !== lastVideoTime && now - lastFaceRun >= 180) {
             lastVideoTime = video.currentTime;
-            const now = performance.now();
+            lastFaceRun = now;
             const faces = face.detectForVideo(video, now).faceLandmarks || [];
             const count = faces.length;
-            setDetections(old => ({ ...old, face: count === 0 ? "No face" : count > 1 ? `${count} faces` : "One face" }));
-            if (count === 0) evidence("ai_no_face", 0.8);
+            const faceLabel = count === 0 ? "No face" : count > 1 ? `${count} faces` : "One face";
+            if (faceLabel !== lastFaceLabel) {
+              lastFaceLabel = faceLabel;
+              setDetections(old => ({ ...old, face: faceLabel }));
+            }
+            if (count === 0) {
+              if (!noFaceSince.current) noFaceSince.current = now;
+              if (now - noFaceSince.current > 1200) evidence("ai_no_face", 0.8);
+            } else {
+              noFaceSince.current = 0;
+            }
             if (count > 1) evidence("ai_multiple_faces", Math.min(0.99, 0.65 + count * 0.08));
             if (count === 1) {
               const points = faces[0];
@@ -1178,11 +1278,21 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
               }
             }
             if (objects) {
-              const found = objects.detectForVideo(video, now).detections || [];
-              const phone = found.find(d => (d.categories || []).some(c => ["cell phone", "mobile phone", "phone"].includes((c.categoryName || "").toLowerCase())));
-              setDetections(old => ({ ...old, objects: phone ? "Possible phone" : "No phone detected" }));
-              if (phone) evidence("ai_phone_detected", phone.categories?.[0]?.score || 0.6);
-            } else setDetections(old => ({ ...old, objects: "Unavailable" }));
+              if (now - lastObjectRun >= 650) {
+                lastObjectRun = now;
+                const found = objects.detectForVideo(video, now).detections || [];
+                const phone = found.find(d => (d.categories || []).some(c => ["cell phone", "mobile phone", "phone"].includes((c.categoryName || "").toLowerCase())));
+                const objectLabel = phone ? "Possible phone" : "No phone detected";
+                if (objectLabel !== lastObjectLabel) {
+                  lastObjectLabel = objectLabel;
+                  setDetections(old => ({ ...old, objects: objectLabel }));
+                }
+                if (phone) evidence("ai_phone_detected", phone.categories?.[0]?.score || 0.6);
+              }
+            } else if (lastObjectLabel !== "Unavailable") {
+              lastObjectLabel = "Unavailable";
+              setDetections(old => ({ ...old, objects: "Unavailable" }));
+            }
           }
           timer = requestAnimationFrame(loop);
         };
@@ -1207,24 +1317,59 @@ function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEven
       modelRef.current = null;
     };
   }, [cameraStream, evidence, report]);
-  return <div className="ai-proctor-panel" style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap",padding:12,border:"1px solid #d7dce3",borderRadius:12,background:"#111827",color:"#f9fafb"}}>
-    <div style={{position:"relative",width:190,maxWidth:"100%",aspectRatio:"16 / 10",flexShrink:0,overflow:"hidden",borderRadius:9,background:"#030712"}}>
-      <video ref={videoRef} muted playsInline autoPlay aria-label="Live webcam preview" style={{display:"block",width:"100%",height:"100%",objectFit:"cover",transform:"scaleX(-1)"}} />
-      <span style={{position:"absolute",left:8,top:8,padding:"3px 7px",borderRadius:5,background:"#b91c1c",color:"#fff",fontSize:10,fontWeight:700,letterSpacing:".04em"}}>LIVE</span>
-      <span style={{position:"absolute",left:8,bottom:7,color:"#fff",fontSize:11,textShadow:"0 1px 3px #000"}}>Camera preview</span>
-    </div>
-    <canvas ref={canvasRef} hidden />
-    <div style={{display:"grid",gap:5,minWidth:180,flex:"1 1 180px"}}>
-      <strong style={{fontSize:14}}>On-device AI</strong>
-      <span style={{fontSize:12,opacity:.95}}>{cameraStatus}</span>
-      <span style={{fontSize:12,opacity:.9}}>{status}</span>
-      <small style={{fontSize:11,opacity:.75}}>Face: {detections.face} · Object: {detections.objects}</small>
-    </div>
-  </div>;
+  const live = Boolean(cameraStream?.getVideoTracks?.().some((track) => track.readyState === "live"));
+  return (
+    <aside className={"camera-float proctor" + (live ? " live" : " off") + (inline ? " inline" : "")} aria-label="Webcam preview and on-device monitoring">
+      <div className="camera-float-head">
+        <i className="camera-dot" aria-hidden="true" />
+        <span>{live ? "LIVE" : "OFF"}</span>
+        <span>On-device AI</span>
+      </div>
+      <div className="camera-frame">
+        <video ref={videoRef} muted playsInline autoPlay aria-label="Live webcam preview" />
+        {!live && <div className="camera-placeholder">Camera offline</div>}
+      </div>
+      <div className="camera-status">
+        <span>{cameraStatus}</span>
+        <span>{status}</span>
+        <div className="camera-detect">
+          <span
+            className={
+              "detect-chip" +
+              (detections.face === "One face"
+                ? " ok"
+                : detections.face === "No face"
+                  ? " bad"
+                  : " warn")
+            }
+          >
+            ◉ {detections.face}
+          </span>
+          <span
+            className={
+              "detect-chip" +
+              (detections.objects === "No phone detected"
+                ? " ok"
+                : detections.objects === "Possible phone"
+                  ? " bad"
+                  : " warn")
+            }
+          >
+            ☎ {detections.objects}
+          </span>
+        </div>
+      </div>
+      <div className="camera-float-foot">
+        <span>Local preview</span>
+        <span>Not recorded</span>
+      </div>
+      <canvas ref={canvasRef} hidden />
+    </aside>
+  );
 }
 
 /* ---------- adaptive exam (phase 2 integrity) ---------- */
-function AdaptiveExamRun({ initial, onFinished, screenStream, cameraStream }) {
+function AdaptiveExamRun({ initial, onFinished, screenStream, cameraStream, micStream }) {
   const t = useT();
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState("");
@@ -1232,6 +1377,7 @@ function AdaptiveExamRun({ initial, onFinished, screenStream, cameraStream }) {
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
   const [quitting, setQuitting] = useState(false);
+  const [alerts, setAlerts] = useState([]);
   const [left, setLeft] = useState(initial.remaining);
   const [unlimitedTime, setUnlimitedTime] = useState(Boolean(initial.unlimited_time));
   const [stream, setStream] = useState(screenStream || null);
@@ -1254,7 +1400,13 @@ function AdaptiveExamRun({ initial, onFinished, screenStream, cameraStream }) {
         try {
           await api(`/attempts/${aid}/event`, { method: "POST", body: item });
           pendingEvents.current.shift();
-        } catch {
+        } catch (error) {
+          // A 409 means this event is stale (replayed sequence or a session that
+          // was replaced in another tab). Drop it instead of retrying forever.
+          if (error?.status === 409) {
+            pendingEvents.current.shift();
+            continue;
+          }
           break;
         }
       }
@@ -1270,7 +1422,37 @@ function AdaptiveExamRun({ initial, onFinished, screenStream, cameraStream }) {
     };
     pendingEvents.current.push(item);
     flushEvents();
+    const info = ALERT_MAP[type];
+    if (info) {
+      const now = Date.now();
+      setAlerts((current) => {
+        const fresh = current.filter((alert) => !(alert.type === type && now - alert.at < 4000));
+        return [...fresh.slice(-2), { id: type + "-" + now, type, at: now, ...info }];
+      });
+    }
   }, [flushEvents]);
+
+  useEffect(() => {
+    if (!alerts.length) return undefined;
+    const timer = setTimeout(() => setAlerts((current) => current.slice(1)), 6500);
+    return () => clearTimeout(timer);
+  }, [alerts]);
+
+  const onVoice = useCallback(({ confidence, level, duration_ms }) => {
+    report("ai_audio_level", {
+      confidence: Number(Number(confidence).toFixed(2)),
+      level: Number(level),
+      duration_ms: Number(duration_ms),
+      local_only: true,
+    });
+  }, [report]);
+  useEffect(() => {
+    const track = micStream?.getAudioTracks?.()[0];
+    if (!track) return undefined;
+    const ended = () => report("microphone_stopped", { reason: "audio_track_ended" });
+    track.addEventListener("ended", ended);
+    return () => track.removeEventListener("ended", ended);
+  }, [micStream, report]);
 
   useEffect(() => {
     const heartbeat = async () => {
@@ -1483,6 +1665,8 @@ function AdaptiveExamRun({ initial, onFinished, screenStream, cameraStream }) {
   if (!q) return <p>{t("loading")}</p>;
   return (
     <section className="card exam">
+      <IntegrityAlerts alerts={alerts} />
+      <MicMonitor stream={micStream} onVoice={onVoice} />
       <div className="examhead">
         <span>
           {t("q")} {q.index + 1} {t("of")} {q.total}
@@ -1534,7 +1718,7 @@ function AdaptiveExamRun({ initial, onFinished, screenStream, cameraStream }) {
   );
 }
 
-function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
+function GraphRAGExamRun({ initial, onFinished, integrity, cameraStream, micStream, onRestartShare }) {
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState(
     initial.page?.answers?.[initial.question?.id] || "",
@@ -1543,9 +1727,35 @@ function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
   const [busy, setBusy] = useState(false);
   const [left, setLeft] = useState(initial.remaining);
   const [sqlOut, setSqlOut] = useState(null);
+  const [marked, setMarked] = useState(() => new Set());
+  const toggleMark = (id) => {
+    setMarked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
   const aid = v.attempt_id;
   const q = v.question;
   const page = v.page || { questions: [], page: 0, page_count: 0, answers: {} };
+  const sessionId = useRef(initial.session_id);
+  const reportEvent = integrity.report;
+  const onVoice = useCallback(({ confidence, level, duration_ms }) => {
+    reportEvent("ai_audio_level", {
+      confidence: Number(Number(confidence).toFixed(2)),
+      level: Number(level),
+      duration_ms: Number(duration_ms),
+      local_only: true,
+    });
+  }, [reportEvent]);
+  useEffect(() => {
+    const track = micStream?.getAudioTracks?.()[0];
+    if (!track) return undefined;
+    const ended = () => reportEvent("microphone_stopped", { reason: "audio_track_ended" });
+    track.addEventListener("ended", ended);
+    return () => track.removeEventListener("ended", ended);
+  }, [micStream, reportEvent]);
 
   useEffect(() => {
     const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000);
@@ -1649,182 +1859,319 @@ function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
   );
   const answered =
     page.answers?.[q.id] != null && String(page.answers[q.id]).trim() !== "";
+  const currentNumber =
+    page.questions.find((item) => item.id === q.id)?.question_number ??
+    q.index + 1;
   const previousIndex = Math.max(0, page.page * 5 - 1);
   const nextIndex = Math.min(v.total - 1, (page.page + 1) * 5);
+  const progressPct = v.total ? Math.round((v.answered / v.total) * 100) : 0;
+  const perQuestionMinutes = Math.max(
+    1,
+    Math.round(Number(q.time_allocation || 60) / 60),
+  );
+  const sqlQuestion = String(q.question_type).toLowerCase().includes("sql");
+  const batchNumber = page.page + 1;
   return (
-    <section className="card exam gr-exam">
-      <div className="examhead">
-        <span>
-          Question {v.answered} of {v.total} answered
-        </span>
-        <progress value={v.answered} max={v.total} />
-        <span className={"timer" + (left < 120 ? " low" : "")}>
-          Time left: {fmt(left)}
-        </span>
-      </div>
-      <ExamIntegrityBanner
-        integrity={integrity}
-        onRestartShare={onRestartShare}
-      />
-      <div className="gr-exam-meta">
-        <span>
-          {v.total} questions · {Math.ceil(v.duration_seconds / 60)} minutes
-          allocated
-        </span>
-        <span>60% fundamentals · 40% CV &amp; development</span>
-      </div>
-      <div className="gr-question-table">
-        <table>
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>Question / Topic</th>
-              <th>Level</th>
-              <th>Type</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {page.questions.map((item) => (
-              <tr
-                key={item.id}
-                className={item.id === q.id ? "selected" : ""}
-                onClick={() => goTo(item.question_number - 1)}
-              >
-                <td>{item.question_number}</td>
-                <td>
-                  <strong>{item.assessment_topic}</strong>
-                  <small>{item.question_text}</small>
-                </td>
-                <td>{item.difficulty_level}</td>
-                <td>{item.question_type}</td>
-                <td>{page.answers?.[item.id] ? "Answered" : "Pending"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <div className="gr-question-current">
-        <div className="gr-question-label">
-          <span>
-            {q.assessment_section === "cv" && q.skill_id !== "sql"
-              ? "CV-BASED"
-              : "FUNDAMENTAL"}{" "}
-            · {q.assessment_topic}
-          </span>
-          <span>
-            {q.difficulty_level} · {q.question_type}
-          </span>
+    <section className="tech-exam">
+      <MicMonitor stream={micStream} onVoice={onVoice} />
+      <div className="tech-exam-head">
+        <div className="tech-brand">
+          <span className="tech-logo">◇</span>
+          <div>
+            <b>SkillBridge</b>
+            <small>Candidate Assessment</small>
+          </div>
         </div>
-        <h3 className="qtext">{q.prompt}</h3>
-        {isChoice ? (
-          <fieldset className="opts">
-            {q.options.map((option, index) => (
-              <label
-                key={index}
-                className={
-                  "opt" + (String(ans) === String(option) ? " on" : "")
-                }
-              >
-                <input
-                  type="radio"
-                  name={"gr-option-" + q.id}
-                  checked={String(ans) === String(option)}
-                  onChange={() => setAns(String(option))}
-                />{" "}
-                {option}
-              </label>
-            ))}
-          </fieldset>
-        ) : (
-          <>
-            {String(q.question_type).toLowerCase().includes("sql") && (
-              <details open>
-                <summary>SQL schema</summary>
-                <pre className="pre">
-                  {q.schema || "Schema supplied by the question author."}
-                </pre>
-              </details>
-            )}
-            <textarea
-              className="code"
-              rows={7}
-              spellCheck={false}
-              value={ans}
-              onChange={(e) => setAns(e.target.value)}
-              placeholder={
-                String(q.question_type).toLowerCase().includes("sql")
-                  ? "SELECT ..."
-                  : "Write your explanation, scenario response or code here…"
-              }
-            />
-            {String(q.question_type).toLowerCase().includes("sql") && (
-              <button
-                className="btn ghost"
-                onClick={runSql}
-                disabled={!ans.trim()}
-              >
-                Run SQL
-              </button>
-            )}
-            {sqlOut && (
-              <pre className="pre">{JSON.stringify(sqlOut, null, 2)}</pre>
-            )}
-          </>
-        )}
-      </div>
-      <div className="gr-exam-actions">
-        <button
-          className="btn ghost"
-          onClick={() => goTo(previousIndex)}
-          disabled={page.page === 0 || busy}
+        <span
+          className={
+            "tech-live" +
+            (integrity.shareActive && integrity.fullscreenActive ? "" : " warn")
+          }
         >
-          Previous 5
-        </button>
-        <span>
-          Page {page.page + 1} of {page.page_count}
+          {integrity.shareActive && integrity.fullscreenActive
+            ? "Assessment active"
+            : "Attention required"}
         </span>
-        <button
-          className="btn ghost"
-          onClick={() => goTo(nextIndex)}
-          disabled={!page.has_next || busy}
-        >
-          Next 5
-        </button>
-        <button
-          className="btn ghost"
-          onClick={save}
-          disabled={
-            busy ||
-            !integrity.shareActive ||
-            !integrity.fullscreenActive ||
-            !String(ans).trim()
-          }
-        >
-          Save answer
-        </button>
-        <button
-          className="btn"
-          onClick={submit}
-          disabled={
-            busy ||
-            !integrity.shareActive ||
-            !integrity.fullscreenActive ||
-            v.answered + (answered ? 0 : String(ans).trim() ? 1 : 0) < v.total
-          }
-        >
-          {busy ? "Saving…" : "Submit assessment"}
-        </button>
       </div>
-      <p className="muted">
-        Answers are saved to your attempt. Correct answers and explanations
-        remain hidden until submission. Coding, SQL, scenario and explanation
-        responses may require human review.
-      </p>
-      <Err e={err} />
+
+      <div className="tech-exam-grid">
+        <main className="tech-main">
+          <div className="tech-hero">
+            <div className="tech-hero-copy">
+              <h1>Technical Assessment</h1>
+              <p>
+                {v.total} questions · {Math.ceil(v.duration_seconds / 60)}{" "}
+                minutes · fundamentals + CV skills
+              </p>
+            </div>
+            <div className="tech-stats">
+              <div>
+                <span>Questions</span>
+                <b>
+                  {String(currentNumber).padStart(2, "0")} /{" "}
+                  {String(v.total).padStart(2, "0")}
+                </b>
+              </div>
+              <div>
+                <span>Answered</span>
+                <b>
+                  {v.answered} / {page.questions.length}
+                </b>
+              </div>
+              <div>
+                <span>Time left</span>
+                <b className={left < 120 ? "low" : ""}>{fmt(left)}</b>
+              </div>
+            </div>
+            <div className="tech-progress">
+              <span style={{ width: progressPct + "%" }} />
+            </div>
+            <div className="tech-progress-row">
+              <b>Assessment progress</b>
+              <span>{progressPct}% completed</span>
+            </div>
+          </div>
+
+          <div className="tech-panel">
+            <div className="tech-panel-head">
+              <h2>Question navigator</h2>
+              <span>
+                Batch {String(batchNumber).padStart(2, "0")} ·{" "}
+                {page.questions.length} questions
+              </span>
+            </div>
+            <div className="tech-nav">
+              {page.questions.map((item) => {
+                const done =
+                  page.answers?.[item.id] != null &&
+                  String(page.answers[item.id]).trim() !== "";
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={
+                      "tech-nav-btn" +
+                      (item.id === q.id ? " current" : "") +
+                      (done ? " done" : "")
+                    }
+                    onClick={() => goTo(item.question_number - 1)}
+                    disabled={busy}
+                  >
+                    <b>{String(item.question_number).padStart(2, "0")}</b>
+                    <i aria-hidden="true" />
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="tech-panel">
+            <div className="tech-q-head">
+              <span className="tech-badge">
+                {q.assessment_section === "cv" && q.skill_id !== "sql"
+                  ? "CV-BASED QUESTION"
+                  : "EXPLAINABLE QUESTION"}
+              </span>
+              <span className="tech-q-time">{perQuestionMinutes} min</span>
+            </div>
+            <h2 className="tech-q-number">Question {currentNumber}</h2>
+            <h3 className="tech-question">{q.prompt}</h3>
+            <div className="tech-context">
+              <span>Question context</span>
+              <p>
+                {q.assessment_topic} · {q.difficulty_level} · {q.question_type}
+                {q.marks
+                  ? ` · ${q.marks} mark${Number(q.marks) === 1 ? "" : "s"}`
+                  : ""}
+              </p>
+            </div>
+
+            {isChoice ? (
+              <div className="tech-options">
+                {q.options.map((option, index) => (
+                  <label
+                    key={index}
+                    className={
+                      "tech-opt" + (String(ans) === String(option) ? " on" : "")
+                    }
+                  >
+                    <input
+                      type="radio"
+                      name={"gr-option-" + q.id}
+                      checked={String(ans) === String(option)}
+                      onChange={() => setAns(String(option))}
+                    />
+                    <span>{option}</span>
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <>
+                {sqlQuestion && (
+                  <details className="tech-schema" open>
+                    <summary>SQL schema</summary>
+                    <pre>{q.schema || "Schema supplied by the question author."}</pre>
+                  </details>
+                )}
+                <div className="tech-answer-head">
+                  <b>Your answer</b>
+                  <span>{sqlQuestion ? "SQL editor" : "Response editor"}</span>
+                </div>
+                <textarea
+                  className="tech-textarea"
+                  rows={8}
+                  spellCheck={false}
+                  value={ans}
+                  onChange={(e) => setAns(e.target.value)}
+                  placeholder={
+                    sqlQuestion
+                      ? "SELECT ..."
+                      : "Write your explanation, scenario response or code here…"
+                  }
+                />
+                {sqlQuestion && (
+                  <button
+                    type="button"
+                    className="tech-btn ghost"
+                    onClick={runSql}
+                    disabled={!ans.trim()}
+                  >
+                    Run SQL
+                  </button>
+                )}
+                {sqlOut && (
+                  <pre className="tech-sqlout">
+                    {JSON.stringify(sqlOut, null, 2)}
+                  </pre>
+                )}
+              </>
+            )}
+            <p className="tech-note">
+              Your answer is editable. You can revisit this question anytime.
+            </p>
+          </div>
+
+          <label className="tech-mark">
+            <input
+              type="checkbox"
+              checked={marked.has(q.id)}
+              onChange={() => toggleMark(q.id)}
+            />
+            <span>Mark for review</span>
+          </label>
+
+          <div className="tech-qnav">
+            <button
+              type="button"
+              className="tech-btn ghost"
+              onClick={() => goTo(previousIndex)}
+              disabled={page.page === 0 || busy}
+            >
+              ‹ Previous
+            </button>
+            <span>
+              Page {page.page + 1} of {page.page_count}
+            </span>
+            <button
+              type="button"
+              className="tech-btn ghost"
+              onClick={() => goTo(nextIndex)}
+              disabled={!page.has_next || busy}
+            >
+              Next question ›
+            </button>
+          </div>
+
+          <div className="tech-panel tech-review">
+            <h2>Review &amp; submission</h2>
+            <p>
+              <span className="tech-good">
+                {marked.size} question{marked.size === 1 ? "" : "s"} marked for
+                review.
+              </span>{" "}
+              Review your responses before submitting.
+            </p>
+            <button
+              type="button"
+              className="tech-submit"
+              onClick={submit}
+              disabled={
+                busy ||
+                !integrity.shareActive ||
+                !integrity.fullscreenActive ||
+                v.answered + (answered ? 0 : String(ans).trim() ? 1 : 0) < v.total
+              }
+            >
+              {busy ? "Submitting…" : "Submit batch answers"}
+            </button>
+            <p className="tech-note">
+              Answers are saved to your attempt. Correct answers stay hidden until
+              submission. Coding, SQL, scenario and explanation responses may
+              require human review.
+            </p>
+          </div>
+          <Err e={err} />
+        </main>
+
+        <aside className="tech-side">
+          <LocalProctor
+            inline
+            cameraStream={cameraStream}
+            aid={aid}
+            sessionId={sessionId}
+            nextSeq={integrity.nextSeq}
+            report={integrity.report}
+            flushEventsForEvidence={integrity.flushEvents}
+          />
+          <IntegrityAlerts alerts={integrity.alerts} inline />
+          <div className="tech-side-card">
+            <h3>Session checks</h3>
+            <ul>
+              <li className={integrity.shareActive ? "ok" : "bad"}>
+                Screen sharing
+              </li>
+              <li className={integrity.fullscreenActive ? "ok" : "bad"}>
+                Full-screen
+              </li>
+              <li className={cameraStream ? "ok" : "bad"}>Webcam</li>
+              <li className={micStream ? "ok" : "bad"}>Microphone</li>
+            </ul>
+            {(!integrity.shareActive || !integrity.fullscreenActive) && (
+              <div className="tech-side-actions">
+                {!integrity.shareActive && (
+                  <button
+                    type="button"
+                    className="tech-btn"
+                    onClick={async () => {
+                      const stream = await onRestartShare?.();
+                      if (!stream) integrity.setNotice("screen_share_required");
+                    }}
+                  >
+                    Restore screen share
+                  </button>
+                )}
+                {!integrity.fullscreenActive && (
+                  <button
+                    type="button"
+                    className="tech-btn"
+                    onClick={integrity.restartFullscreen}
+                  >
+                    Restore full-screen
+                  </button>
+                )}
+              </div>
+            )}
+            <p className="tech-note">
+              Face, gaze and phone checks run in this browser. Flags are advisory
+              review signals and never an automatic fail.
+            </p>
+          </div>
+        </aside>
+      </div>
     </section>
   );
 }
+
 function Result({ aid, next, nextLabel }) {
   const t = useT();
   const [r, setR] = useState(null);
@@ -2269,6 +2616,371 @@ function Uplift() {
   );
 }
 
+/* ---------- shared camera preview ---------- */
+function CameraPreview({ stream, label = "Camera preview", note = "Local preview · not recorded" }) {
+  const videoRef = useRef(null);
+  const live = Boolean(stream?.getVideoTracks?.().some((track) => track.readyState === "live"));
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return undefined;
+    video.srcObject = stream || null;
+    if (!stream) return undefined;
+    video.play().catch(() => {});
+    return () => {
+      video.pause();
+      video.srcObject = null;
+    };
+  }, [stream]);
+  return (
+    <aside className={"camera-float" + (live ? " live" : " off")} aria-label={label}>
+      <div className="camera-float-head">
+        <i className="camera-dot" aria-hidden="true" />
+        <span>{live ? "LIVE" : "OFF"}</span>
+        <span>{label}</span>
+      </div>
+      <div className="camera-frame">
+        <video ref={videoRef} muted playsInline autoPlay aria-label="Live webcam preview" />
+        {!live && <div className="camera-placeholder">Your camera preview appears here once the webcam is enabled.</div>}
+      </div>
+      <div className="camera-float-foot">
+        <span>{live ? "You are visible" : "Camera off"}</span>
+        <span>{note}</span>
+      </div>
+    </aside>
+  );
+}
+
+/* ---------- realtime integrity alerts ---------- */
+const ALERT_MAP = {
+  copy: { title: "Copy attempt blocked", detail: "Clipboard actions are recorded as review signals.", level: "warn", icon: "⧉" },
+  cut: { title: "Cut attempt blocked", detail: "Clipboard actions are recorded as review signals.", level: "warn", icon: "⧉" },
+  paste: { title: "Paste attempt blocked", detail: "Clipboard actions are recorded as review signals.", level: "warn", icon: "⧉" },
+  blur: { title: "Window focus lost", detail: "Stay on the assessment window.", level: "warn", icon: "◱" },
+  tab_hidden: { title: "Tab switch detected", detail: "Keep the assessment tab visible.", level: "warn", icon: "◱" },
+  fullscreen_exit: { title: "Full-screen exited", detail: "Return to full-screen to answer.", level: "warn", icon: "⛶" },
+  screen_share_stopped: { title: "Screen sharing stopped", detail: "Restore screen sharing to continue.", level: "danger", icon: "▣" },
+  screen_share_unavailable: { title: "Screen sharing unavailable", detail: "Restore screen sharing to continue.", level: "danger", icon: "▣" },
+  wrong_share_surface: { title: "Wrong surface shared", detail: "Share your entire screen, not a tab or window.", level: "warn", icon: "▣" },
+  camera_stopped: { title: "Webcam disconnected", detail: "Reconnect the webcam to restore the preview.", level: "danger", icon: "◉" },
+  ai_gaze_away: { title: "Eyes away from screen", detail: "On-device gaze estimate flagged a look-away.", level: "info", icon: "◉" },
+  ai_no_face: { title: "Face not detected", detail: "Stay centred in the camera frame.", level: "warn", icon: "◉" },
+  ai_multiple_faces: { title: "Multiple faces detected", detail: "Only the candidate should be visible.", level: "warn", icon: "◉" },
+  ai_phone_detected: { title: "Possible phone detected", detail: "Phones and other devices are not allowed.", level: "warn", icon: "☎" },
+  ai_audio_level: { title: "Voice detected", detail: "Sustained speech was detected by the microphone level. Only a loudness flag is computed on your device.", level: "warn", icon: "🎙" },
+  microphone_stopped: { title: "Microphone disconnected", detail: "Reconnect the microphone and enable it again. This interruption is recorded.", level: "danger", icon: "🎙" },
+  ai_model_unavailable: { title: "On-device AI unavailable", detail: "Camera analysis could not start; review continues from events.", level: "info", icon: "◉" },
+};
+
+function IntegrityAlerts({ alerts, inline = false }) {
+  if (!alerts?.length) return null;
+  return (
+    <div className={"integrity-alerts" + (inline ? " inline" : "")} role="status" aria-live="polite">
+      {alerts.map((alert) => (
+        <div key={alert.id} className={"integrity-alert " + alert.level} title={alert.detail}>
+          <span className="integrity-alert-icon" aria-hidden="true">{alert.icon}</span>
+          <div>
+            <strong>{alert.title}</strong>
+            {alert.detail && <small>{alert.detail}</small>}
+          </div>
+        </div>
+      ))}
+      <span className="integrity-alerts-note">Review signals only · never an automatic fail</span>
+    </div>
+  );
+}
+
+/* On-device loudness monitor. No audio is recorded, stored or uploaded. */
+function MicMonitor({ stream, onVoice }) {
+  useEffect(() => {
+    if (!stream) return undefined;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return undefined;
+    const context = new Ctx();
+    // Browsers start an AudioContext suspended unless it is resumed from a user
+    // gesture. Without this the analyser reads silence and no voice flag fires.
+    const resume = () => {
+      if (context.state === "suspended") context.resume?.().catch(() => {});
+    };
+    resume();
+    document.addEventListener("pointerdown", resume);
+    document.addEventListener("keydown", resume);
+    const source = context.createMediaStreamSource(stream);
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.4;
+    source.connect(analyser);
+    const samples = new Uint8Array(analyser.fftSize);
+    let loudTicks = 0;
+    let lastAlert = 0;
+    const timer = setInterval(() => {
+      resume();
+      analyser.getByteTimeDomainData(samples);
+      let sum = 0;
+      for (let i = 0; i < samples.length; i += 1) {
+        const value = (samples[i] - 128) / 128;
+        sum += value * value;
+      }
+      const rms = Math.sqrt(sum / samples.length);
+      const now = Date.now();
+      if (rms > 0.035) {
+        loudTicks += 1;
+        // ~1 second of sustained speech before flagging, then throttle.
+        if (loudTicks >= 4 && now - lastAlert > 8000) {
+          lastAlert = now;
+          loudTicks = 0;
+          onVoice({
+            confidence: Math.min(0.99, 0.5 + rms * 2),
+            level: Number(rms.toFixed(4)),
+            duration_ms: 1000,
+          });
+        }
+      } else {
+        loudTicks = 0;
+      }
+    }, 250);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("pointerdown", resume);
+      document.removeEventListener("keydown", resume);
+      try { source.disconnect(); } catch { /* already disconnected */ }
+      context.close?.().catch(() => {});
+    };
+  }, [stream, onVoice]);
+  return null;
+}
+
+/* ---------- pre-exam identity check (profile photo vs live webcam) ---------- */
+let faceApiPromise = null;
+
+function loadFaceApi() {
+  if (!faceApiPromise) {
+    faceApiPromise = (async () => {
+      const faceapi = await import("@vladmandic/face-api");
+      await faceapi.nets.tinyFaceDetector.loadFromUri("/face-api/model");
+      await faceapi.nets.faceLandmark68TinyNet.loadFromUri("/face-api/model");
+      await faceapi.nets.faceRecognitionNet.loadFromUri("/face-api/model");
+      return faceapi;
+    })().catch((error) => {
+      faceApiPromise = null;
+      throw error;
+    });
+  }
+  return faceApiPromise;
+}
+
+function loadImageElement(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Could not read the image."));
+    image.src = src;
+  });
+}
+
+function captureStreamFrame(stream) {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement("video");
+    video.muted = true;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.srcObject = stream;
+    const deadline = Date.now() + 8000;
+    const finish = (fn, arg) => {
+      video.pause();
+      video.srcObject = null;
+      fn(arg);
+    };
+    video.onloadeddata = async () => {
+      try { await video.play(); } catch { /* autoplay may be blocked */ }
+      const waitForFrame = () => {
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.min(640, video.videoWidth);
+          canvas.height = Math.round((canvas.width * video.videoHeight) / video.videoWidth);
+          canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+          finish(resolve, canvas.toDataURL("image/jpeg", 0.85));
+        } else if (Date.now() > deadline) {
+          finish(reject, new Error("No camera frames were received."));
+        } else {
+          requestAnimationFrame(waitForFrame);
+        }
+      };
+      waitForFrame();
+    };
+    video.onerror = () => finish(reject, new Error("The camera preview could not be read."));
+  });
+}
+
+function IdentityCheck({ cameraStream, avatarUrl, status, onChange, onAvatarUploaded, disabled }) {
+  const [reference, setReference] = useState({ state: "idle", descriptor: null, message: "" });
+  const [live, setLive] = useState({ state: "idle", similarity: null, distance: null, message: "" });
+  const [busy, setBusy] = useState(false);
+  const [uploadBusy, setUploadBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!avatarUrl) {
+      setReference({ state: "missing", descriptor: null, message: "Add a profile photo to enable identity verification." });
+      return undefined;
+    }
+    setReference({ state: "loading", descriptor: null, message: "Reading your profile photo…" });
+    (async () => {
+      try {
+        const faceapi = await loadFaceApi();
+        const image = await loadImageElement(avatarUrl);
+        const detections = await faceapi
+          .detectAllFaces(image, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.4 }))
+          .withFaceLandmarks(true)
+          .withFaceDescriptors();
+        if (cancelled) return;
+        if (detections.length === 0) {
+          setReference({ state: "error", descriptor: null, message: "No face was found in your profile photo. Upload a clear, front-facing photo." });
+        } else if (detections.length > 1) {
+          setReference({ state: "error", descriptor: null, message: "Your profile photo contains more than one face." });
+        } else {
+          setReference({ state: "ready", descriptor: detections[0].descriptor, message: "Profile photo ready." });
+        }
+      } catch (error) {
+        if (!cancelled) setReference({ state: "error", descriptor: null, message: error.message || "Could not analyse the profile photo." });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [avatarUrl]);
+
+  useEffect(() => {
+    if (status === "verified" || status === "flagged") return;
+    setLive({ state: "idle", similarity: null, distance: null, message: "" });
+  }, [avatarUrl, cameraStream, status]);
+
+  const scan = async () => {
+    if (!cameraStream) {
+      setLive({ state: "error", message: "Enable the webcam first." });
+      return;
+    }
+    if (!reference.descriptor) {
+      setLive({ state: "error", message: reference.message || "Your profile photo is not ready." });
+      return;
+    }
+    setBusy(true);
+    setLive({ state: "scanning", message: "Comparing your live face with the profile photo…" });
+    try {
+      const faceapi = await loadFaceApi();
+      const shot = await captureStreamFrame(cameraStream);
+      const image = await loadImageElement(shot);
+      const detections = await faceapi
+        .detectAllFaces(image, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.4 }))
+        .withFaceLandmarks(true)
+        .withFaceDescriptors();
+      if (detections.length === 0) throw new Error("No face detected. Face the camera in good light and try again.");
+      if (detections.length > 1) throw new Error("More than one face is visible. Only you should be in the frame.");
+      const distance = faceapi.euclideanDistance(reference.descriptor, detections[0].descriptor);
+      const similarity = Math.max(0, Math.min(100, Math.round((1 - distance) * 100)));
+      const match = distance <= 0.6;
+      setLive({
+        state: match ? "match" : "mismatch",
+        similarity,
+        distance,
+        message: match
+          ? "Live face matches your profile photo."
+          : "Live face does not match your profile photo closely enough.",
+      });
+      onChange({
+        status: match ? "verified" : "flagged",
+        similarity,
+        distance: Number(distance.toFixed(3)),
+        reason: match ? "face_match" : "face_distance_above_threshold",
+      });
+    } catch (error) {
+      setLive({ state: "error", message: error.message || "Identity check could not run." });
+      onChange({ status: "pending", similarity: null, distance: null, reason: "identity_check_failed" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uploadPhoto = async (file) => {
+    if (!file) return;
+    setUploadBusy(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      await api("/candidate/avatar", { method: "POST", form });
+      await onAvatarUploaded?.();
+    } catch (error) {
+      setReference({ state: "error", descriptor: null, message: error.message || "Could not upload the profile photo." });
+    } finally {
+      setUploadBusy(false);
+    }
+  };
+
+  const ready = reference.state === "ready";
+  return (
+    <div className={"identity-check" + (live.state === "match" ? " ok" : live.state === "mismatch" ? " warn" : "")}>
+      <header className="identity-check-head">
+        <span className="eyebrow">IDENTITY CHECK</span>
+        <strong>Match your live face to your profile photo</strong>
+        <span>Runs entirely in this browser. No biometric template is stored.</span>
+      </header>
+      <div className="identity-check-body">
+        <div className="identity-photo">
+          {avatarUrl ? (
+            <img src={avatarUrl} alt="Profile photo" />
+          ) : (
+            <span className="identity-photo-empty">No profile photo</span>
+          )}
+          <small>Profile photo</small>
+          {!avatarUrl && (
+            <label className={"identity-upload" + (uploadBusy ? " busy" : "")}>
+              {uploadBusy ? "Uploading…" : "Upload photo"}
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                disabled={uploadBusy}
+                onChange={(e) => uploadPhoto(e.target.files?.[0])}
+              />
+            </label>
+          )}
+        </div>
+        <div className="identity-actions">
+          <p className={"identity-state " + live.state}>
+            {live.state === "scanning" && "Scanning…"}
+            {live.state === "match" && `Match ${live.similarity}% · distance ${live.distance?.toFixed?.(3) ?? live.distance}`}
+            {live.state === "mismatch" && `Mismatch ${live.similarity}% · distance ${live.distance?.toFixed?.(3) ?? live.distance}`}
+            {live.state === "error" && live.message}
+            {(live.state === "idle") && (reference.message || "Enable the webcam, then scan your face.")}
+          </p>
+          <button
+            type="button"
+            className="btn"
+            onClick={scan}
+            disabled={disabled || busy || !ready || !cameraStream}
+          >
+            {busy ? "Checking…" : live.state === "match" ? "Scan again" : "Scan my face"}
+          </button>
+          {reference.state === "loading" && <small>Loading face recognition models…</small>}
+          {reference.state === "missing" && <small>Identity verification needs a profile photo. Upload one above.</small>}
+          {reference.state === "error" && <small className="err">{reference.message}</small>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SetupStep({ done, index, title, hint, actionLabel, onAction, disabled }) {
+  return (
+    <div className={"exam-step" + (done ? " ready" : "")}>
+      <span className="exam-step-badge" aria-hidden="true">{done ? "✓" : index}</span>
+      <div className="exam-step-body">
+        <strong>{title}</strong>
+        <span>{hint}</span>
+      </div>
+      <button type="button" className="btn ghost sm" onClick={onAction} disabled={disabled}>
+        {actionLabel}
+      </button>
+    </div>
+  );
+}
+
 function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const t = useT();
   const [active, setActive] = useState(null);
@@ -2277,6 +2989,12 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const [screenStream, setScreenStream] = useState(null);
   const [cameraStream, setCameraStream] = useState(null);
   const [cameraReady, setCameraReady] = useState(false);
+  const [micStream, setMicStream] = useState(null);
+  const [micReady, setMicReady] = useState(false);
+  const avatarUrl = useAvatar(st.has_avatar, st.avatar_updated, st.user?.email || "");
+  const [identityResult, setIdentityResult] = useState({ status: "pending", similarity: null, distance: null, reason: "" });
+  const [identityAck, setIdentityAck] = useState(false);
+  const identityPass = identityResult.status === "verified" || (identityResult.status === "flagged" && identityAck);
   const [shareReady, setShareReady] = useState(false);
   const [fullscreenReady, setFullscreenReady] = useState(Boolean(document.fullscreenElement));
   const [setupBusy, setSetupBusy] = useState(false);
@@ -2361,6 +3079,37 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   useEffect(() => () => {
     screenStream?.getTracks().forEach((track) => track.stop());
   }, [screenStream]);
+
+  // Optional microphone monitoring: an on-device loudness flag only.
+  const toggleMic = async () => {
+    setErr(null);
+    if (micStream) {
+      micStream.getTracks().forEach((track) => track.stop());
+      setMicStream(null);
+      setMicReady(false);
+      return;
+    }
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access is not supported in this browser.");
+      const media = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      setMicStream(media);
+      setMicReady(true);
+    } catch (e) {
+      setMicReady(false);
+      setMicStream(null);
+      setErr(new Error(e?.name === "NotAllowedError" ? "Microphone permission was denied. Speaking alerts stay off." : e.message || "Unable to start the microphone."));
+    }
+  };
+  useEffect(() => {
+    const track = micStream?.getAudioTracks?.()[0];
+    if (!track) return;
+    const onEnded = () => { setMicReady(false); setMicStream(null); };
+    track.addEventListener("ended", onEnded);
+    return () => track.removeEventListener("ended", onEnded);
+  }, [micStream]);
+  useEffect(() => () => {
+    micStream?.getTracks().forEach((track) => track.stop());
+  }, [micStream]);
 
   // Ask for screen sharing in its own click so the browser can show its picker.
   const enableScreenShare = async () => {
@@ -2468,7 +3217,25 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
         body: blueprintId ? { blueprint_id: blueprintId } : undefined,
       });
       if (v.status === "active") {
-        const body = { type: "screen_share_started", session_id: v.session_id, seq: (v.last_event_seq || 0) + 1,
+        let seq = v.last_event_seq || 0;
+        seq += 1;
+        await api(`/attempts/${v.attempt_id}/event`, {
+          method: "POST",
+          body: {
+            type: identityResult.status === "verified" ? "identity_verified" : "identity_mismatch",
+            session_id: v.session_id,
+            seq,
+            client_ts: Date.now(),
+            metadata: {
+              similarity: identityResult.similarity ?? null,
+              distance: identityResult.distance ?? null,
+              reason: identityResult.reason || "",
+              model: "face-api",
+              local_only: true,
+            },
+          },
+        });
+        const body = { type: "screen_share_started", session_id: v.session_id, seq: seq + 1,
           client_ts: Date.now(), metadata: { surface: screenStream.getVideoTracks()[0]?.getSettings?.().displaySurface || "unknown" } };
         await api(`/attempts/${v.attempt_id}/event`, { method: "POST", body });
         setActive({ ...v, last_event_seq: body.seq });
@@ -2482,10 +3249,11 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     } finally {
       setSetupBusy(false);
     }
-  }, [refresh, screenStream, cameraStream, cameraReady, t]);
+  }, [refresh, screenStream, cameraStream, cameraReady, t, identityResult]);
   const finished = async () => {
     screenStream?.getTracks().forEach((track) => track.stop());
     cameraStream?.getTracks().forEach((track) => track.stop());
+    micStream?.getTracks().forEach((track) => track.stop());
     setScreenStream(null);
     setActive(null);
     if (document.fullscreenElement && document.exitFullscreen)
@@ -2493,37 +3261,69 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     await refresh();
   };
 
-  if (active) return <ExamRun initial={active} screenStream={screenStream} cameraStream={cameraStream} onFinished={finished} onRestartShare={restartShare} />;
+  if (active) return <ExamRun initial={active} screenStream={screenStream} cameraStream={cameraStream} micStream={micStream} onFinished={finished} onRestartShare={restartShare} />;
   if (act && (act.kind === kind)) return (
-    <section className="card narrow">
-      <h2>{t("resume")}</h2>
-      <p>{t("shareBeforeResume")}</p>
-      <div className="card exam-setup-steps">
-        <p><strong>System check</strong></p>
-        <p>{mobileDevice ? "✕ Desktop device required" : "✓ Desktop device"} · {browserSupported ? "✓ Browser APIs supported" : "✕ Screen sharing/full-screen unsupported"} · {navigator.onLine ? "✓ Network available" : "✕ Network offline"}</p>
-        <div className="row">
-          <span>{shareReady ? "✓" : "1."} {t("shareSetupStep")}</span>
-          <button type="button" className="btn ghost sm" onClick={enableScreenShare} disabled={setupBusy}>
-            {shareReady ? t("shareActive") : t("restartShare")}
-          </button>
+    <section className="card exam-setup">
+      <header className="exam-setup-head">
+        <span className="eyebrow">SYSTEM CHECK</span>
+        <h2>{t("resume")}</h2>
+        <p>{t("shareBeforeResume")}</p>
+      </header>
+      <div className="exam-steps">
+        <SetupStep
+          done={shareReady}
+          index={1}
+          title={t("shareSetupStep")}
+          hint={t("sharePrivacy")}
+          actionLabel={shareReady ? t("shareActive") : t("restartShare")}
+          onAction={enableScreenShare}
+          disabled={setupBusy}
+        />
+        <SetupStep
+          done={cameraReady}
+          index={2}
+          title="Enable webcam for local AI analysis"
+          hint="Face, gaze and phone checks run in your browser. No video is uploaded or recorded."
+          actionLabel={cameraReady ? "Camera ready" : "Enable camera"}
+          onAction={enableCamera}
+          disabled={setupBusy}
+        />
+        <SetupStep
+          done={fullscreenReady}
+          index={3}
+          title={t("fullscreenSetupStep")}
+          hint={t("examSetupHint")}
+          actionLabel={fullscreenReady ? t("fullscreenActive") : t("restartFullscreen")}
+          onAction={enableFullscreen}
+          disabled={setupBusy}
+        />
+      </div>
+      <div className={"exam-optional" + (micReady ? " on" : "")}>
+        <div>
+          <strong>Microphone monitoring <span className="optional-tag">REQUIRED</span></strong>
+          <span>Required for this assessment. Uses an on-device loudness level only; audio is never recorded, stored or uploaded.</span>
         </div>
-        <div className="row">
-          <span>{cameraReady ? "✓" : "2."} Enable webcam for local AI analysis</span>
-          <button type="button" className="btn ghost sm" onClick={enableCamera} disabled={setupBusy}>
-            {cameraReady ? "Camera ready" : "Enable camera"}
-          </button>
+        <button type="button" className="btn ghost sm" onClick={toggleMic} disabled={setupBusy}>
+          {micReady ? "Microphone on · turn off" : "Enable microphone"}
+        </button>
+      </div>
+      <div className={"exam-optional" + (micReady ? " on" : "")}>
+        <div>
+          <strong>Microphone monitoring <span className="optional-tag">REQUIRED</span></strong>
+          <span>Required for this assessment. Uses an on-device loudness level only; audio is never recorded, stored or uploaded.</span>
         </div>
-        <div className="row">
-          <span>{fullscreenReady ? "✓" : "3."} {t("fullscreenSetupStep")}</span>
-          <button type="button" className="btn ghost sm" onClick={enableFullscreen} disabled={setupBusy}>
-            {fullscreenReady ? t("fullscreenActive") : t("restartFullscreen")}
-          </button>
-        </div>
+        <button type="button" className="btn ghost sm" onClick={toggleMic} disabled={setupBusy}>
+          {micReady ? "Microphone on · turn off" : "Enable microphone"}
+        </button>
       </div>
       <Err e={err} />
-      <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady || !cameraReady}>
-        {setupBusy ? t("saving") : t("resume")}
-      </button>
+      <div className="exam-setup-actions">
+        <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady || !cameraReady || !micReady}>
+          {setupBusy ? t("saving") : t("resume")}
+        </button>
+        <small>Screen sharing, webcam, microphone and full-screen must be active before you can resume.</small>
+      </div>
+      <CameraPreview stream={cameraStream} />
     </section>
   );
   if (mine) return (
@@ -2534,39 +3334,83 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   );
   if (kind === "post" && done.length === 0) return <p className="note">{t("needPre")}</p>;
   return (
-    <section className="card narrow exam-setup">
-      <h2>{kind === "pre" ? t("startTest") : t("steps").retest}</h2>
-      <p>{kind === "pre" ? t("testIntro") : t("retestIntro")}</p>
-      <p className="exam-integrity-note">{t("examIntegrityIntro")}</p>
-      <div className="card exam-setup-steps">
-        <p><strong>System check</strong></p>
-        <p>{mobileDevice ? "✕ Desktop device required" : "✓ Desktop device"} · {browserSupported ? "✓ Browser APIs supported" : "✕ Screen sharing/full-screen unsupported"} · {navigator.onLine ? "✓ Network available" : "✕ Network offline"}</p>
-        <div className="row">
-          <span>{shareReady ? "✓" : "1."} {t("shareSetupStep")}</span>
-          <button type="button" className="btn ghost sm" onClick={enableScreenShare} disabled={setupBusy}>
-            {shareReady ? t("shareActive") : t("restartShare")}
-          </button>
-        </div>
-        <div className="row">
-          <span>{cameraReady ? "✓" : "2."} Enable webcam for local AI analysis</span>
-          <button type="button" className="btn ghost sm" onClick={enableCamera} disabled={setupBusy}>
-            {cameraReady ? "Camera ready" : "Enable camera"}
-          </button>
-        </div>
-        <p className="muted">The webcam is analyzed in this browser. Only alert logs and limited JPEG evidence snapshots may be uploaded; no continuous video or audio is recorded.</p>
-        <div className="row">
-          <span>{fullscreenReady ? "✓" : "3."} {t("fullscreenSetupStep")}</span>
-          <button type="button" className="btn ghost sm" onClick={enableFullscreen} disabled={setupBusy}>
-            {fullscreenReady ? t("fullscreenActive") : t("restartFullscreen")}
-          </button>
-        </div>
-        <p className="muted">{t("examSetupHint")}</p>
+    <section className="card exam-setup">
+      <header className="exam-setup-head">
+        <span className="eyebrow">SYSTEM CHECK</span>
+        <h2>{kind === "pre" ? t("startTest") : t("steps").retest}</h2>
+        <p>{kind === "pre" ? t("testIntro") : t("retestIntro")}</p>
+      </header>
+      <div className="system-check-strip">
+        <span className={mobileDevice ? "bad" : "ok"}>{mobileDevice ? "✕ Desktop device required" : "✓ Desktop device"}</span>
+        <span className={browserSupported ? "ok" : "bad"}>{browserSupported ? "✓ Browser APIs supported" : "✕ Screen sharing/full-screen unsupported"}</span>
+        <span className={navigator.onLine ? "ok" : "bad"}>{navigator.onLine ? "✓ Network available" : "✕ Network offline"}</span>
       </div>
+      <p className="exam-integrity-note">{t("examIntegrityIntro")}</p>
+      <div className="exam-steps">
+        <SetupStep
+          done={shareReady}
+          index={1}
+          title={t("shareSetupStep")}
+          hint={t("sharePrivacy")}
+          actionLabel={shareReady ? t("shareActive") : t("restartShare")}
+          onAction={enableScreenShare}
+          disabled={setupBusy}
+        />
+        <SetupStep
+          done={cameraReady}
+          index={2}
+          title="Enable webcam for local AI analysis"
+          hint="The webcam is analysed in this browser only. Only alert logs and limited JPEG evidence snapshots may be uploaded; no continuous video or audio is recorded."
+          actionLabel={cameraReady ? "Camera ready" : "Enable camera"}
+          onAction={enableCamera}
+          disabled={setupBusy}
+        />
+        <SetupStep
+          done={fullscreenReady}
+          index={3}
+          title={t("fullscreenSetupStep")}
+          hint={t("examSetupHint")}
+          actionLabel={fullscreenReady ? t("fullscreenActive") : t("restartFullscreen")}
+          onAction={enableFullscreen}
+          disabled={setupBusy}
+        />
+      </div>
+      <div className={"exam-optional" + (micReady ? " on" : "")}>
+        <div>
+          <strong>Microphone monitoring <span className="optional-tag">REQUIRED</span></strong>
+          <span>Required for this assessment. Uses an on-device loudness level only; audio is never recorded, stored or uploaded.</span>
+        </div>
+        <button type="button" className="btn ghost sm" onClick={toggleMic} disabled={setupBusy}>
+          {micReady ? "Microphone on · turn off" : "Enable microphone"}
+        </button>
+      </div>
+      <IdentityCheck
+        cameraStream={cameraStream}
+        avatarUrl={avatarUrl}
+        status={identityResult.status}
+        onChange={setIdentityResult}
+        onAvatarUploaded={refresh}
+        disabled={!cameraReady || setupBusy}
+      />
+      {identityResult.status === "flagged" && (
+        <label className="identity-ack">
+          <input
+            type="checkbox"
+            checked={identityAck}
+            onChange={(e) => setIdentityAck(e.target.checked)}
+          />
+          My live face did not match closely. Continue anyway and flag this attempt for human review.
+        </label>
+      )}
       {banner && <p className="note">{banner}</p>}
       <Err e={err} />
-      <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady || !cameraReady}>
-        {setupBusy ? t("saving") : t("startTest")}
-      </button>
+      <div className="exam-setup-actions">
+        <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady || !cameraReady || !identityPass || !micReady}>
+          {setupBusy ? t("saving") : t("startTest")}
+        </button>
+        <small>Screen sharing, webcam, microphone, full-screen and the identity check must be complete before you can start.</small>
+      </div>
+      <CameraPreview stream={cameraStream} />
     </section>
   );
 }
@@ -3183,6 +4027,97 @@ function PublicPassport({ id }) {
         <footer className="public-passport-footer"><span>{p.issuer} · {t("mockLabel")}</span><a href="#/" className="link">{t("brand")}</a></footer>
       </article>
     </main>
+  );
+}
+
+function CandidateAssessmentResults({ attempts }) {
+  const done = (attempts || []).filter((a) => a.status === "done");
+  const approved = done
+    .filter((a) => a.review_decision === "approved")
+    .sort((a, b) => (b.finished || 0) - (a.finished || 0));
+  const latest = approved[0];
+  const other = done
+    .filter((a) => !latest || a.id !== latest.id)
+    .sort((a, b) => (b.finished || 0) - (a.finished || 0));
+  const date = (v) =>
+    v
+      ? new Date(Number(v) * 1000).toLocaleDateString(undefined, {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        })
+      : "Date unavailable";
+  const label = (a) =>
+    a.kind === "pre" ? "Initial assessment" : a.kind === "post" ? "Reassessment" : "Assessment";
+  const status = (a) =>
+    a.review_decision === "approved"
+      ? "Valid exam"
+      : a.review_decision === "invalidated"
+        ? "Invalidated"
+        : "Under review";
+  return (
+    <section className="portal-panel assessment-history">
+      <div className="dashboard-section-heading">
+        <div>
+          <span className="eyebrow">VERIFIED ASSESSMENT RESULTS</span>
+          <h2>Assessment results</h2>
+          <p>Only an administrator-approved assessment is treated as valid.</p>
+        </div>
+      </div>
+      {latest ? (
+        <div className="assessment-featured">
+          <div>
+            <span className="eyebrow">LATEST VALID EXAM</span>
+            <h3>{label(latest)}</h3>
+            <p>{date(latest.finished)}</p>
+          </div>
+          <strong>
+            {latest.overall ?? "—"}
+            <small>/ 100</small>
+          </strong>
+          <span className="status-pill">Valid exam</span>
+        </div>
+      ) : (
+        <div className="assessment-pending-banner">
+          <strong>No valid exam result yet</strong>
+          <p>
+            Your completed exam marks will remain under review until an
+            administrator reviews them.
+          </p>
+        </div>
+      )}
+      {other.length > 0 && (
+        <>
+          <h3>Other exam attempts</h3>
+          <div className="assessment-history-list">
+            {other.map((a) => (
+              <div className="assessment-history-row" key={a.id}>
+                <div>
+                  <strong>{label(a)}</strong>
+                  <small>{date(a.finished)}</small>
+                </div>
+                <strong>
+                  {a.overall ?? "—"}
+                  <small>/ 100</small>
+                </strong>
+                <span
+                  className={
+                    "status-pill " +
+                    (a.review_decision === "approved"
+                      ? "status-valid"
+                      : a.review_decision === "invalidated"
+                        ? "status-invalid"
+                        : "status-review")
+                  }
+                >
+                  {status(a)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -3855,6 +4790,7 @@ function CandidatePortal({ st, refresh, tick, setTick, onLogout }) {
                   await refresh();
                 }}
               />
+              <CandidateAssessmentResults attempts={st.attempts} />
             </>
           )}
           {section === "jobs" && (
@@ -4068,6 +5004,9 @@ function AdminConsole({ onLogout }) {
   const [creatingAdmin, setCreatingAdmin] = useState(false);
   const [integrityDetail, setIntegrityDetail] = useState(null),
     [integrityLoading, setIntegrityLoading] = useState(false);
+  const [honestyDraft, setHonestyDraft] = useState({ score: "", reason: "" });
+  const [honestyBusy, setHonestyBusy] = useState(false);
+  const [honestyError, setHonestyError] = useState("");
   const [integrityStatus, setIntegrityStatus] = useState("all"),
     [integrityKind, setIntegrityKind] = useState("all"),
     [integrityTrust, setIntegrityTrust] = useState("all");
@@ -4341,14 +5280,54 @@ function AdminConsole({ onLogout }) {
   const openIntegrityDetail = async (id) => {
     setIntegrityLoading(true);
     setIntegrityDetail(null);
+    setHonestyError("");
     try {
-      setIntegrityDetail(
-        await api("/admin/integrity/attempts/" + encodeURIComponent(id)),
+      const detail = await api(
+        "/admin/integrity/attempts/" + encodeURIComponent(id),
       );
+      setIntegrityDetail(detail);
+      setHonestyDraft({
+        score: String(detail.honesty?.score ?? ""),
+        reason: detail.honesty?.reason || "",
+      });
     } catch (x) {
       setError(x.message || "Could not load attempt details.");
     } finally {
       setIntegrityLoading(false);
+    }
+  };
+  const saveHonesty = async (decision) => {
+    if (!integrityDetail) return;
+    setHonestyBusy(true);
+    setHonestyError("");
+    try {
+      const next = await api(
+        "/admin/integrity/attempts/" +
+          encodeURIComponent(integrityDetail.id) +
+          "/honesty",
+        {
+          method: "POST",
+          body: {
+            score: honestyDraft.score === "" ? null : Number(honestyDraft.score),
+            decision,
+            reason: honestyDraft.reason.trim(),
+          },
+        },
+      );
+      setIntegrityDetail((current) =>
+        current ? { ...current, honesty: next.honesty } : current,
+      );
+      setHonestyDraft({
+        score: String(next.honesty.score),
+        reason: next.honesty.reason || "",
+      });
+      // Refresh only the integrity queue instead of every admin endpoint.
+      const list = await api("/admin/integrity/attempts");
+      setData((prev) => ({ ...prev, integrity: list }));
+    } catch (x) {
+      setHonestyError(x.message || "Could not save the honesty score.");
+    } finally {
+      setHonestyBusy(false);
     }
   };
   const submitAction = async (e) => {
@@ -4720,6 +5699,103 @@ function AdminConsole({ onLogout }) {
       ),
     );
   const stamp = (v) => (v ? new Date(Number(v) * 1000).toLocaleString() : "—");
+  const eventLabel = (type) => ({
+    tab_hidden: "Switched away from exam tab",
+    tab_visible: "Returned to exam tab",
+    blur: "Exam window lost focus",
+    focus: "Exam window focused",
+    fullscreen_exit: "Exited full-screen",
+    fullscreen_enter: "Returned to full-screen",
+    screen_share_stopped: "Screen sharing stopped",
+    screen_share_started: "Screen sharing started",
+    screen_share_unavailable: "Screen sharing unavailable",
+    wrong_share_surface: "Wrong surface shared",
+    camera_stopped: "Webcam disconnected",
+    copy: "Copy shortcut blocked",
+    cut: "Cut shortcut blocked",
+    paste: "Paste shortcut blocked",
+    heartbeat_gap: "Monitoring connection gap",
+    network_ip_changed: "Network address changed",
+    ai_no_face: "No face visible to camera",
+    ai_multiple_faces: "Multiple faces detected",
+    ai_gaze_away: "Possible gaze deviation",
+    ai_phone_detected: "Possible phone detected",
+    ai_audio_level: "Voice detected (microphone)",
+    microphone_stopped: "Microphone disconnected",
+    ai_model_unavailable: "On-device AI unavailable",
+    identity_verified: "Identity verified against profile photo",
+    identity_mismatch: "Identity mismatch against profile photo",
+    identity_skipped: "Identity check skipped",
+  })[type] || String(type || "Unknown event").replaceAll("_", " ");
+  const eventSource = (e) =>
+    String(e.type || "").startsWith("ai_")
+      ? "Local AI · MediaPipe"
+      : String(e.type || "").startsWith("identity_")
+        ? "Local face check · face-api"
+        : e.type === "heartbeat_gap"
+          ? "Connection monitoring"
+          : e.type === "camera_stopped"
+            ? "Webcam status"
+            : "Browser event · server timestamp";
+  const renderIntegrityEvents = (title, events, emptyText) => (
+    <>
+      <h3>{title} ({events.length})</h3>
+      {events.length ? (
+        <div className="ad-table-wrap">
+          <table className="ad-table">
+            <thead>
+              <tr>
+                <th>SERVER TIME</th>
+                <th>ELAPSED</th>
+                <th>EVENT</th>
+                <th>QUESTION</th>
+                <th>INTERRUPTION DURATION</th>
+                <th>SOURCE</th>
+              </tr>
+            </thead>
+            <tbody>
+              {events.map((e) => (
+                <tr key={e.id}>
+                  <td>{stamp(e.server_ts)}</td>
+                  <td>{e.elapsed_label || fmt(Math.floor(e.elapsed_seconds || 0))}</td>
+                  <td>
+                    <b>{eventLabel(e.type)}</b>
+                    <small>{e.type}</small>
+                  </td>
+                  <td>
+                    {e.question_id || "Before / between questions"}
+                    {e.question && <small>{e.question}</small>}
+                  </td>
+                  <td>
+                    {e.duration_status === "instant"
+                      ? "Point-in-time event"
+                      : e.duration_seconds != null
+                        ? Number(e.duration_seconds).toFixed(1) + "s" +
+                          (e.duration_status === "ongoing"
+                            ? " (ongoing)"
+                            : e.duration_status === "measured"
+                              ? " (measured)"
+                              : "")
+                        : "Not recorded"}
+                  </td>
+                  <td>
+                    {eventSource(e)}
+                    {e.metadata?.surface ? " · " + e.metadata.surface : ""}
+                    {typeof e.metadata?.similarity === "number"
+                      ? " · similarity " + e.metadata.similarity + "%"
+                      : ""}
+                    {e.seq ? " · seq " + e.seq : ""}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p>{emptyText}</p>
+      )}
+    </>
+  );
   const pill = (v) => (
     <span
       className={
@@ -4840,6 +5916,11 @@ function AdminConsole({ onLogout }) {
                 <b>{counts.pending_companies}</b>
               ) : id === "jobs" && counts.pending_jobs > 0 ? (
                 <b>{counts.pending_jobs}</b>
+              ) : id === "integrity" &&
+                (data.assessments?.items || []).filter((x) => !x.review_decision).length > 0 ? (
+                <b>
+                  {(data.assessments?.items || []).filter((x) => !x.review_decision).length}
+                </b>
               ) : id === "appeals" && counts.open_appeals > 0 ? (
                 <b>{counts.open_appeals}</b>
               ) : null}
@@ -5717,6 +6798,7 @@ function AdminConsole({ onLogout }) {
                   "STATUS",
                   "SCORE",
                   "TRUST",
+                  "HONESTY",
                   "EVENTS",
                   "REVIEW",
                   "DETAILS",
@@ -5754,6 +6836,10 @@ function AdminConsole({ onLogout }) {
                       <td>
                         {pill(x.trust || "Not scored")}
                         <small>{x.result?.trust_points ?? "—"} points</small>
+                      </td>
+                      <td>
+                        <b>{x.honesty_score ?? "—"}</b>
+                        <small>{x.honesty_status || "pending"}</small>
                       </td>
                       <td>{x.event_count ?? 0}</td>
                       <td>{pill(x.review_decision || "not_reviewed")}</td>
@@ -8094,10 +9180,10 @@ function AdminConsole({ onLogout }) {
                   {integrityDetail.id}
                 </p>
                 <div className="ad-info-banner">
-                  Recorded browser events are client-reported telemetry, not
-                  proof of misconduct. Screen video, camera, microphone, device
-                  identity and full desktop activity are not collected by this
-                  feature.
+                  AI and identity alerts are probabilistic review signals, not
+                  proof of misconduct. Webcam frames are analysed locally; only
+                  limited JPEG snapshots linked to triggered alerts may be stored
+                  temporarily. No continuous video or audio is recorded.
                 </div>
                 <div className="ad-detail-list">
                   <div>
@@ -8136,6 +9222,102 @@ function AdminConsole({ onLogout }) {
                     <b>{integrityDetail.review_decision || "Not reviewed"}</b>
                   </div>
                 </div>
+                <h3>Honesty score</h3>
+                <div className="honesty-review">
+                  <div className="honesty-summary">
+                    <div>
+                      <span>System default</span>
+                      <b>{integrityDetail.honesty?.auto_score ?? "—"}</b>
+                    </div>
+                    <div>
+                      <span>Current score</span>
+                      <b>{integrityDetail.honesty?.score ?? "—"}</b>
+                    </div>
+                    <div>
+                      <span>Status</span>
+                      <b>{pill(integrityDetail.honesty?.status || "pending")}</b>
+                    </div>
+                    <div>
+                      <span>Reviewed</span>
+                      <b>
+                        {integrityDetail.honesty?.reviewed_at
+                          ? stamp(integrityDetail.honesty.reviewed_at)
+                          : "Not reviewed"}
+                      </b>
+                    </div>
+                  </div>
+                  <div className="honesty-form">
+                    <label>
+                      Score (0–100)
+                      <input
+                        type="number"
+                        min="0"
+                        max="100"
+                        value={honestyDraft.score}
+                        onChange={(e) =>
+                          setHonestyDraft((d) => ({ ...d, score: e.target.value }))
+                        }
+                      />
+                    </label>
+                    <label>
+                      Review note
+                      <textarea
+                        rows="2"
+                        maxLength="2000"
+                        placeholder="Why did you adjust or accept this score?"
+                        value={honestyDraft.reason}
+                        onChange={(e) =>
+                          setHonestyDraft((d) => ({ ...d, reason: e.target.value }))
+                        }
+                      />
+                    </label>
+                    <div className="honesty-actions">
+                      <button
+                        type="button"
+                        className="ad-action-btn"
+                        disabled={honestyBusy}
+                        onClick={() => saveHonesty("pending")}
+                      >
+                        {honestyBusy ? "Saving…" : "Save score"}
+                      </button>
+                      <button
+                        type="button"
+                        className="ad-action-btn"
+                        disabled={honestyBusy}
+                        onClick={() => saveHonesty("approved")}
+                      >
+                        Approve honesty
+                      </button>
+                      <button
+                        type="button"
+                        className="ad-action-btn danger"
+                        disabled={honestyBusy}
+                        onClick={() => saveHonesty("rejected")}
+                      >
+                        Reject honesty
+                      </button>
+                    </div>
+                    {honestyError && <p className="err">{honestyError}</p>}
+                    <p className="ad-footnote">
+                      Default score = 100 − (integrity points × 10), capped at 40
+                      when a hard flag exists. Editing or deciding this score never
+                      changes the technical assessment score; use assessment review
+                      for that.
+                    </p>
+                  </div>
+                </div>
+                <h3>Flags detected</h3>
+                {integrityDetail.flags?.length ? (
+                  <div className="honesty-flags">
+                    {integrityDetail.flags.map((f) => (
+                      <span key={f.type} className="honesty-flag">
+                        {eventLabel(f.type)} <b>×{f.count}</b>
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p>No integrity flags recorded for this attempt.</p>
+                )}
                 <h3>Trust reasons</h3>
                 {integrityDetail.integrity?.trust_reasons?.length ? (
                   <ul>
@@ -8156,50 +9338,175 @@ function AdminConsole({ onLogout }) {
                   {integrityDetail.integrity?.trust_hard_flags?.join(", ") ||
                     "None recorded"}
                 </p>
-                <h3>Event timeline ({integrityDetail.events?.length || 0})</h3>
-                {integrityDetail.events?.length ? (
-                  <div className="ad-table-wrap">
-                    <table className="ad-table">
-                      <thead>
-                        <tr>
-                          <th>TIME</th>
-                          <th>EVENT</th>
-                          <th>SOURCE</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {integrityDetail.events.map((e) => (
-                          <tr key={e.id}>
-                            <td>{stamp(e.server_ts)}</td>
-                            <td>{e.type}</td>
-                            <td>Browser-reported event</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                <h3>Integrity activity summary</h3>
+                <div className="ad-detail-list">
+                  <div>
+                    <span>Suspicious-activity signals</span>
+                    <b>
+                      {integrityDetail.events?.filter(
+                        (e) =>
+                          [
+                            "tab_hidden",
+                            "tab_visible",
+                            "blur",
+                            "focus",
+                            "fullscreen_exit",
+                            "fullscreen_enter",
+                            "screen_share_stopped",
+                            "screen_share_started",
+                            "screen_share_unavailable",
+                            "wrong_share_surface",
+                            "copy",
+                            "cut",
+                            "paste",
+                            "identity_mismatch",
+                          ].includes(e.type) ||
+                          String(e.type || "").startsWith("ai_"),
+                      ).length || 0}
+                    </b>
+                  </div>
+                  <div>
+                    <span>AI evidence snapshots</span>
+                    <b>{integrityDetail.evidence?.length || 0}</b>
+                  </div>
+                  <div>
+                    <span>Technical issues</span>
+                    <b>
+                      {integrityDetail.events?.filter((e) =>
+                        e.type !== "heartbeat" &&
+                        ["heartbeat_gap", "camera_stopped", "microphone_stopped", "ai_model_unavailable", "network_ip_changed"].includes(e.type),
+                      ).length || 0}
+                    </b>
+                  </div>
+                </div>
+                {renderIntegrityEvents(
+                  "Suspicious activity signals",
+                  (integrityDetail.events || []).filter(
+                    (e) =>
+                      [
+                        "tab_hidden",
+                        "tab_visible",
+                        "blur",
+                        "focus",
+                        "fullscreen_exit",
+                        "fullscreen_enter",
+                        "screen_share_stopped",
+                        "screen_share_started",
+                        "screen_share_unavailable",
+                        "wrong_share_surface",
+                        "copy",
+                        "cut",
+                        "paste",
+                        "identity_mismatch",
+                      ].includes(e.type) ||
+                      String(e.type || "").startsWith("ai_"),
+                  ),
+                  "No suspicious-activity signals were recorded. These are review signals, not findings of misconduct.",
+                )}
+                {renderIntegrityEvents(
+                  "Technical issues",
+                  (integrityDetail.events || []).filter(
+                    (e) =>
+                      e.type !== "heartbeat" &&
+                      (["heartbeat_gap", "camera_stopped", "microphone_stopped", "ai_model_unavailable", "network_ip_changed"].includes(e.type) ||
+                      ![
+                        "tab_hidden",
+                        "tab_visible",
+                        "blur",
+                        "focus",
+                        "fullscreen_exit",
+                        "fullscreen_enter",
+                        "screen_share_stopped",
+                        "screen_share_started",
+                        "screen_share_unavailable",
+                        "wrong_share_surface",
+                        "copy",
+                        "cut",
+                        "paste",
+                        "identity_mismatch",
+                        "identity_verified",
+                        "identity_skipped",
+                      ].includes(e.type) &&
+                        !String(e.type || "").startsWith("ai_")),
+                  ),
+                  "No technical interruptions were recorded.",
+                )}
+                <h3>AI evidence snapshots ({integrityDetail.evidence?.length || 0})</h3>
+                <p className="ad-footnote">
+                  Snapshots are limited still images captured when an eligible AI
+                  alert fires. They are not continuous video. A missing snapshot
+                  does not mean the alert did not occur: capture or upload may
+                  fail, the image may exceed the size limit, the per-attempt cap
+                  may be reached, or the retention period may have expired.
+                  Confidence is a detector score, not the probability that the
+                  candidate cheated.
+                </p>
+                {integrityDetail.evidence?.length ? (
+                  <div className="ai-evidence-grid">
+                    {integrityDetail.evidence.map((ev) => (
+                      <figure key={ev.id}>
+                        <img src={ev.data_url} alt="AI alert evidence snapshot" />
+                        <figcaption>
+                          {stamp(ev.captured_at)} ·{" "}
+                          {Math.round(ev.size_bytes / 1024)} KB
+                          {ev.vision && (
+                            <span className="evidence-vision">
+                              {ev.vision.phone ? "Phone visible" : "No phone"} ·{" "}
+                              {ev.vision.people}{" "}
+                              {ev.vision.people === 1 ? "person" : "people"} ·{" "}
+                              {ev.vision.face ? "face visible" : "no face"}
+                              {ev.vision.summary ? " — " + ev.vision.summary : ""}
+                            </span>
+                          )}
+                        </figcaption>
+                      </figure>
+                    ))}
                   </div>
                 ) : (
-                  <p>No event records for this attempt.</p>
+                  <p>No retained AI snapshots are available for this attempt.</p>
                 )}
-                <h3>Answer timing</h3>
+                <p className="ad-footnote">
+                  Routine heartbeat pings run every 10 seconds and are not
+                  displayed. A gap over 30 seconds is listed under Technical
+                  issues as a monitoring interruption, not misconduct. Duration
+                  is shown only when a matching return/restoration event exists;
+                  clipboard actions are point-in-time events. AI detections,
+                  including possible gaze deviation, are imperfect signals and
+                  require human review.
+                </p>
+                <h3>Answer timing &amp; responses</h3>
                 {integrityDetail.answers?.length ? (
                   <div className="ad-table-wrap">
                     <table className="ad-table">
                       <thead>
                         <tr>
-                          <th>QUESTION</th>
-                          <th>TOPIC</th>
-                          <th>TYPE</th>
-                          <th>SECONDS</th>
+                          <th># / QUESTION</th>
+                          <th>CANDIDATE ANSWER</th>
+                          <th>TOPIC / TYPE</th>
+                          <th>STARTED</th>
+                          <th>SUBMITTED</th>
+                          <th>TIME TAKEN</th>
                         </tr>
                       </thead>
                       <tbody>
                         {integrityDetail.answers.map((a, i) => (
                           <tr key={i}>
-                            <td>{a.question_id || "—"}</td>
-                            <td>{a.topic || "—"}</td>
-                            <td>{a.type || "—"}</td>
-                            <td>{a.seconds ?? "—"}</td>
+                            <td>
+                              <b>Q{a.question_index ?? i + 1}: {a.question_id || "—"}</b>
+                              <small>{a.question}</small>
+                            </td>
+                            <td style={{ whiteSpace: "pre-wrap", maxWidth: 260 }}>
+                              {a.answer || "No answer text recorded"}
+                            </td>
+                            <td>
+                              {a.topic || "—"}
+                              <small>{a.type || "—"}</small>
+                            </td>
+                            <td>{a.started_at ? stamp(a.started_at) : "—"}</td>
+                            <td>{a.submitted_at ? stamp(a.submitted_at) : "—"}</td>
+                            <td>
+                              {a.seconds == null ? "—" : Number(a.seconds).toFixed(1) + "s"}
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -8211,10 +9518,24 @@ function AdminConsole({ onLogout }) {
                 <h3>Candidate appeal</h3>
                 <p>{integrityDetail.appeal || "No appeal submitted."}</p>
                 <h3>Human review</h3>
-                <p>
-                  {integrityDetail.review_decision || "Not reviewed"} ·{" "}
-                  {integrityDetail.review_reason || "No review note"}
-                </p>
+                <div className="ad-detail-list">
+                  <div>
+                    <span>Decision</span>
+                    <b>{integrityDetail.review_decision || "Pending review"}</b>
+                  </div>
+                  <div>
+                    <span>Reviewer account ID</span>
+                    <b>{integrityDetail.reviewer_id ?? "—"}</b>
+                  </div>
+                  <div>
+                    <span>Reviewed at</span>
+                    <b>{stamp(integrityDetail.reviewed_at)}</b>
+                  </div>
+                  <div>
+                    <span>Review note</span>
+                    <b>{integrityDetail.review_reason || "No review note recorded"}</b>
+                  </div>
+                </div>
                 <p className="ad-footnote">
                   Answer records and technical score remain unchanged by
                   integrity review.

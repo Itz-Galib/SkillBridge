@@ -1517,6 +1517,10 @@ def ensure_admin_console_schema():
         """CREATE TABLE IF NOT EXISTS admin_attempt_reviews (
             attempt_id TEXT PRIMARY KEY, decision TEXT NOT NULL, reason TEXT NOT NULL,
             reviewer_id INTEGER NOT NULL, reviewed_at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS attempt_honesty_reviews (
+            attempt_id TEXT PRIMARY KEY, auto_score INTEGER NOT NULL, score INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', reason TEXT NOT NULL DEFAULT '',
+            reviewer_id INTEGER, reviewed_at REAL, updated_at REAL NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS admin_appeal_decisions (
             attempt_id TEXT PRIMARY KEY, decision TEXT NOT NULL, reason TEXT NOT NULL,
             reviewer_id INTEGER NOT NULL, decided_at REAL NOT NULL)""",
@@ -1692,6 +1696,16 @@ def admin_job_review_queue_v2(user=Depends(current_user)):
     return {"items": [dict(r) for r in rows]}
 
 
+INTEGRITY_FLAG_TYPES = {
+    "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
+    "screen_share_stopped", "screen_share_unavailable", "wrong_share_surface",
+    "camera_stopped", "heartbeat_gap", "network_ip_changed",
+    "ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected",
+    "ai_audio_level", "ai_model_unavailable", "identity_mismatch", "identity_skipped",
+    "microphone_stopped",
+}
+
+
 @router.get("/api/admin/integrity/attempts")
 def admin_integrity_attempts(user=Depends(current_user), q: str = "", status: str = "all", kind: str = "all", trust: str = "all", limit: int = 300):
     admin_only(user, "integrity_review")
@@ -1699,9 +1713,11 @@ def admin_integrity_attempts(user=Depends(current_user), q: str = "", status: st
     query = """SELECT a.id,a.user_id,a.kind,a.status,a.started,a.finished,a.result,a.appeal,
                u.name AS candidate_name,u.email,
                r.decision AS review_decision,r.reason AS review_reason,r.reviewed_at,
+               h.score AS honesty_score,h.status AS honesty_status,
                (SELECT COUNT(*) FROM events e WHERE e.attempt_id=a.id) AS event_count
                FROM attempts a JOIN users u ON u.id=a.user_id
-               LEFT JOIN admin_attempt_reviews r ON r.attempt_id=a.id WHERE 1=1"""
+               LEFT JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+               LEFT JOIN attempt_honesty_reviews h ON h.attempt_id=a.id WHERE 1=1"""
     args = []
     if status in ("active", "done"):
         query += " AND a.status=?"; args.append(status)
@@ -1720,6 +1736,10 @@ def admin_integrity_attempts(user=Depends(current_user), q: str = "", status: st
         except Exception: item["result"] = None
         result = item["result"] or {}
         item["trust"] = result.get("trust", "Not scored")
+        if item.get("honesty_score") is None:
+            item["honesty_score"] = E.honesty_score(
+                result.get("trust_points", 0), result.get("trust_hard_flags") or [])
+        item["honesty_status"] = item.get("honesty_status") or "pending"
         if trust != "all" and item["trust"] != trust:
             continue
         items.append(item)
@@ -1822,15 +1842,98 @@ def admin_integrity_attempt_detail(attempt_id: str, user=Depends(current_user)):
                     answer["answer"] = options[option_index]
             except (TypeError, ValueError):
                 pass
-    evidence_rows = allr("SELECT id,event_id,captured_at,mime_type,image_data,size_bytes,expires_at FROM exam_evidence WHERE attempt_id=? AND expires_at>? ORDER BY captured_at", (attempt_id, time.time()))
-    item["evidence"] = [{
-        "id": e["id"], "event_id": e["event_id"], "captured_at": e["captured_at"],
-        "mime_type": e["mime_type"], "size_bytes": e["size_bytes"],
-        "data_url": "data:" + e["mime_type"] + ";base64," + base64.b64encode(bytes(e["image_data"])).decode("ascii")
-    } for e in evidence_rows]
+    evidence_rows = allr("SELECT id,event_id,captured_at,mime_type,image_data,size_bytes,expires_at,vision_json,vision_model,vision_at FROM exam_evidence WHERE attempt_id=? AND expires_at>? ORDER BY captured_at", (attempt_id, time.time()))
+    item["evidence"] = []
+    for e in evidence_rows:
+        try:
+            vision = json.loads(e["vision_json"]) if e.get("vision_json") else None
+        except Exception:
+            vision = None
+        item["evidence"].append({
+            "id": e["id"], "event_id": e["event_id"], "captured_at": e["captured_at"],
+            "mime_type": e["mime_type"], "size_bytes": e["size_bytes"],
+            "data_url": "data:" + e["mime_type"] + ";base64," + base64.b64encode(bytes(e["image_data"])).decode("ascii"),
+            "vision": vision, "vision_model": e.get("vision_model"), "vision_at": e.get("vision_at"),
+        })
     item["integrity"] = item["result"] or {}
+    integrity = item["integrity"] or {}
+    auto_score = E.honesty_score(
+        integrity.get("trust_points", 0), integrity.get("trust_hard_flags") or [])
+    honesty = one("""SELECT auto_score,score,status,reason,reviewer_id,reviewed_at,updated_at
+                     FROM attempt_honesty_reviews WHERE attempt_id=?""", (attempt_id,))
+    item["honesty"] = {
+        "auto_score": honesty["auto_score"] if honesty else auto_score,
+        "score": honesty["score"] if honesty else auto_score,
+        "source": "admin" if honesty else "system",
+        "status": honesty["status"] if honesty else "pending",
+        "reason": honesty["reason"] if honesty else "",
+        "reviewer_id": honesty["reviewer_id"] if honesty else None,
+        "reviewed_at": honesty["reviewed_at"] if honesty else None,
+    }
+    flag_counts = {}
+    for event in item["events"]:
+        if event["type"] in INTEGRITY_FLAG_TYPES:
+            flag_counts[event["type"]] = flag_counts.get(event["type"], 0) + 1
+    item["flags"] = [{"type": key, "count": value} for key, value in sorted(flag_counts.items())]
     audit(user["id"], "integrity_attempt_viewed", attempt_id)
     return item
+
+
+class HonestyReviewInput(BaseModel):
+    score: Optional[int] = Field(default=None, ge=0, le=100)
+    decision: str = Field(default="pending")
+    reason: str = Field(default="", max_length=2000)
+
+
+@router.post("/api/admin/integrity/attempts/{attempt_id}/honesty")
+def admin_honesty_review(attempt_id: str, body: HonestyReviewInput, user=Depends(current_user)):
+    """Store, edit, approve or reject the advisory honesty score for one attempt.
+
+    The honesty score is an integrity review signal. It never changes the
+    assessment score by itself; the technical score only changes through the
+    existing assessment-review endpoint.
+    """
+    admin_only(user, "integrity_review")
+    if body.decision not in ("pending", "approved", "rejected"):
+        raise HTTPException(422, "Unsupported honesty decision")
+    row = one("SELECT id,result FROM attempts WHERE id=?", (attempt_id,))
+    if not row:
+        raise HTTPException(404, "Assessment attempt not found")
+    try:
+        result = json.loads(row["result"]) if row["result"] else {}
+    except Exception:
+        result = {}
+    auto_score = E.honesty_score(
+        result.get("trust_points", 0), result.get("trust_hard_flags") or [])
+    existing = one("""SELECT score,status,reason,reviewer_id,reviewed_at
+                      FROM attempt_honesty_reviews WHERE attempt_id=?""", (attempt_id,))
+    score = int(body.score) if body.score is not None else (
+        int(existing["score"]) if existing else auto_score)
+    decision = body.decision
+    reason = body.reason.strip()
+    if decision in ("approved", "rejected") and len(reason) < 3:
+        raise HTTPException(422, "A reason is required to approve or reject the honesty score")
+    now = time.time()
+    reviewed_at = None
+    reviewer_id = user["id"]
+    if decision == "pending" and existing:
+        reviewed_at = existing["reviewed_at"]
+        reviewer_id = existing["reviewer_id"] or user["id"]
+    elif decision != "pending":
+        reviewed_at = now
+    run("""INSERT INTO attempt_honesty_reviews
+               (attempt_id,auto_score,score,status,reason,reviewer_id,reviewed_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(attempt_id) DO UPDATE SET auto_score=excluded.auto_score,
+               score=excluded.score,status=excluded.status,reason=excluded.reason,
+               reviewer_id=excluded.reviewer_id,reviewed_at=excluded.reviewed_at,
+               updated_at=excluded.updated_at""",
+        (attempt_id, auto_score, score, decision, reason, reviewer_id, reviewed_at, now))
+    audit(user["id"], "exam_honesty_reviewed", f"{attempt_id}:{decision}:{score}:{reason[:200]}")
+    return {"attempt_id": attempt_id, "honesty": {
+        "auto_score": auto_score, "score": score, "source": "admin",
+        "status": decision, "reason": reason,
+        "reviewer_id": reviewer_id, "reviewed_at": reviewed_at}}
 
 
 @router.get("/api/admin/assessment-reviews")

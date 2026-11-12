@@ -199,3 +199,10 @@ def test_ai_proctor_signals_are_capped_advisory_and_never_hard_flags():
     assert reasons["ai_phone_detected"]["advisory"] is True
     assert result["hard_flags"] == []
     assert result["label"] != "Needs review"
+
+def test_honesty_score_default_is_advisory_and_bounded():
+    assert honesty_score(0) == 100
+    assert honesty_score(2.5) == 75
+    assert honesty_score(50) == 0
+    assert honesty_score(3, ["identity_mismatch"]) == 40
+    assert honesty_score(None, []) == 100
