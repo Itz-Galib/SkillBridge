@@ -3,14 +3,15 @@
 Scores come from stored answer keys + deterministic server logic. For descriptive
 answers an AI-assisted hybrid draft is advisory only: every mark stays pending
 until a human administrator approves or edits it."""
-import os, io, re, json, time, uuid, base64, hmac, hashlib, secrets, sqlite3, zipfile, logging
+import os, io, re, json, time, uuid, base64, hmac, hashlib, secrets, sqlite3, zipfile, logging, asyncio
 from datetime import date
 from pathlib import Path
 from typing import Optional, List
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form, Request
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -23,6 +24,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 COOLDOWN_HOURS = float(os.getenv("RETEST_COOLDOWN_HOURS", "0"))   # spec default is 14 days (336h); 0 for demos
 MAX_ATTEMPTS_90D = int(os.getenv("MAX_ATTEMPTS_90D", "3"))
+UNLIMITED_EXAM_EMAILS = {"i@gmail.com"}
+EVIDENCE_RETENTION_DAYS = max(1, min(90, int(os.getenv("EVIDENCE_RETENTION_DAYS", "30"))))
+MAX_EVIDENCE_BYTES = 180 * 1024
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-5-5")
 CONSENT_VERSION = "r0-2"
@@ -45,8 +49,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT, salt TEXT, pw_hash TEXT, created REAL);
 CREATE TABLE IF NOT EXISTS consents(id INTEGER PRIMARY KEY, user_id INT, version TEXT, lang TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY, redacted TEXT, redaction TEXT, extracted TEXT, source TEXT, confirmed TEXT);
-CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, user_id INT, kind TEXT, seed INT, status TEXT, state TEXT, started REAL, finished REAL, result TEXT, appeal TEXT);
-CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, attempt_id TEXT, type TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY, user_id INT, kind TEXT, seed INT, status TEXT, state TEXT, started DOUBLE PRECISION, finished DOUBLE PRECISION, result TEXT, appeal TEXT, session_id TEXT, last_event_seq INTEGER NOT NULL DEFAULT 0, last_heartbeat DOUBLE PRECISION, session_ip TEXT, session_ua TEXT);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, attempt_id TEXT, type TEXT, ts DOUBLE PRECISION, question_id TEXT, question_index INTEGER, seq INTEGER, client_ts DOUBLE PRECISION, metadata TEXT);
 CREATE TABLE IF NOT EXISTS passports(id TEXT PRIMARY KEY, user_id INT, payload TEXT, signature TEXT, created REAL, revoked INT DEFAULT 0, source_attempt TEXT);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL, actor INT, action TEXT, target TEXT);
 CREATE TABLE IF NOT EXISTS user_roles(user_id INTEGER PRIMARY KEY, role TEXT NOT NULL DEFAULT 'candidate');
@@ -119,6 +123,50 @@ def init_db():
             schema = schema.replace("events(id INTEGER PRIMARY KEY", "events(id BIGSERIAL PRIMARY KEY")
             schema = schema.replace("audit(id INTEGER PRIMARY KEY", "audit(id BIGSERIAL PRIMARY KEY")
         c.executescript(schema)
+        c.execute("CREATE TABLE IF NOT EXISTS exam_evidence(id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, event_id INTEGER, captured_at REAL NOT NULL, mime_type TEXT NOT NULL, image_data BYTEA NOT NULL, size_bytes INTEGER NOT NULL, expires_at REAL NOT NULL)")
+        # Additive migration for existing databases.
+        if DATABASE_URL:
+            event_columns = {row["column_name"] for row in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='events'").fetchall()}
+        else:
+            event_columns = {row["name"] for row in c.execute("PRAGMA table_info(events)").fetchall()}
+        if "question_id" not in event_columns:
+            c.execute("ALTER TABLE events ADD COLUMN question_id TEXT")
+        for column, definition in {
+            "question_id": "TEXT", "question_index": "INTEGER", "seq": "INTEGER",
+            "client_ts": "REAL", "metadata": "TEXT"
+        }.items():
+            if column not in event_columns:
+                c.execute(f"ALTER TABLE events ADD COLUMN {column} {definition}")
+        if DATABASE_URL:
+            attempt_columns = {row["column_name"] for row in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='attempts'").fetchall()}
+        else:
+            attempt_columns = {row["name"] for row in c.execute("PRAGMA table_info(attempts)").fetchall()}
+        for column, definition in {
+            "session_id": "TEXT", "last_event_seq": "INTEGER NOT NULL DEFAULT 0",
+            "last_heartbeat": "REAL", "session_ip": "TEXT", "session_ua": "TEXT"
+        }.items():
+            if column not in attempt_columns:
+                c.execute(f"ALTER TABLE attempts ADD COLUMN {column} {definition}")
+
+        # PostgreSQL REAL cannot preserve sub-minute Unix timestamp precision at
+        # current epoch magnitudes. Promote existing proctoring timestamp columns
+        # to DOUBLE PRECISION; SQLite already stores these values as floating point.
+        if DATABASE_URL:
+            timestamp_columns = {
+                "attempts": ("started", "finished", "last_heartbeat"),
+                "events": ("ts", "client_ts"),
+            }
+            for table, columns in timestamp_columns.items():
+                types = {row["column_name"]: row["data_type"] for row in c.execute(
+                    f"SELECT column_name, data_type FROM information_schema.columns "
+                    f"WHERE table_schema=current_schema() AND table_name='{table}'"
+                ).fetchall()}
+                for column in columns:
+                    if types.get(column) == "real":
+                        c.execute(
+                            f"ALTER TABLE {table} ALTER COLUMN {column} "
+                            f"TYPE DOUBLE PRECISION USING {column}::double precision"
+                        )
     if DATABASE_URL:
         profile_columns = {
             row["column_name"]
@@ -264,8 +312,33 @@ app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http
                    allow_methods=["*"], allow_headers=["*"])
 
 
+async def _purge_expired_exam_evidence():
+    while True:
+        try:
+            run("DELETE FROM exam_evidence WHERE expires_at<?", (time.time(),))
+        except Exception:
+            log.exception("Could not purge expired exam evidence")
+        await asyncio.sleep(3600)
+
+
+_evidence_cleanup_task = None
+
+
 @app.on_event("startup")
-def _startup(): init_db()
+async def _startup():
+    global _evidence_cleanup_task
+    init_db()
+    _evidence_cleanup_task = asyncio.create_task(_purge_expired_exam_evidence())
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    if _evidence_cleanup_task:
+        _evidence_cleanup_task.cancel()
+        try:
+            await _evidence_cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/api/health")
@@ -487,8 +560,45 @@ def state(u=Depends(current_user)):
     if candidate_profile:
         profile_skills = json.loads(candidate_profile["skills"] or "[]")
         skill_entries = profile_skill_entries({"skills": profile_skills})
-    atts = allr("SELECT id,kind,status,result,finished FROM attempts WHERE user_id=? ORDER BY started", (u["id"],))
-    pp = allr("SELECT id,created,revoked,source_attempt FROM passports WHERE user_id=? ORDER BY created DESC", (u["id"],))
+    atts = allr("""SELECT a.id,a.kind,a.status,a.result,a.finished,
+                   r.decision AS review_decision,r.reason AS review_reason,r.reviewed_at,
+                   a.appeal,d.decision AS appeal_decision,d.reason AS appeal_reason,d.decided_at AS appeal_decided_at
+                   FROM attempts a LEFT JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+                   LEFT JOIN admin_appeal_decisions d ON d.attempt_id=a.id
+                   WHERE a.user_id=? ORDER BY a.finished DESC,a.started DESC""", (u["id"],))
+    pp = allr("SELECT id,created,revoked,payload,source_attempt FROM passports WHERE user_id=? ORDER BY created DESC", (u["id"],))
+    attempt_items = []
+    for a in atts:
+        try:
+            result = json.loads(a["result"]) if a["result"] else {}
+        except Exception:
+            result = {}
+        attempt_items.append({
+            "id": a["id"], "kind": a["kind"], "status": a["status"],
+            "overall": result.get("overall"), "level": result.get("level"),
+            "trust": result.get("trust"), "date": result.get("date"),
+            "finished": a["finished"],
+            "topics": result.get("topics", {}),
+            "review_decision": a["review_decision"], "review_reason": a["review_reason"],
+            "reviewed_at": a["reviewed_at"], "appeal": a["appeal"],
+            "appeal_decision": a["appeal_decision"], "appeal_reason": a["appeal_reason"],
+            "appeal_decided_at": a["appeal_decided_at"],
+        })
+    passport_items = []
+    for p in pp:
+        payload = json.loads(p["payload"])
+        attempt_id = p["source_attempt"] or payload.get("assessment", {}).get("attempt_id") or payload.get("attempt_id")
+        reviewed = bool(attempt_id and one(
+            """SELECT 1 FROM attempts a JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+               WHERE a.id=? AND a.user_id=? AND a.status='done' AND r.decision='approved'""",
+            (attempt_id, u["id"]),
+        ))
+        passport_items.append({
+            "id": p["id"], "created": p["created"], "revoked": bool(p["revoked"]),
+            "reviewed": reviewed,
+            "source_attempt": p["source_attempt"],
+            "auto": bool(p["source_attempt"]),
+        })
     return {
         "user": {"name": u["name"], "email": u["email"]},
         "consented": bool(one("SELECT 1 FROM consents WHERE user_id=? AND version=?", (u["id"], CONSENT_VERSION))),
@@ -501,10 +611,8 @@ def state(u=Depends(current_user)):
             entry["name"] for entry in skill_entries if not entry["id"]
         ],
         **avatar_metadata(u["id"]),
-        "attempts": [{"id": a["id"], "kind": a["kind"], "status": a["status"], "finished": a["finished"], "overall": (json.loads(a["result"])["overall"] if a["result"] else None)} for a in atts],
-        "passports": [{"id": p["id"], "created": p["created"], "revoked": bool(p["revoked"]),
-                       "source_attempt": p["source_attempt"],
-                       "auto": bool(p["source_attempt"])} for p in pp],
+        "attempts": attempt_items,
+        "passports": passport_items,
     }
 
 
@@ -2634,13 +2742,21 @@ def sync_skill_question_edges():
     return len(edges)
 
 
-def view(att):
+def unlimited_exam_user(uid):
+    user = one("SELECT email FROM users WHERE id=?", (uid,))
+    return bool(user and (user["email"] or "").strip().lower() in UNLIMITED_EXAM_EMAILS)
+
+
+def view(att, include_session=False):
     st = json.loads(att["state"])
+    unlimited_time = unlimited_exam_user(att["user_id"])
+    session = {"session_id": att.get("session_id") if include_session else None,
+               "last_event_seq": int(att.get("last_event_seq") or 0)}
     if st.get("graphrag"):
         import graphrag as G
         questions = st["selected_questions"]
         duration = int(st["duration_seconds"])
-        remaining = max(0, int(att["started"] + duration - time.time()))
+        remaining = 0 if unlimited_time else max(0, int(att["started"] + duration - time.time()))
         index = int(st.get("question_index", 0))
         current = questions[index] if questions else None
         page = G.question_page(questions, index // G.QUESTION_PAGE_SIZE, st.get("answers", {}))
@@ -2658,11 +2774,12 @@ def view(att):
             "remaining": remaining, "answered": len(st.get("answers", {})), "total": len(questions),
             "graphrag": True, "blueprint_id": st["blueprint_id"], "question": public,
             "page": page, "question_index": index, "duration_seconds": duration,
+            "unlimited_time": unlimited_time, **session,
             "manual_review_count": sum(1 for q in questions if not (
                 str(q.get("question_type", "")).lower() in ("mcq", "multiple choice") or
                 ("sql" in str(q.get("question_type", "")).lower() and bool(str(q.get("reference_answer", "")).strip()))))}
-    remaining = max(0, int(att["started"] + E.TEST_SECONDS - time.time()))
-    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "answered": len(st["answers"]), "total": len(E.SLOTS)}
+    remaining = 0 if unlimited_time else max(0, int(att["started"] + E.TEST_SECONDS - time.time()))
+    out = {"attempt_id": att["id"], "kind": att["kind"], "status": att["status"], "remaining": remaining, "unlimited_time": unlimited_time, "answered": len(st["answers"]), "total": len(E.SLOTS), **session}
     if att["status"] == "active" and st["current"]:
         out["question"] = E.public_question(QBYID[st["current"]], st)
     return out
@@ -2969,13 +3086,18 @@ class StartAttempt(BaseModel):
 @app.post("/api/attempts")
 def start_attempt(b: Optional[StartAttempt] = None, u=Depends(current_user)):
     need_consent(u)
+    unlimited_time = (u.get("email") or "").strip().lower() in UNLIMITED_EXAM_EMAILS
     act = one("SELECT * FROM attempts WHERE user_id=? AND status='active'", (u["id"],))
     if act:
-        if time.time() > act["started"] + E.TEST_SECONDS + E.GRACE:
+        if not unlimited_time and time.time() > act["started"] + E.TEST_SECONDS + E.GRACE:
             finalize(dict(act), json.loads(act["state"]))
         else:
-            return view(dict(act))                       # resume after a dropped connection
-
+            # A fresh page/session takes ownership; the previous tab is rejected from this point.
+            sid = secrets.token_urlsafe(32)
+            now = time.time()
+            run("UPDATE attempts SET session_id=?,last_event_seq=0,last_heartbeat=? WHERE id=?", (sid, now, act["id"]))
+            act = get_att(act["id"], u["id"])
+            return view(dict(act), include_session=True)  # resume while invalidating any older tab
     seed = secrets.randbelow(10**9)
     if b and b.blueprint_id:
         blueprint = one("SELECT status,payload FROM assessment_blueprints WHERE id=? AND user_id=?",
@@ -2997,6 +3119,7 @@ def start_attempt(b: Optional[StartAttempt] = None, u=Depends(current_user)):
         q = E.pick_question(st, seen_before(u["id"]))
         st["current"], st["served_at"] = q["id"], time.time()
     aid = uuid.uuid4().hex[:12]
+    session_id = secrets.token_urlsafe(32)
     now = time.time()
     # Serialize attempt creation per candidate. This prevents double-clicks or
     # parallel requests from opening two active exams or spending one credit twice.
@@ -3033,8 +3156,8 @@ def start_attempt(b: Optional[StartAttempt] = None, u=Depends(current_user)):
             balance = int(balance_row["balance"] or 0)
             if balance < credit_cost:
                 raise HTTPException(402, "retake_credit_required")
-        conn.execute("INSERT INTO attempts(id,user_id,kind,seed,status,state,started) VALUES (?,?,?,?,?,?,?)",
-                     (aid, u["id"], kind, seed, "active", json.dumps(st), now))
+        conn.execute("INSERT INTO attempts(id,user_id,kind,seed,status,state,started,session_id,last_heartbeat,session_ip,session_ua) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     (aid, u["id"], kind, seed, "active", json.dumps(st), now, session_id, now, "", ""))
         # Record ASKED_QUESTION graph edges for the retake filter (GraphRAG knows the
         # full question set up-front; the adaptive flow records its questions on answer).
         if st.get("graphrag"):
@@ -3048,7 +3171,7 @@ def start_attempt(b: Optional[StartAttempt] = None, u=Depends(current_user)):
                          (uuid.uuid4().hex, u["id"], -credit_cost, "retake_consumption", aid,
                           "Retake credit consumed for official assessment attempt", u["id"], now))
     audit(u["id"], "attempt_start", aid)
-    return view(get_att(aid, u["id"]))
+    return view(get_att(aid, u["id"]), include_session=True)
 
 @app.get("/api/attempts/{aid}")
 def get_attempt(aid: str, u=Depends(current_user)): return view(get_att(aid, u["id"]))
@@ -3057,6 +3180,10 @@ def get_attempt(aid: str, u=Depends(current_user)): return view(get_att(aid, u["
 class Ans(BaseModel):
     question_id: str
     answer: Optional[str] = None
+    session_id: Optional[str] = None
+
+class QuitAttempt(BaseModel):
+    session_id: str = Field(min_length=20, max_length=100)
 
 
 @app.post("/api/attempts/{aid}/answer")
@@ -3065,7 +3192,7 @@ def answer(aid: str, b: Ans, u=Depends(current_user)):
     if att["status"] != "active": raise HTTPException(409, "Attempt already finished")
     require_screen_share(aid)
     st = json.loads(att["state"])
-    if time.time() > att["started"] + E.TEST_SECONDS + E.GRACE:      # server owns the timer
+    if not unlimited_exam_user(u["id"]) and time.time() > att["started"] + E.TEST_SECONDS + E.GRACE:      # server owns the timer
         finalize(att, st); return view(get_att(aid, u["id"]))
     if st.get("graphrag"):
         question = next((q for q in st["selected_questions"] if q["id"] == b.question_id), None)
@@ -3083,9 +3210,13 @@ def answer(aid: str, b: Ans, u=Depends(current_user)):
         st["current"] = b.question_id
         save(aid, st)
         return view(get_att(aid, u["id"]))
+    _check_exam_session(att, b.session_id)
     if b.question_id != st["current"]: raise HTTPException(409, "Question mismatch")
     q = QBYID[st["current"]]
-    E.record_answer(st, q, b.answer, time.time() - (st["served_at"] or time.time()))
+    submitted_at = time.time()
+    served_at = float(st.get("served_at") or submitted_at)
+    E.record_answer(st, q, b.answer, submitted_at - served_at, answer_text=b.answer,
+                    started_at=served_at, submitted_at=submitted_at)
     if st["index"] >= len(E.SLOTS):
         finalize(att, st)
     else:
@@ -3143,7 +3274,19 @@ def submit_graphrag_attempt(aid: str, u=Depends(current_user)):
 
 
 class SqlRun(BaseModel):
-    sql: str
+    sql: str = Field(max_length=12000)
+    session_id: Optional[str] = None
+
+
+@app.post("/api/attempts/{aid}/quit")
+def quit_attempt(aid: str, b: QuitAttempt, u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    _check_exam_session(att, b.session_id)
+    run("UPDATE attempts SET status='quit', finished=? WHERE id=? AND status='active'", (time.time(), aid))
+    audit(u["id"], "attempt_quit", aid)
+    return {"status": "quit"}
 
 
 @app.post("/api/attempts/{aid}/sql-run")
@@ -3157,30 +3300,175 @@ def sql_run(aid: str, b: SqlRun, u=Depends(current_user)):
             raise HTTPException(409, "No SQL question active")
         return E.run_query(att["seed"], b.sql)
     if att["status"] != "active" or not st["current"] or QBYID[st["current"]]["type"] != "sql": raise HTTPException(409, "No SQL question active")
+    _check_exam_session(att, b.session_id)
+    require_screen_share(aid)
     return E.run_query(att["seed"], b.sql)                  # visible dataset only; scoring uses hidden datasets
+
+
+EVENT_TYPES = {
+    "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
+    "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
+    "fullscreen_enter", "focus", "wrong_share_surface", "camera_stopped", "ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected", "ai_audio_level", "ai_model_unavailable"
+}
+EVENT_META_KEYS = {"surface", "editor", "reason", "visibility", "supported", "confidence", "model", "duration_ms", "local_only"}
 
 
 class Ev(BaseModel):
     type: str = Field(min_length=1, max_length=40)
+    session_id: str = Field(min_length=20, max_length=100)
+    seq: int = Field(ge=1)
+    client_ts: Optional[float] = None
+    metadata: dict = Field(default_factory=dict)
+
+
+class Heartbeat(BaseModel):
+    session_id: str = Field(min_length=20, max_length=100)
+    seq: int = Field(ge=1)
+    client_ts: Optional[float] = None
+
+class BeaconEv(Ev):
+    authorization: str = Field(min_length=20, max_length=4096)
+
+
+def _request_fingerprint(request):
+    return (request.client.host if request.client else "", request.headers.get("user-agent", "")[:300])
+
+
+def _check_exam_session(att, session_id):
+    if not att.get("session_id") or not hmac.compare_digest(str(att["session_id"]), str(session_id or "")):
+        raise HTTPException(409, "exam_session_replaced")
+
+
+def _accept_sequence(att, seq, aid, request, event_type, client_ts=None, metadata=None):
+    now = time.time()
+    _check_exam_session(att, att.get("_provided_session"))
+    last = int(att.get("last_event_seq") or 0)
+    if seq <= last:
+        raise HTTPException(409, "event_sequence_replayed")
+    if seq > last + 100:
+        raise HTTPException(409, "event_sequence_gap")
+    recent = one("SELECT COUNT(*) AS n FROM events WHERE attempt_id=? AND ts>?", (aid, now - 60))
+    if recent and recent["n"] >= 180:
+        raise HTTPException(429, "event_rate_limited")
+    ip, ua = _request_fingerprint(request)
+    prior_ip = att.get("session_ip") or ""
+    if prior_ip and ip and prior_ip != ip:
+        run("INSERT INTO events(attempt_id,type,ts,question_id,question_index,seq,client_ts,metadata) VALUES (?,?,?,?,?,?,?,?)",
+            (aid, "network_ip_changed", now, None, None, None, None, json.dumps({"previous_ip_changed": True})))
+    st = json.loads(att["state"])
+    safe_meta = {k: (v[:100] if isinstance(v, str) else v) for k, v in list((metadata or {}).items())[:8]
+                 if k in EVENT_META_KEYS and isinstance(v, (str, int, float, bool))}
+    run("INSERT INTO events(attempt_id,type,ts,question_id,question_index,seq,client_ts,metadata) VALUES (?,?,?,?,?,?,?,?)",
+        (aid, event_type, now, st.get("current"), st.get("index"), seq,
+         float(client_ts) if client_ts is not None else None, json.dumps(safe_meta)))
+    run("UPDATE attempts SET last_event_seq=?,session_ip=?,session_ua=? WHERE id=?", (seq, ip, ua, aid))
+    return now
 
 
 @app.post("/api/attempts/{aid}/event")
-def event(aid: str, b: Ev, u=Depends(current_user)):
+def event(aid: str, b: Ev, request: Request, u=Depends(current_user)):
     att = get_att(aid, u["id"])
-    allowed = {
-        "copy", "cut", "paste", "blur", "tab_hidden", "tab_visible", "fullscreen_exit",
-        "screen_share_started", "screen_share_stopped", "screen_share_unavailable",
-    }
-    if att["status"] == "active" and b.type in allowed:
-        run("INSERT INTO events(attempt_id,type,ts) VALUES (?,?,?)", (aid, b.type, time.time()))
-    return {"ok": True}
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    if b.type not in EVENT_TYPES:
+        raise HTTPException(422, "unsupported_event_type")
+    att["_provided_session"] = b.session_id
+    now = _accept_sequence(att, b.seq, aid, request, b.type, b.client_ts, b.metadata)
+    return {"ok": True, "server_ts": now, "seq": b.seq}
+
+
+@app.post("/api/attempts/{aid}/event/beacon")
+def event_beacon(aid: str, b: BeaconEv, request: Request):
+    # sendBeacon cannot set Authorization headers; accept the same signed bearer token in its JSON body.
+    u = current_user("Bearer " + b.authorization)
+    att = get_att(aid, u["id"])
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    if b.type not in EVENT_TYPES:
+        raise HTTPException(422, "unsupported_event_type")
+    att["_provided_session"] = b.session_id
+    now = _accept_sequence(att, b.seq, aid, request, b.type, b.client_ts, b.metadata)
+    return {"ok": True, "server_ts": now, "seq": b.seq}
+
+
+@app.post("/api/attempts/{aid}/evidence")
+async def upload_exam_evidence(aid: str, request: Request, session_id: str = Form(...), seq: int = Form(...),
+                              event_type: str = Form(...), confidence: float = Form(...),
+                              image: UploadFile = File(...), u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    _check_exam_session(att, session_id)
+    if event_type not in {"ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected"}:
+        raise HTTPException(422, "unsupported_evidence_event")
+    if not 0 <= confidence <= 1:
+        raise HTTPException(422, "invalid_confidence")
+    if image.content_type != "image/jpeg":
+        raise HTTPException(415, "jpeg_evidence_required")
+    payload = await image.read(MAX_EVIDENCE_BYTES + 1)
+    if not payload or len(payload) > MAX_EVIDENCE_BYTES:
+        raise HTTPException(413, "evidence_too_large")
+    if not payload.startswith(bytes([255, 216, 255])):
+        raise HTTPException(415, "invalid_jpeg")
+    count = one("SELECT COUNT(*) AS n FROM exam_evidence WHERE attempt_id=?", (aid,))
+    if count and count["n"] >= 20:
+        raise HTTPException(429, "evidence_limit_reached")
+    att["_provided_session"] = session_id
+    server_ts = _accept_sequence(att, seq, aid, request, event_type, None,
+                                 {"confidence": round(confidence, 3), "model": "mediapipe_tasks_vision", "local_only": True})
+    evidence_id = uuid.uuid4().hex
+    expires = server_ts + EVIDENCE_RETENTION_DAYS * 86400
+    event_row = one("SELECT id FROM events WHERE attempt_id=? AND seq=? ORDER BY id DESC LIMIT 1", (aid, seq))
+    run("INSERT INTO exam_evidence(id,attempt_id,event_id,captured_at,mime_type,image_data,size_bytes,expires_at) VALUES (?,?,?,?,?,?,?,?)",
+        (evidence_id, aid, event_row["id"] if event_row else None, server_ts, "image/jpeg", payload, len(payload), expires))
+    run("DELETE FROM exam_evidence WHERE expires_at<?", (server_ts,))
+    return {"ok": True, "evidence_id": evidence_id, "server_ts": server_ts, "size_bytes": len(payload), "retention_days": EVIDENCE_RETENTION_DAYS}
+
+
+@app.get("/api/attempts/{aid}/evidence/{evidence_id}")
+def get_own_exam_evidence(aid: str, evidence_id: str, u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    row = one("SELECT mime_type,image_data,expires_at FROM exam_evidence WHERE id=? AND attempt_id=?", (evidence_id, aid))
+    if not row or row["expires_at"] < time.time():
+        raise HTTPException(404, "evidence_not_found")
+    return Response(content=bytes(row["image_data"]), media_type=row["mime_type"], headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/attempts/{aid}/heartbeat")
+def heartbeat(aid: str, b: Heartbeat, request: Request, u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    _check_exam_session(att, b.session_id)
+    now = time.time()
+    previous = float(att.get("last_heartbeat") or att["started"])
+    gap = now - previous
+    att["_provided_session"] = b.session_id
+    _accept_sequence(att, b.seq, aid, request, "heartbeat", b.client_ts, {})
+    if gap > 30:
+        st = json.loads(att["state"])
+        run("INSERT INTO events(attempt_id,type,ts,question_id,question_index,seq,client_ts,metadata) VALUES (?,?,?,?,?,?,?,?)",
+            (aid, "heartbeat_gap", now, st.get("current"), st.get("index"), None, None,
+             json.dumps({"gap_seconds": round(gap, 1), "classification": "monitoring_gap_not_misconduct"})))
+    run("UPDATE attempts SET last_heartbeat=? WHERE id=?", (now, aid))
+    return {"ok": True, "server_ts": now, "gap_seconds": round(gap, 1) if gap > 30 else 0}
 
 
 @app.get("/api/attempts/{aid}/result")
 def result(aid: str, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     if att["status"] != "done": raise HTTPException(409, "Attempt not finished")
-    r = candidate_result(json.loads(att["result"])); r["appeal"] = att["appeal"]; r["attempt_id"] = aid
+    r = candidate_result(json.loads(att["result"]))
+    review = one("SELECT decision,reason,reviewed_at FROM admin_attempt_reviews WHERE attempt_id=?", (aid,))
+    appeal_review = one("SELECT decision,reason,decided_at FROM admin_appeal_decisions WHERE attempt_id=?", (aid,))
+    r.update({
+        "appeal": att["appeal"], "attempt_id": aid,
+        "review_decision": review["decision"] if review else None,
+        "review_reason": review["reason"] if review else None,
+        "reviewed_at": review["reviewed_at"] if review else None,
+        "appeal_decision": appeal_review["decision"] if appeal_review else None,
+        "appeal_reason": appeal_review["reason"] if appeal_review else None,
+    })
     return r
 
 
@@ -3190,7 +3478,14 @@ class Appeal(BaseModel):
 
 @app.post("/api/attempts/{aid}/appeal")
 def appeal(aid: str, b: Appeal, u=Depends(current_user)):
-    get_att(aid, u["id"])
+    att = get_att(aid, u["id"])
+    if att["status"] != "done":
+        raise HTTPException(409, "attempt_not_finished")
+    review = one("SELECT decision FROM admin_attempt_reviews WHERE attempt_id=?", (aid,))
+    if not review or review["decision"] != "invalidated":
+        raise HTTPException(409, "appeal_only_available_for_invalidated_results")
+    if att.get("appeal"):
+        raise HTTPException(409, "appeal_already_submitted")
     run("UPDATE attempts SET appeal=? WHERE id=?", (b.note, aid))     # queued for human review; never changes score automatically
     audit(u["id"], "appeal", aid)
     return {"ok": True}
@@ -3293,24 +3588,31 @@ def create_passport_for_attempt(user_id, attempt_id, *, issued_by="admin_approve
 
 
 class PassBody(BaseModel):
-    topics: List[str]
+    attempt_id: str = Field(min_length=1, max_length=100)
+    topics: List[str] = Field(default_factory=list)
     show_name: bool = False
 
 
 @app.post("/api/passport")
 def make_passport(b: PassBody, u=Depends(current_user)):
     need_consent(u)
-    a = latest_done(u["id"])
-    if not a: raise HTTPException(409, "Take the assessment first")
+    a = one("""SELECT a.*,r.reviewed_at FROM attempts a JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+               WHERE a.id=? AND a.user_id=? AND a.status='done' AND r.decision='approved'""",
+            (b.attempt_id, u["id"]))
+    if not a:
+        raise HTTPException(409, "passport_requires_approved_reviewed_assessment")
     r = json.loads(a["result"])
+    topic_keys = list(b.topics) if b.topics else list((r.get("topics") or {}).keys())
     skills = [{"skill": t, "name": TAXONOMY.get(t, {}).get("name", t.replace("_", " ").title()), "score": r["topics"][t]["score"], "level": r["topics"][t]["level"], "trust": r["trust"], "date": r["date"]}
-              for t in b.topics if t in r["topics"]]
+              for t in topic_keys if t in (r.get("topics") or {})]
     if not skills: raise HTTPException(422, "Choose at least one verified skill")
     up = uplift(u)
     pid = secrets.token_urlsafe(9)
     payload = {"pid": pid, "issued": time.strftime("%Y-%m-%d"), "expires": time.strftime("%Y-%m-%d", time.localtime(time.time() + 365 * 86400)),
                "holder": u["name"] if b.show_name else "Anonymous candidate", "skills": skills,
                "attempt_id": a["id"], "verification": "candidate_selected",
+               "assessment": {"attempt_id": a["id"], "overall": r.get("overall"), "review_decision": "approved",
+                              "reviewed_at": a["reviewed_at"], "kind": a["kind"]},
                "uplift": up["overall"] if up["available"] else None, "issuer": "SkillBridge Global R0 prototype"}
     run("INSERT INTO passports(id,user_id,payload,signature,created,source_attempt) VALUES (?,?,?,?,?,?)",
         (pid, u["id"], json.dumps(payload), E.sign_payload(payload, SECRET), time.time(), a["id"]))
@@ -3334,7 +3636,17 @@ def public_passport(pid: str):
     payload = json.loads(p["payload"])
     valid = hmac.compare_digest(p["signature"], E.sign_payload(payload, SECRET))
     if p["revoked"]: return {"revoked": True, "signature_valid": valid}
-    return {"revoked": False, "expired": payload["expires"] < time.strftime("%Y-%m-%d"), "signature_valid": valid, "signature": p["signature"][:16], "passport": payload}
+    assessment = payload.get("assessment", {})
+    attempt_id = assessment.get("attempt_id") or payload.get("attempt_id") or p.get("source_attempt")
+    current_review = one("""SELECT 1 FROM attempts a JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+                            WHERE a.id=? AND a.user_id=? AND a.status='done' AND r.decision='approved'""",
+                         (attempt_id, p["user_id"])) if attempt_id else None
+    if not current_review:
+        return {"revoked": True, "review_required": True, "signature_valid": valid}
+    public_payload = payload
+    if isinstance(assessment, dict):
+        public_payload = {**payload, "assessment": {key: value for key, value in assessment.items() if key != "attempt_id"}}
+    return {"revoked": False, "expired": payload["expires"] < time.strftime("%Y-%m-%d"), "signature_valid": valid, "signature": p["signature"][:16], "passport": public_payload}
 
 
 # Initialise the base schema before enterprise/admin modules create their extension tables.

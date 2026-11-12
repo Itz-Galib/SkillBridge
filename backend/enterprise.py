@@ -1,5 +1,5 @@
 """Initial hiring workflow APIs for SkillBridge PRD."""
-import json, time, uuid, os, re, secrets, csv, io, logging
+import json, time, uuid, os, re, secrets, csv, io, logging, base64
 from typing import Annotated, Optional, List, Literal
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -1718,7 +1718,8 @@ def admin_integrity_attempts(user=Depends(current_user), q: str = "", status: st
         item = dict(row)
         try: item["result"] = json.loads(item["result"]) if item["result"] else None
         except Exception: item["result"] = None
-        item["trust"] = (item["result"] or {}).get("trust", "Not scored")
+        result = item["result"] or {}
+        item["trust"] = result.get("trust", "Not scored")
         if trust != "all" and item["trust"] != trust:
             continue
         items.append(item)
@@ -1755,14 +1756,78 @@ def admin_integrity_attempt_detail(attempt_id: str, user=Depends(current_user)):
         } for qid, answer in raw_answers.items()]
     else:
         item["answers"] = [{
-            "question_id": a.get("qid"), "topic": a.get("topic"), "type": a.get("type"),
-            "difficulty": a.get("difficulty"), "seconds": a.get("seconds"), "answered": True,
-        } for a in raw_answers if isinstance(a, dict)]
+            "question_id": a.get("qid"), "question_index": i + 1,
+            "question": QBYID.get(a.get("qid"), {}).get("prompt", "Question text unavailable"),
+            "topic": a.get("topic"), "type": a.get("type"), "difficulty": a.get("difficulty"),
+            "answer": a.get("answer", ""), "seconds": a.get("seconds"),
+            "started_at": a.get("started_at"), "submitted_at": a.get("submitted_at"), "answered": True,
+        } for i, a in enumerate(raw_answers) if isinstance(a, dict)]
     item.pop("state", None)
     item["events"] = [dict(e) for e in allr(
-        "SELECT id,type,ts AS server_ts FROM events WHERE attempt_id=? ORDER BY ts,id",
+        "SELECT id,type,ts AS server_ts,question_id,question_index,seq,client_ts,metadata FROM events WHERE attempt_id=? ORDER BY ts,id",
         (attempt_id,)
     )]
+    for event in item["events"]:
+        try: event["metadata"] = json.loads(event.get("metadata") or "{}")
+        except Exception: event["metadata"] = {}
+    interval_pairs = {"tab_hidden": "tab_visible", "blur": "focus", "fullscreen_exit": "fullscreen_enter", "screen_share_stopped": "screen_share_started", "screen_share_unavailable": "screen_share_started"}
+    pending = {}
+    now_ts = time.time()
+    for event in item["events"]:
+        question = QBYID.get(event.get("question_id"))
+        event["question"] = question.get("prompt") if question else None
+        # All database timestamps are Unix seconds. Normalize legacy millisecond
+        # values defensively so old attempts cannot collapse to 00:00.
+        started_ts = float(item.get("started") or 0)
+        event_ts = float(event.get("server_ts") or 0)
+        if started_ts > 100_000_000_000:
+            started_ts /= 1000
+        if event_ts > 100_000_000_000:
+            event_ts /= 1000
+        event["elapsed_seconds"] = round(max(0, event_ts - started_ts), 1)
+        event["elapsed_label"] = (
+            f"{int(event['elapsed_seconds'] // 3600):02d}:"
+            f"{int((event['elapsed_seconds'] % 3600) // 60):02d}:"
+            f"{int(event['elapsed_seconds'] % 60):02d}"
+        )
+        event["duration_seconds"] = None
+        event["duration_status"] = "instant" if event["type"] in {"copy", "cut", "paste"} else None
+        if event["type"] in interval_pairs:
+            pending.setdefault(event["type"], []).append(event)
+        else:
+            for start_type, end_type in interval_pairs.items():
+                starts = pending.get(start_type) or []
+                if end_type == event["type"] and starts:
+                    start_event = starts.pop(0)
+                    duration = round(max(0, float(event["server_ts"]) - float(start_event["server_ts"])), 1)
+                    start_event["duration_seconds"] = duration
+                    start_event["duration_status"] = "measured"
+                    event["duration_seconds"] = duration
+                    event["duration_status"] = "interval_end"
+                    break
+    for starts in pending.values():
+        for start_event in starts:
+            if item["status"] == "active":
+                start_event["duration_seconds"] = round(max(0, now_ts - float(start_event["server_ts"])), 1)
+                start_event["duration_status"] = "ongoing"
+            else:
+                start_event["duration_status"] = "no_end_event"
+    for answer in item["answers"]:
+        question_data = QBYID.get(answer.get("question_id")) or {}
+        if answer.get("type") == "mcq":
+            try:
+                option_index = int(answer.get("answer", ""))
+                options = question_data.get("options") or []
+                if 0 <= option_index < len(options):
+                    answer["answer"] = options[option_index]
+            except (TypeError, ValueError):
+                pass
+    evidence_rows = allr("SELECT id,event_id,captured_at,mime_type,image_data,size_bytes,expires_at FROM exam_evidence WHERE attempt_id=? AND expires_at>? ORDER BY captured_at", (attempt_id, time.time()))
+    item["evidence"] = [{
+        "id": e["id"], "event_id": e["event_id"], "captured_at": e["captured_at"],
+        "mime_type": e["mime_type"], "size_bytes": e["size_bytes"],
+        "data_url": "data:" + e["mime_type"] + ";base64," + base64.b64encode(bytes(e["image_data"])).decode("ascii")
+    } for e in evidence_rows]
     item["integrity"] = item["result"] or {}
     audit(user["id"], "integrity_attempt_viewed", attempt_id)
     return item

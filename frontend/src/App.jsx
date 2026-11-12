@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { api, getToken, setToken } from "./api.js";
 import { LangCtx, useT } from "./i18n.js";
 import CandidateProfileWorkspace from "./CandidateProfileWorkspace.jsx";
@@ -861,8 +861,11 @@ function Gap({ st, onStart, refreshKey, actionLabel }) {
 }
 
 /* ---------- exam integrity monitor ---------- */
-function useExamIntegrity(aid, screenStream) {
+function useExamIntegrity(initial, screenStream) {
   const t = useT();
+  const aid = initial.attempt_id;
+  const sessionId = useRef(initial.session_id);
+  const sequence = useRef(initial.last_event_seq || 0);
   const [shareActive, setShareActive] = useState(
     Boolean(
       screenStream
@@ -879,7 +882,7 @@ function useExamIntegrity(aid, screenStream) {
     (type) => {
       api("/attempts/" + aid + "/event", {
         method: "POST",
-        body: { type },
+        body: { type, session_id: sessionId.current, seq: ++sequence.current, client_ts: Date.now() },
       }).catch(() => {});
     },
     [aid],
@@ -1031,53 +1034,428 @@ function ExamIntegrityBanner({ integrity, onRestartShare }) {
 }
 
 /* ---------- exam ---------- */
-function ExamRun({ initial, onFinished, screenStream, onRestartShare }) {
-  const integrity = useExamIntegrity(initial.attempt_id, screenStream);
+function ExamRun({ initial, onFinished, screenStream, cameraStream, onRestartShare }) {
   if (initial.graphrag)
     return (
-      <GraphRAGExamRun
+      <GraphRAGExamRunGate
         initial={initial}
         onFinished={onFinished}
-        integrity={integrity}
+        screenStream={screenStream}
         onRestartShare={onRestartShare}
       />
     );
+  return (
+    <AdaptiveExamRun
+      initial={initial}
+      onFinished={onFinished}
+      screenStream={screenStream}
+      cameraStream={cameraStream}
+    />
+  );
+}
+
+function GraphRAGExamRunGate({ initial, onFinished, screenStream, onRestartShare }) {
+  const integrity = useExamIntegrity(initial, screenStream);
+  return (
+    <GraphRAGExamRun
+      initial={initial}
+      onFinished={onFinished}
+      integrity={integrity}
+      onRestartShare={onRestartShare}
+    />
+  );
+}
+
+/* ---------- local-only AI proctoring ---------- */
+function LocalProctor({ cameraStream, aid, sessionId, nextSeq, report, flushEventsForEvidence }) {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [status, setStatus] = useState("Loading local vision models…");
+  const [cameraStatus, setCameraStatus] = useState("Waiting for camera video…");
+  const [detections, setDetections] = useState({ face: "Starting", objects: "Starting" });
+  const lastAlert = useRef({});
+  const modelRef = useRef(null);
+
+  const evidence = useCallback(async (type, confidence) => {
+    const now = Date.now();
+    if (now - (lastAlert.current[type] || 0) < 15000) return;
+    lastAlert.current[type] = now;
+    report(type, { confidence: Number(confidence.toFixed(2)), model: "mediapipe", local_only: true });
+    try {
+      const video = videoRef.current, canvas = canvasRef.current;
+      if (!video || !canvas || video.readyState < 2) return;
+      canvas.width = 480; canvas.height = Math.round(480 * video.videoHeight / video.videoWidth);
+      const ctx = canvas.getContext("2d", { alpha: false });
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.55));
+      if (!blob || blob.size > 180 * 1024) return;
+      const form = new FormData();
+      form.append("session_id", sessionId.current);
+      await flushEventsForEvidence();
+      form.append("seq", String(nextSeq()));
+      form.append("event_type", type);
+      form.append("confidence", String(confidence));
+      form.append("image", blob, "evidence.jpg");
+      await api(`/attempts/${aid}/evidence`, { method: "POST", form });
+    } catch {
+      // Detection log remains in the event queue even if evidence upload fails.
+    }
+  }, [aid, nextSeq, report, sessionId, flushEventsForEvidence]);
+
+  useEffect(() => {
+    let cancelled = false, timer = null;
+    const video = videoRef.current;
+    if (!cameraStream || !video) return;
+    video.muted = true;
+    video.autoplay = true;
+    video.playsInline = true;
+    const playPreview = async () => {
+      try {
+        await video.play();
+        if (!cancelled) setCameraStatus("Camera preview live");
+      } catch (previewError) {
+        if (!cancelled) setCameraStatus("Preview blocked: " + (previewError?.message || "click to allow playback"));
+      }
+    };
+    const onVideoReady = () => { if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) playPreview(); };
+    const onPlaying = () => { if (!cancelled) setCameraStatus("Camera preview live"); };
+    const onWaiting = () => { if (!cancelled) setCameraStatus("Waiting for camera frames…"); };
+    video.addEventListener("loadedmetadata", onVideoReady);
+    video.addEventListener("loadeddata", onVideoReady);
+    video.addEventListener("playing", onPlaying);
+    video.addEventListener("waiting", onWaiting);
+    video.srcObject = cameraStream;
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) playPreview();
+    const track = cameraStream.getVideoTracks()[0];
+    if (track) {
+      if (track.readyState !== "live") setCameraStatus("Camera track is not live");
+      else if (track.muted) setCameraStatus("Camera is starting…");
+    }
+    const load = async () => {
+      try {
+        const vision = await import("@mediapipe/tasks-vision");
+        const files = await vision.FilesetResolver.forVisionTasks(
+          "/mediapipe/wasm"
+        );
+        const faceOptions = {
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
+          runningMode: "VIDEO", numFaces: 3
+        };
+        let face;
+        try { face = await vision.FaceLandmarker.createFromOptions(files, { ...faceOptions, baseOptions: { ...faceOptions.baseOptions, delegate: "GPU" } }); }
+        catch { face = await vision.FaceLandmarker.createFromOptions(files, { ...faceOptions, baseOptions: { ...faceOptions.baseOptions, delegate: "CPU" } }); }
+        let objects = null;
+        const objectOptions = {
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite" },
+          runningMode: "VIDEO", scoreThreshold: 0.55, maxResults: 10
+        };
+        try {
+          try { objects = await vision.ObjectDetector.createFromOptions(files, { ...objectOptions, baseOptions: { ...objectOptions.baseOptions, delegate: "GPU" } }); }
+          catch { objects = await vision.ObjectDetector.createFromOptions(files, { ...objectOptions, baseOptions: { ...objectOptions.baseOptions, delegate: "CPU" } }); }
+        } catch { /* Face/gaze checks can still run when object model fails. */ }
+        if (cancelled) { face.close(); objects?.close(); return; }
+        modelRef.current = { face, objects };
+        setStatus(objects ? "Local AI monitoring active" : "Face analysis active; object model unavailable");
+        let lastVideoTime = -1;
+        const loop = () => {
+          if (cancelled) return;
+          if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+            lastVideoTime = video.currentTime;
+            const now = performance.now();
+            const faces = face.detectForVideo(video, now).faceLandmarks || [];
+            const count = faces.length;
+            setDetections(old => ({ ...old, face: count === 0 ? "No face" : count > 1 ? `${count} faces` : "One face" }));
+            if (count === 0) evidence("ai_no_face", 0.8);
+            if (count > 1) evidence("ai_multiple_faces", Math.min(0.99, 0.65 + count * 0.08));
+            if (count === 1) {
+              const points = faces[0];
+              const nose = points[1], leftEye = points[33], rightEye = points[263];
+              if (nose && leftEye && rightEye) {
+                const center = (leftEye.x + rightEye.x) / 2;
+                const eyeSpan = Math.max(0.001, Math.abs(rightEye.x - leftEye.x));
+                const offset = Math.abs(nose.x - center) / eyeSpan;
+                if (offset > 0.09) evidence("ai_gaze_away", Math.min(0.9, 0.55 + offset));
+              }
+            }
+            if (objects) {
+              const found = objects.detectForVideo(video, now).detections || [];
+              const phone = found.find(d => (d.categories || []).some(c => ["cell phone", "mobile phone", "phone"].includes((c.categoryName || "").toLowerCase())));
+              setDetections(old => ({ ...old, objects: phone ? "Possible phone" : "No phone detected" }));
+              if (phone) evidence("ai_phone_detected", phone.categories?.[0]?.score || 0.6);
+            } else setDetections(old => ({ ...old, objects: "Unavailable" }));
+          }
+          timer = requestAnimationFrame(loop);
+        };
+        loop();
+      } catch (e) {
+        if (!cancelled) setStatus("Local AI unavailable: " + (e?.message || "model load failed"));
+        report("ai_model_unavailable", { reason: "model_load_failed", local_only: true });
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+      if (timer) cancelAnimationFrame(timer);
+      video.removeEventListener("loadedmetadata", onVideoReady);
+      video.removeEventListener("loadeddata", onVideoReady);
+      video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("waiting", onWaiting);
+      video.pause();
+      video.srcObject = null;
+      modelRef.current?.face?.close();
+      modelRef.current?.objects?.close();
+      modelRef.current = null;
+    };
+  }, [cameraStream, evidence, report]);
+  return <div className="ai-proctor-panel" style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap",padding:12,border:"1px solid #d7dce3",borderRadius:12,background:"#111827",color:"#f9fafb"}}>
+    <div style={{position:"relative",width:190,maxWidth:"100%",aspectRatio:"16 / 10",flexShrink:0,overflow:"hidden",borderRadius:9,background:"#030712"}}>
+      <video ref={videoRef} muted playsInline autoPlay aria-label="Live webcam preview" style={{display:"block",width:"100%",height:"100%",objectFit:"cover",transform:"scaleX(-1)"}} />
+      <span style={{position:"absolute",left:8,top:8,padding:"3px 7px",borderRadius:5,background:"#b91c1c",color:"#fff",fontSize:10,fontWeight:700,letterSpacing:".04em"}}>LIVE</span>
+      <span style={{position:"absolute",left:8,bottom:7,color:"#fff",fontSize:11,textShadow:"0 1px 3px #000"}}>Camera preview</span>
+    </div>
+    <canvas ref={canvasRef} hidden />
+    <div style={{display:"grid",gap:5,minWidth:180,flex:"1 1 180px"}}>
+      <strong style={{fontSize:14}}>On-device AI</strong>
+      <span style={{fontSize:12,opacity:.95}}>{cameraStatus}</span>
+      <span style={{fontSize:12,opacity:.9}}>{status}</span>
+      <small style={{fontSize:11,opacity:.75}}>Face: {detections.face} · Object: {detections.objects}</small>
+    </div>
+  </div>;
+}
+
+/* ---------- adaptive exam (phase 2 integrity) ---------- */
+function AdaptiveExamRun({ initial, onFinished, screenStream, cameraStream }) {
   const t = useT();
   const [v, setV] = useState(initial);
   const [ans, setAns] = useState("");
   const [out, setOut] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [quitting, setQuitting] = useState(false);
   const [left, setLeft] = useState(initial.remaining);
+  const [unlimitedTime, setUnlimitedTime] = useState(Boolean(initial.unlimited_time));
+  const [stream, setStream] = useState(screenStream || null);
+  const [shareActive, setShareActive] = useState(Boolean(screenStream?.getVideoTracks().some((track) => track.readyState === "live")));
+  const [fullscreenActive, setFullscreenActive] = useState(Boolean(document.fullscreenElement));
+  const [shareNotice, setShareNotice] = useState("");
+  const [integrityNotice, setIntegrityNotice] = useState("");
   const aid = v.attempt_id;
+  const sessionId = useRef(initial.session_id);
+  const sequence = useRef(initial.last_event_seq || 0);
+  const pendingEvents = useRef([]);
+  const flushPromise = useRef(null);
+  const nextSeq = useCallback(() => ++sequence.current, []);
+
+  const flushEvents = useCallback(async () => {
+    if (flushPromise.current) return flushPromise.current;
+    flushPromise.current = (async () => {
+      while (pendingEvents.current.length) {
+        const item = pendingEvents.current[0];
+        try {
+          await api(`/attempts/${aid}/event`, { method: "POST", body: item });
+          pendingEvents.current.shift();
+        } catch {
+          break;
+        }
+      }
+    })();
+    try { await flushPromise.current; }
+    finally { flushPromise.current = null; }
+  }, [aid]);
+
+  const report = useCallback((type, metadata = {}) => {
+    const item = {
+      type, session_id: sessionId.current, seq: ++sequence.current,
+      client_ts: Date.now(), metadata
+    };
+    pendingEvents.current.push(item);
+    flushEvents();
+  }, [flushEvents]);
 
   useEffect(() => {
+    const heartbeat = async () => {
+      try {
+        await flushEvents();
+        if (pendingEvents.current.length) return; // preserve strict sequence order while offline
+        const body = { session_id: sessionId.current, seq: ++sequence.current, client_ts: Date.now() };
+        await api(`/attempts/${aid}/heartbeat`, { method: "POST", body });
+      } catch {
+        // The next successful heartbeat lets the server record the monitoring gap.
+      }
+    };
+    const timer = setInterval(heartbeat, 10000);
+    const flushOnExit = () => {
+      const token = localStorage.getItem("sb_token");
+      for (const item of pendingEvents.current) {
+        const payload = { ...item, authorization: token || "" };
+        const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+        if (navigator.sendBeacon?.(`/api/attempts/${aid}/event/beacon`, blob)) continue;
+        fetch(`/api/attempts/${aid}/event/beacon`, {
+          method: "POST", keepalive: true, headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        }).catch(() => {});
+      }
+    };
+    window.addEventListener("pagehide", flushOnExit);
+    return () => { clearInterval(timer); window.removeEventListener("pagehide", flushOnExit); };
+  }, [aid, flushEvents]);
+
+  useEffect(() => {
+    if (unlimitedTime) return;
     const i = setInterval(() => setLeft((x) => Math.max(0, x - 1)), 1000);
     return () => clearInterval(i);
-  }, []);
+  }, [unlimitedTime]);
+  useEffect(() => { setAns(""); setOut(null); }, [v.question?.id]);
+
+  // Block clipboard actions throughout the exam, not only in the SQL editor.
   useEffect(() => {
-    setAns("");
-    setOut(null);
-  }, [v.question?.id]);
+    const inCodeEditor = (target) => Boolean(target?.closest?.("textarea.code, [contenteditable='true']"));
+    const clipboard = (event) => {
+      if (event.type !== "paste" && inCodeEditor(event.target)) return;
+      event.preventDefault();
+      report(event.type, { editor: inCodeEditor(event.target) });
+      setIntegrityNotice(t("clipboardBlocked"));
+    };
+    const keyboard = (event) => {
+      const key = String(event.key || "").toLowerCase();
+      if (key === "f11" || (key === "escape" && document.fullscreenElement)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      if (inCodeEditor(event.target) && (event.ctrlKey || event.metaKey) && key === "v") {
+        event.preventDefault();
+        report("paste", { editor: true });
+        setIntegrityNotice(t("clipboardBlocked"));
+        return;
+      }
+      if (inCodeEditor(event.target)) return;
+      if ((event.ctrlKey || event.metaKey) && ["c", "v", "x"].includes(key)) {
+        event.preventDefault();
+        report(key === "c" ? "copy" : key === "x" ? "cut" : "paste");
+        setIntegrityNotice(t("clipboardBlocked"));
+      }
+      if (event.shiftKey && key === "insert") {
+        event.preventDefault();
+        report("paste");
+        setIntegrityNotice(t("clipboardBlocked"));
+      }
+    };
+    const contextMenu = (event) => { event.preventDefault(); };
+    const blur = () => report("blur");
+    const visibility = () => { report(document.visibilityState === "hidden" ? "tab_hidden" : "tab_visible"); };
+    const fullscreen = () => {
+      const active = Boolean(document.fullscreenElement);
+      setFullscreenActive(active);
+      if (!active) {
+        report("fullscreen_exit");
+        setIntegrityNotice(t("fullscreenWarning"));
+      } else {
+        report("fullscreen_enter");
+      }
+    };
+    const focus = () => report("focus");
+    const blockOutsideExam = (event) => {
+      if (event.target?.closest?.(".exam")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      setIntegrityNotice(t("examNavigationLocked"));
+    };
+    document.addEventListener("copy", clipboard, true);
+    document.addEventListener("cut", clipboard, true);
+    document.addEventListener("paste", clipboard, true);
+    document.addEventListener("keydown", keyboard, true);
+    document.addEventListener("click", blockOutsideExam, true);
+    document.addEventListener("contextmenu", contextMenu, true);
+    document.addEventListener("visibilitychange", visibility);
+    document.addEventListener("fullscreenchange", fullscreen);
+    window.addEventListener("blur", blur);
+    window.addEventListener("focus", focus);
+    return () => {
+      document.removeEventListener("copy", clipboard, true);
+      document.removeEventListener("cut", clipboard, true);
+      document.removeEventListener("paste", clipboard, true);
+      document.removeEventListener("keydown", keyboard, true);
+      document.removeEventListener("click", blockOutsideExam, true);
+      document.removeEventListener("contextmenu", contextMenu, true);
+      document.removeEventListener("visibilitychange", visibility);
+      document.removeEventListener("fullscreenchange", fullscreen);
+      window.removeEventListener("blur", blur);
+      window.removeEventListener("focus", focus);
+    };
+  }, [report]);
+
+  useEffect(() => {
+    const track = stream?.getVideoTracks()[0];
+    if (!track) { setShareActive(false); return; }
+    setShareActive(track.readyState === "live");
+    const ended = () => {
+      setShareActive(false);
+      setShareNotice(t("shareStopped"));
+      report("screen_share_stopped");
+    };
+    track.addEventListener("ended", ended);
+    return () => track.removeEventListener("ended", ended);
+  }, [stream, report]);
+
+  // Record webcam disconnection during the active attempt. The browser never
+  // uploads a continuous video stream; this is a status event only.
+  useEffect(() => {
+    const track = cameraStream?.getVideoTracks()[0];
+    if (!track) return;
+    const ended = () => {
+      report("camera_stopped", { reason: "video_track_ended" });
+      setIntegrityNotice("Webcam disconnected. This interruption has been recorded.");
+    };
+    track.addEventListener("ended", ended);
+    return () => track.removeEventListener("ended", ended);
+  }, [cameraStream, report]);
+
+  // Stop capture when the exam component is removed or the stream is replaced.
+  useEffect(() => () => {
+    stream?.getTracks().forEach((track) => track.stop());
+  }, [stream]);
+  useEffect(() => () => {
+    if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  }, []);
+
   const q = v.question;
-  const submit = async () => {
-    if (!integrity.shareActive || !integrity.fullscreenActive) {
-      setErr(
-        new Error(
-          !integrity.shareActive ? t("shareRequired") : t("fullscreenRequired"),
-        ),
-      );
-      return;
-    }
-    setBusy(true);
-    setErr(null);
+  const restartFullscreen = async () => {
     try {
-      const r = await api(`/attempts/${aid}/answer`, {
-        method: "POST",
-        body: { question_id: q.id, answer: String(ans) },
-      });
-      setV(r);
-      setLeft(r.remaining);
+      if (!document.documentElement.requestFullscreen) throw new Error(t("fullscreenUnsupported"));
+      await document.documentElement.requestFullscreen();
+      setFullscreenActive(Boolean(document.fullscreenElement));
+      setIntegrityNotice("");
+    } catch (e) {
+      setShareNotice(e.message || t("fullscreenUnsupported"));
+    }
+  };
+  const restartShare = async () => {
+    try {
+      if (!navigator.mediaDevices?.getDisplayMedia) throw new Error(t("shareUnsupported"));
+      const nextStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 5 }, audio: false });
+      const surface = nextStream.getVideoTracks()[0]?.getSettings?.().displaySurface || "unknown";
+      if (surface !== "monitor") {
+        nextStream.getTracks().forEach((track) => track.stop());
+        report("wrong_share_surface", { surface });
+        throw new Error("Please share your entire screen (not a tab or window).");
+      }
+      report("screen_share_started", { surface });
+      setStream(nextStream);
+      setShareActive(true);
+      setShareNotice("");
+      setIntegrityNotice("");
+    } catch (e) {
+      setShareNotice(e.message || t("shareRequired"));
+      report("screen_share_unavailable");
+    }
+  };
+  const submit = async () => {
+    if (!shareActive || !fullscreenActive) { setShareNotice(!shareActive ? t("shareRequired") : t("fullscreenRequired")); return; }
+    setBusy(true); setErr(null);
+    try {
+      const r = await api(`/attempts/${aid}/answer`, { method: "POST", body: { question_id: q.id, answer: String(ans), session_id: sessionId.current } });
+      setV(r); setLeft(r.remaining); setUnlimitedTime(Boolean(r.unlimited_time));
       if (r.status === "done") onFinished(aid);
     } catch (e) {
       setErr(e);
@@ -1085,21 +1463,21 @@ function ExamRun({ initial, onFinished, screenStream, onRestartShare }) {
       setBusy(false);
     }
   };
-  const runSql = async () => {
-    if (!integrity.shareActive || !integrity.fullscreenActive) {
-      setErr(new Error(t("shareRequired")));
-      return;
-    }
+  const quit = async () => {
+    if (!window.confirm(t("quitConfirm"))) return;
+    setQuitting(true);
+    setErr(null);
     try {
-      setOut(
-        await api(`/attempts/${aid}/sql-run`, {
-          method: "POST",
-          body: { sql: ans },
-        }),
-      );
+      await api(`/attempts/${aid}/quit`, { method: "POST", body: { session_id: sessionId.current } });
+      await onFinished(aid);
     } catch (e) {
       setErr(e);
+      setQuitting(false);
     }
+  };
+  const runSql = async () => {
+    if (!shareActive) { setShareNotice(t("shareRequired")); return; }
+    try { setOut(await api(`/attempts/${aid}/sql-run`, { method: "POST", body: { sql: ans, session_id: sessionId.current } })); } catch (e) { setErr(e); }
   };
 
   if (!q) return <p>{t("loading")}</p>;
@@ -1110,80 +1488,48 @@ function ExamRun({ initial, onFinished, screenStream, onRestartShare }) {
           {t("q")} {q.index + 1} {t("of")} {q.total}
         </span>
         <progress value={q.index} max={q.total} />
-        <span className={"timer" + (left < 120 ? " low" : "")}>
-          {t("timeLeft")}: {fmt(left)}
-        </span>
+        <span className={"timer" + (!unlimitedTime && left < 120 ? " low" : "")}>{t("timeLeft")}: {unlimitedTime ? "Unlimited" : fmt(left)}</span>
       </div>
-      <ExamIntegrityBanner
-        integrity={integrity}
-        onRestartShare={onRestartShare}
-      />
+      <LocalProctor cameraStream={cameraStream} aid={aid} sessionId={sessionId} nextSeq={nextSeq} report={report} flushEventsForEvidence={flushEvents} />
+      <div className={"exam-integrity-banner" + (shareActive ? " active" : " warning")} role="status">
+        <strong>{shareActive ? t("shareActive") : t("shareStopped")}</strong>
+        <span>{t("sharePrivacy")}</span>
+        {!shareActive && <button type="button" className="btn sm" onClick={restartShare}>{t("restartShare")}</button>}
+        <span>{fullscreenActive ? t("fullscreenActive") : t("fullscreenWarning")}</span>
+        {!fullscreenActive && <button type="button" className="btn sm" onClick={restartFullscreen}>{t("restartFullscreen")}</button>}
+      </div>
+      {integrityNotice && <p className="exam-integrity-notice" role="status">{integrityNotice}</p>}
+      {shareNotice && <p className="err" role="alert">{shareNotice}</p>}
       <h3 className="qtext exam-copy-locked">{q.prompt}</h3>
       {q.type === "mcq" ? (
         <fieldset className="opts">
           {q.options.map((o, i) => (
-            <label
-              key={i}
-              className={
-                "opt exam-copy-locked" +
-                (String(ans) === String(i) ? " on" : "")
-              }
-            >
-              <input
-                type="radio"
-                name="opt"
-                checked={String(ans) === String(i)}
-                onChange={() => setAns(String(i))}
-              />{" "}
-              {o}
+            <label key={i} className={"opt exam-copy-locked" + (String(ans) === String(i) ? " on" : "")}>
+              <input type="radio" name="opt" checked={String(ans) === String(i)} onChange={() => setAns(String(i))} /> {o}
             </label>
           ))}
         </fieldset>
       ) : (
         <>
-          <details open>
-            <summary>{t("schema")}</summary>
-            <pre className="pre exam-copy-locked">{q.schema}</pre>
-          </details>
+          <details open><summary>{t("schema")}</summary><pre className="pre exam-copy-locked">{q.schema}</pre></details>
           <p className="note">{t("sqlHelp")}</p>
-          <textarea
-            className="code"
-            rows={6}
-            spellCheck={false}
-            value={ans}
-            onChange={(e) => setAns(e.target.value)}
-            placeholder="Write your answer..."
-          />
+          <textarea className="code" rows={6} spellCheck={false} value={ans} onChange={(e) => setAns(e.target.value)} placeholder="SELECT ..." />
           <p className="muted">{t("pasteNote")}</p>
-          {String(q.type).toLowerCase().includes("sql") && (
-            <button
-              className="btn ghost"
-              onClick={runSql}
-              disabled={
-                !ans.trim() ||
-                !integrity.shareActive ||
-                !integrity.fullscreenActive
-              }
-            >
-              {t("run")}
-            </button>
-          )}
-          {out && <pre className="pre">{JSON.stringify(out, null, 2)}</pre>}
+          <button className="btn ghost" onClick={runSql} disabled={!ans.trim() || !shareActive || !fullscreenActive}>{t("run")}</button>
+          {out && (out.error ? <p className="err">{t("sqlError")}: {out.error}</p> : (
+            <div className="tablewrap">
+              <table><thead><tr>{out.columns.map((c) => <th key={c}>{c}</th>)}</tr></thead>
+                <tbody>{out.rows.slice(0, 20).map((r, i) => <tr key={i}>{r.map((c, j) => <td key={j}>{String(c)}</td>)}</tr>)}</tbody></table>
+              <small className="muted">{out.rows.length} {t("rows")}</small>
+            </div>
+          ))}
         </>
       )}
       <Err e={err} />
-      <button
-        className="btn"
-        onClick={submit}
-        disabled={
-          busy ||
-          !integrity.shareActive ||
-          !integrity.fullscreenActive ||
-          String(ans).trim() === ""
-        }
-      >
-        {busy ? t("saving") : t("submit")}
-      </button>
+      <div className="exam-actions">
+        <button className="btn" onClick={submit} disabled={busy || quitting || !shareActive || !fullscreenActive || String(ans).trim() === ""}>{busy ? t("saving") : t("submit")}</button>
+        <button type="button" className="btn ghost exam-quit" onClick={quit} disabled={busy || quitting}>{quitting ? t("quitBusy") : t("quitButton")}</button>
+      </div>
     </section>
   );
 }
@@ -1406,12 +1752,6 @@ function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
               spellCheck={false}
               value={ans}
               onChange={(e) => setAns(e.target.value)}
-              onPaste={() =>
-                api(`/attempts/${aid}/event`, {
-                  method: "POST",
-                  body: { type: "paste" },
-                }).catch(() => {})
-              }
               placeholder={
                 String(q.question_type).toLowerCase().includes("sql")
                   ? "SELECT ..."
@@ -1485,7 +1825,6 @@ function GraphRAGExamRun({ initial, onFinished, integrity, onRestartShare }) {
     </section>
   );
 }
-
 function Result({ aid, next, nextLabel }) {
   const t = useT();
   const [r, setR] = useState(null);
@@ -1686,6 +2025,12 @@ function Result({ aid, next, nextLabel }) {
             ))}
           </ul>
         )}
+        {r.review_decision && (
+          <div className="assessment-review-result">
+            <strong>{t(`assessmentReview_${r.review_decision}`)}</strong>
+            {r.review_reason && <p>{r.review_reason}</p>}
+          </div>
+        )}
         <h3>{t("appealTitle")}</h3>
         {r.appeal || sent ? (
           <p className="note">{t("appealSent")}</p>
@@ -1711,6 +2056,167 @@ function Result({ aid, next, nextLabel }) {
           {nextLabel}
         </button>
       )}
+    </section>
+  );
+}
+
+function AttemptAppeal({ attempt, onSubmitted }) {
+  const t = useT();
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [submitted, setSubmitted] = useState(false);
+  const submit = async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    setErr(null);
+    try {
+      await api(`/attempts/${attempt.id || attempt.attempt_id}/appeal`, { method: "POST", body: { note } });
+      setNote("");
+      await onSubmitted();
+      setSubmitted(true);
+    } catch (error) {
+      setErr(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (attempt.appeal || submitted) return (
+    <div className="attempt-appeal-status">
+      <strong>{attempt.appeal_decision ? t(`appeal_${attempt.appeal_decision}`) : t("appealPending")}</strong>
+      {attempt.appeal_reason && <p>{attempt.appeal_reason}</p>}
+    </div>
+  );
+  if (attempt.review_decision !== "invalidated") return null;
+  return (
+    <form className="attempt-appeal-form" onSubmit={submit}>
+      <label>{t("appealHelp")}<textarea value={note} onChange={(event) => setNote(event.target.value)} minLength={3} maxLength={1000} rows={3} required /></label>
+      {err && <Err e={err} />}
+      <button className="btn ghost sm" disabled={busy || note.trim().length < 3}>{busy ? t("saving") : t("appealBtn")}</button>
+    </form>
+  );
+}
+
+function AssessmentNotifications({ attempts, onRefresh }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  const latest = attempts[0];
+  const latestKey = latest ? `${latest.id}:${latest.reviewed_at}:${latest.review_decision}` : "";
+  const previousKey = useRef(latestKey);
+  useEffect(() => {
+    if (previousKey.current && latestKey && previousKey.current !== latestKey) setOpen(true);
+    previousKey.current = latestKey;
+  }, [latestKey]);
+  if (!attempts.length) return null;
+  const date = (timestamp) => timestamp
+    ? new Date(Number(timestamp) * 1000).toLocaleString()
+    : "";
+  const statusKey = (decision) => `assessmentReview_${decision}`;
+  return (
+    <aside className="assessment-notifications" aria-live="polite">
+      <button className="assessment-notification-toggle" onClick={() => setOpen((value) => !value)}>
+        {t("assessmentUpdates")} <span>{attempts.length}</span>
+      </button>
+      {open && <div className="assessment-notification-panel">
+        <div className="assessment-notification-heading">
+          <div><small>{t("latestReviewed")}</small><strong>{latest.overall ?? "—"} / 100</strong></div>
+          <button type="button" aria-label={t("close")} onClick={() => setOpen(false)}>×</button>
+        </div>
+        {attempts.slice(0, 3).map((attempt) => (
+          <article className="assessment-notification-item" key={attempt.id}>
+            <div className="assessment-notification-meta">
+              <strong>{attempt.kind === "post" ? t("attemptRetest") : t("attemptInitial")}</strong>
+              <span className={"status-pill " + (attempt.review_decision === "approved" ? "status-valid" : attempt.review_decision === "invalidated" ? "status-invalid" : "status-review")}>
+                {t(statusKey(attempt.review_decision))}
+              </span>
+              <small>{date(attempt.reviewed_at)}</small>
+            </div>
+            <strong className="assessment-notification-score">{attempt.overall ?? "—"} / 100</strong>
+            {attempt.review_reason && <p>{attempt.review_reason}</p>}
+            {attempt.review_decision === "invalidated" && <AttemptAppeal attempt={attempt} onSubmitted={onRefresh} />}
+          </article>
+        ))}
+      </div>}
+    </aside>
+  );
+}
+
+function AssessmentRecords({ attempts, onRefresh }) {
+  const t = useT();
+  const [filter, setFilter] = useState("all");
+  const records = [...attempts].filter((attempt) => attempt.status === "done")
+    .sort((a, b) => (b.finished || 0) - (a.finished || 0));
+  const counts = {
+    all: records.length,
+    approved: records.filter((attempt) => attempt.review_decision === "approved").length,
+    pending: records.filter((attempt) => !attempt.review_decision || attempt.review_decision === "needs_more_info").length,
+    invalidated: records.filter((attempt) => attempt.review_decision === "invalidated").length,
+  };
+  const visibleRecords = filter === "all" ? records : records.filter((attempt) =>
+    filter === "pending"
+      ? !attempt.review_decision || attempt.review_decision === "needs_more_info"
+      : attempt.review_decision === filter);
+  const date = (timestamp) => timestamp
+    ? new Date(Number(timestamp) * 1000).toLocaleString()
+    : "";
+  const filters = [
+    ["all", t("allRecords")],
+    ["approved", t("assessmentReview_approved")],
+    ["pending", t("assessmentReview_pending")],
+    ["invalidated", t("assessmentReview_invalidated")],
+  ];
+  return (
+    <section className="assessment-records">
+      <header className="assessment-records-heading">
+        <div><span className="eyebrow">{t("assessmentUpdates")}</span><h1>{t("assessmentRecords")}</h1><p>{t("assessmentRecordsHelp")}</p></div>
+        <span className="assessment-total"><strong>{records.length}</strong><small>{t("records")}</small></span>
+      </header>
+      {!!records.length && <div className="assessment-record-summary">
+        <article className="assessment-summary-card"><span className="assessment-summary-icon">✓</span><div><strong>{counts.approved}</strong><small>{t("assessmentReview_approved")}</small></div></article>
+        <article className="assessment-summary-card"><span className="assessment-summary-icon pending">◷</span><div><strong>{counts.pending}</strong><small>{t("assessmentReview_pending")}</small></div></article>
+        <article className="assessment-summary-card"><span className="assessment-summary-icon rejected">!</span><div><strong>{counts.invalidated}</strong><small>{t("assessmentReview_invalidated")}</small></div></article>
+      </div>}
+      <nav className="assessment-record-filters" aria-label={t("filterAssessments")}>
+        {filters.map(([id, label]) => <button key={id} type="button" aria-pressed={filter === id} className={filter === id ? "active" : ""} onClick={() => setFilter(id)}>
+          {label}<span>{counts[id]}</span>
+        </button>)}
+      </nav>
+      {!visibleRecords.length ? <div className="assessment-record-empty"><span aria-hidden="true">◷</span><h2>{records.length ? t("noMatchingAssessments") : t("noAssessmentRecords")}</h2><p>{records.length ? t("changeAssessmentFilter") : t("assessmentRecordsHelp")}</p></div> : visibleRecords.map((attempt) => {
+        const status = attempt.review_decision || "pending";
+        const label = status === "pending" ? t("assessmentReview_pending") : t(`assessmentReview_${status}`);
+        return (
+          <article className={`assessment-record-card assessment-record-${status}`} key={attempt.id}>
+            <header className="assessment-record-header">
+              <div className="assessment-record-title"><span className="assessment-record-icon">{attempt.kind === "post" ? "↻" : "✓"}</span><div><strong>{attempt.kind === "post" ? t("attemptRetest") : t("attemptInitial")}</strong><small>{date(attempt.finished)}</small></div></div>
+              <span className={"status-pill " + (status === "approved" ? "status-valid" : status === "invalidated" ? "status-invalid" : "status-review")}>{label}</span>
+            </header>
+            <div className="assessment-record-score-row">
+              <div className="assessment-record-score"><span>{t("score")}</span><strong>{attempt.overall ?? "—"}<small> / 100</small></strong></div>
+              <div className="assessment-score-track" role="img" aria-label={`${t("score")}: ${attempt.overall ?? 0}%`}>
+                <span style={{ width: `${Math.max(0, Math.min(100, Number(attempt.overall) || 0))}%` }} />
+              </div>
+            </div>
+            {Object.keys(attempt.topics || {}).length > 0 && <details className="assessment-topic-details">
+              <summary>{t("topicBreakdown")} <span>{Object.keys(attempt.topics).length}</span></summary>
+              <div className="assessment-topic-list">
+                {["sql", "python", "statistics", "visualization", ...Object.keys(attempt.topics)]
+                  .filter((topic, index, topics) => topic in attempt.topics && topics.indexOf(topic) === index)
+                  .map((topic) => {
+                    const topicResult = attempt.topics[topic];
+                    const topicScore = Math.max(0, Math.min(100, Number(topicResult.score) || 0));
+                    return <div className="assessment-topic-row" key={topic}>
+                      <div className="assessment-topic-label"><strong>{t(`topic_${topic}`)}</strong><span>{topicScore}%</span></div>
+                      <div className="assessment-score-track"><span style={{ width: `${topicScore}%` }} /></div>
+                      <small>{topicResult.n} {t("questionsAnswered")}</small>
+                    </div>;
+                  })}
+              </div>
+            </details>}
+            {attempt.review_reason && <p className="assessment-record-reason"><strong>{t("reviewReason")}:</strong> {attempt.review_reason}</p>}
+            <AttemptAppeal attempt={attempt} onSubmitted={onRefresh} />
+          </article>
+        );
+      })}
     </section>
   );
 }
@@ -1765,87 +2271,127 @@ function Uplift() {
 
 function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   const t = useT();
-  const [active, setActive] = useState(null),
-    [err, setErr] = useState(null);
+  const [active, setActive] = useState(null);
+  const [err, setErr] = useState(null);
   const [banner, setBanner] = useState("");
-  const [screenStream, setScreenStream] = useState(null),
-    [shareReady, setShareReady] = useState(false),
-    [fullscreenReady, setFullscreenReady] = useState(
-      Boolean(document.fullscreenElement),
-    ),
-    [setupBusy, setSetupBusy] = useState(false);
+  const [screenStream, setScreenStream] = useState(null);
+  const [cameraStream, setCameraStream] = useState(null);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [shareReady, setShareReady] = useState(false);
+  const [fullscreenReady, setFullscreenReady] = useState(Boolean(document.fullscreenElement));
+  const [setupBusy, setSetupBusy] = useState(false);
+  const mobileDevice = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+  const browserSupported = Boolean(navigator.mediaDevices?.getDisplayMedia && document.documentElement.requestFullscreen);
   const done = st.attempts
     .filter((a) => a.status === "done")
     .sort((a, b) => (a.finished || 0) - (b.finished || 0));
   const latestDone = done.length ? done[done.length - 1] : null;
-  // Both Verify and Re-test show the current result. The old code showed the
-  // oldest attempt in Verify, which made Verify and Gap disagree.
-  const mine =
-    kind === "pre" ? latestDone : done.length > 1 ? latestDone : null;
+  const unlimitedCandidate = (st.user?.email || "").trim().toLowerCase() === "i@gmail.com";
+  const mine = unlimitedCandidate ? null : (kind === "pre" ? latestDone : done.length > 1 ? latestDone : null);
   const act = st.attempts.find((a) => a.status === "active");
+
+  // Keep the setup status in sync if the candidate exits full-screen.
+  useEffect(() => {
+    const syncFullscreen = () => setFullscreenReady(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", syncFullscreen);
+    return () => document.removeEventListener("fullscreenchange", syncFullscreen);
+  }, []);
+
+  // Reflect when the candidate stops screen sharing from the browser toolbar.
   useEffect(() => {
     const track = screenStream?.getVideoTracks()[0];
     if (!track) {
       setShareReady(false);
       return;
     }
-    const sync = () => setShareReady(track.readyState === "live");
-    sync();
-    track.addEventListener("ended", sync);
-    return () => track.removeEventListener("ended", sync);
+    const syncShare = () => setShareReady(track.readyState === "live");
+    syncShare();
+    track.addEventListener("ended", syncShare);
+    return () => track.removeEventListener("ended", syncShare);
   }, [screenStream]);
+
+  // Revoke readiness immediately if the camera disconnects during setup.
   useEffect(() => {
-    const sync = () => setFullscreenReady(Boolean(document.fullscreenElement));
-    document.addEventListener("fullscreenchange", sync);
-    return () => document.removeEventListener("fullscreenchange", sync);
-  }, []);
-  useEffect(
-    () => () => {
-      screenStream?.getTracks().forEach((track) => track.stop());
-    },
-    [screenStream],
-  );
+    const track = cameraStream?.getVideoTracks()[0];
+    if (!track) return;
+    const onEnded = () => { setCameraReady(false); setCameraStream(null); setErr(new Error("Your webcam disconnected. Reconnect it and verify the camera before starting.")); };
+    track.addEventListener("ended", onEnded);
+    return () => track.removeEventListener("ended", onEnded);
+  }, [cameraStream]);
+
+  // Stop pending camera capture if setup is abandoned.
+  useEffect(() => () => { cameraStream?.getTracks().forEach(track => track.stop()); }, [cameraStream]);
+
+  const enableCamera = async () => {
+    setErr(null);
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access is not supported in this browser.");
+      const media = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+      // Permission + a live track are not enough: verify that the browser can
+      // actually decode camera frames before allowing the assessment to start.
+      const probe = document.createElement("video");
+      probe.muted = true;
+      probe.autoplay = true;
+      probe.playsInline = true;
+      probe.srcObject = media;
+      try {
+        await probe.play();
+        await new Promise((resolve, reject) => {
+          const deadline = Date.now() + 7000;
+          const checkFrame = () => {
+            if (probe.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && probe.videoWidth > 0 && probe.videoHeight > 0) return resolve();
+            if (Date.now() >= deadline) return reject(new Error("Camera permission was granted, but no live video frames were received. Check that your webcam is not being used by another application."));
+            requestAnimationFrame(checkFrame);
+          };
+          checkFrame();
+        });
+      } catch (probeError) {
+        media.getTracks().forEach(track => track.stop());
+        throw probeError;
+      } finally {
+        probe.pause();
+        probe.srcObject = null;
+      }
+      setCameraStream(media);
+      setCameraReady(true);
+    } catch (e) { setCameraReady(false); setErr(new Error(e?.name === "NotAllowedError" ? "Camera permission is required for this assessment." : e.message || "Unable to start camera.")); }
+  };
+
+  // Stop a pending screen capture if the candidate leaves the setup screen.
+  useEffect(() => () => {
+    screenStream?.getTracks().forEach((track) => track.stop());
+  }, [screenStream]);
+
+  // Ask for screen sharing in its own click so the browser can show its picker.
   const enableScreenShare = async () => {
     setErr(null);
     try {
-      if (!navigator.mediaDevices?.getDisplayMedia)
-        throw new Error(t("shareUnsupported"));
-      const stream = await navigator.mediaDevices.getDisplayMedia({
+      if (!navigator.mediaDevices?.getDisplayMedia) throw new Error(t("shareUnsupported"));
+      const requestedStream = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: 5 },
         audio: false,
       });
-      setScreenStream(stream);
-      setShareReady(
-        stream.getVideoTracks().some((track) => track.readyState === "live"),
-      );
+      setScreenStream(requestedStream);
+      setShareReady(requestedStream.getVideoTracks().some((track) => track.readyState === "live"));
     } catch (e) {
       setShareReady(false);
-      setErr(
-        new Error(
-          e?.name === "NotAllowedError"
-            ? t("shareRequired")
-            : e.message || t("shareRequired"),
-        ),
-      );
+      setErr(e?.name === "NotAllowedError" ? new Error(t("shareRequired")) : e);
     }
   };
+
+  // Full-screen must be requested directly from a separate user click.
   const enableFullscreen = async () => {
     setErr(null);
     try {
-      if (!document.documentElement.requestFullscreen)
-        throw new Error(t("fullscreenUnsupported"));
+      if (!document.documentElement.requestFullscreen) throw new Error(t("fullscreenUnsupported"));
       await document.documentElement.requestFullscreen();
       setFullscreenReady(Boolean(document.fullscreenElement));
       if (!document.fullscreenElement) throw new Error(t("fullscreenRequired"));
     } catch (e) {
       setFullscreenReady(Boolean(document.fullscreenElement));
-      setErr(
-        new Error(
-          e?.name === "NotAllowedError"
-            ? t("fullscreenClickAgain")
-            : e.message || t("fullscreenUnsupported"),
-        ),
-      );
+      setErr(e?.name === "NotAllowedError"
+        ? new Error(t("fullscreenClickAgain"))
+        : new Error(e.message || t("fullscreenUnsupported")));
     }
   };
   const restartShare = async () => {
@@ -1860,7 +2406,7 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
       if (aid)
         await api("/attempts/" + aid + "/event", {
           method: "POST",
-          body: { type: "screen_share_started" },
+          body: { type: "screen_share_started", session_id: active?.session_id, seq: (active?.last_event_seq || 0) + 1, client_ts: Date.now() },
         });
       setScreenStream(stream);
       setShareReady(true);
@@ -1873,26 +2419,21 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
   };
   const start = useCallback(async () => {
     setErr(null);
-    const sharing = Boolean(
-      screenStream
-        ?.getVideoTracks()
-        .some((track) => track.readyState === "live"),
-    );
+    const sharing = screenStream?.getVideoTracks().some((track) => track.readyState === "live");
     const fullscreen = Boolean(document.fullscreenElement);
-    setShareReady(sharing);
+    setShareReady(Boolean(sharing));
     setFullscreenReady(fullscreen);
-    if (!sharing || !fullscreen) {
-      setErr(
-        new Error(!sharing ? t("shareRequired") : t("fullscreenRequired")),
-      );
+    if (mobileDevice || !browserSupported || !navigator.onLine || !sharing || !fullscreen || !cameraReady || !cameraStream?.getVideoTracks().some(track => track.readyState === "live")) {
+      setErr(new Error(mobileDevice ? "This assessment requires a supported desktop browser." :
+        !browserSupported ? "Your browser does not support the required screen-sharing and full-screen features." :
+        !navigator.onLine ? "A network connection is required to begin the assessment." :
+        !sharing ? t("shareRequired") : !fullscreen ? t("fullscreenRequired") : "Please enable your webcam before starting."));
       return;
     }
     setSetupBusy(true);
     setBanner("");
     try {
-      // Prefer the CV-based GraphRAG assessment (fundamental + CV skills) when a
-      // candidate has confirmed CV skills. Fall back to the standard adaptive
-      // assessment when no CV / confirmed skills / complete bank is available.
+      // Prefer the CV-based GraphRAG assessment; fall back to adaptive.
       let blueprintId = null;
       try {
         const bp = await api("/assessment/blueprint", { method: "POST" });
@@ -1927,11 +2468,10 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
         body: blueprintId ? { blueprint_id: blueprintId } : undefined,
       });
       if (v.status === "active") {
-        await api("/attempts/" + v.attempt_id + "/event", {
-          method: "POST",
-          body: { type: "screen_share_started" },
-        });
-        setActive(v);
+        const body = { type: "screen_share_started", session_id: v.session_id, seq: (v.last_event_seq || 0) + 1,
+          client_ts: Date.now(), metadata: { surface: screenStream.getVideoTracks()[0]?.getSettings?.().displaySurface || "unknown" } };
+        await api(`/attempts/${v.attempt_id}/event`, { method: "POST", body });
+        setActive({ ...v, last_event_seq: body.seq });
       } else {
         screenStream?.getTracks().forEach((track) => track.stop());
         setScreenStream(null);
@@ -1942,93 +2482,94 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     } finally {
       setSetupBusy(false);
     }
-  }, [refresh, screenStream, t]);
+  }, [refresh, screenStream, cameraStream, cameraReady, t]);
   const finished = async () => {
     screenStream?.getTracks().forEach((track) => track.stop());
+    cameraStream?.getTracks().forEach((track) => track.stop());
     setScreenStream(null);
     setActive(null);
     if (document.fullscreenElement && document.exitFullscreen)
       document.exitFullscreen().catch(() => {});
     await refresh();
   };
-  if (active)
-    return (
-      <ExamRun
-        initial={active}
-        onFinished={finished}
-        screenStream={screenStream}
-        onRestartShare={restartShare}
-      />
-    );
-  if (mine)
-    return (
-      <>
-        <Result aid={mine.id} next={afterResult} nextLabel={afterLabel} />
-        {kind === "post" && <Uplift />}
-      </>
-    );
-  if (kind === "post" && done.length === 0)
-    return <p className="note">{t("needPre")}</p>;
-  return (
-    <section className="card narrow exam-setup">
-      <h2>{kind === "pre" ? t("startTest") : t("steps").retest}</h2>
-      <p>{kind === "pre" ? t("testIntro") : t("retestIntro")}</p>
-      <p className="muted">
-        Before starting or resuming, enable screen sharing and full-screen mode.
-        The browser will ask for permission separately. SkillBridge does not
-        record or upload the shared screen stream.
-      </p>
-      <div className="exam-setup-steps">
-        <div className={shareReady ? "ready" : ""}>
-          <span>{shareReady ? "✓" : "1"}</span>
-          <div>
-            <b>{t("shareSetupStep")}</b>
-            <small>{shareReady ? t("shareActive") : t("shareRequired")}</small>
-          </div>
-          <button
-            type="button"
-            className="btn ghost"
-            onClick={enableScreenShare}
-          >
+
+  if (active) return <ExamRun initial={active} screenStream={screenStream} cameraStream={cameraStream} onFinished={finished} onRestartShare={restartShare} />;
+  if (act && (act.kind === kind)) return (
+    <section className="card narrow">
+      <h2>{t("resume")}</h2>
+      <p>{t("shareBeforeResume")}</p>
+      <div className="card exam-setup-steps">
+        <p><strong>System check</strong></p>
+        <p>{mobileDevice ? "✕ Desktop device required" : "✓ Desktop device"} · {browserSupported ? "✓ Browser APIs supported" : "✕ Screen sharing/full-screen unsupported"} · {navigator.onLine ? "✓ Network available" : "✕ Network offline"}</p>
+        <div className="row">
+          <span>{shareReady ? "✓" : "1."} {t("shareSetupStep")}</span>
+          <button type="button" className="btn ghost sm" onClick={enableScreenShare} disabled={setupBusy}>
             {shareReady ? t("shareActive") : t("restartShare")}
           </button>
         </div>
-        <div className={fullscreenReady ? "ready" : ""}>
-          <span>{fullscreenReady ? "✓" : "2"}</span>
-          <div>
-            <b>{t("fullscreenSetupStep")}</b>
-            <small>
-              {fullscreenReady
-                ? t("fullscreenActive")
-                : t("fullscreenRequired")}
-            </small>
-          </div>
-          <button
-            type="button"
-            className="btn ghost"
-            onClick={enableFullscreen}
-          >
+        <div className="row">
+          <span>{cameraReady ? "✓" : "2."} Enable webcam for local AI analysis</span>
+          <button type="button" className="btn ghost sm" onClick={enableCamera} disabled={setupBusy}>
+            {cameraReady ? "Camera ready" : "Enable camera"}
+          </button>
+        </div>
+        <div className="row">
+          <span>{fullscreenReady ? "✓" : "3."} {t("fullscreenSetupStep")}</span>
+          <button type="button" className="btn ghost sm" onClick={enableFullscreen} disabled={setupBusy}>
             {fullscreenReady ? t("fullscreenActive") : t("restartFullscreen")}
           </button>
         </div>
       </div>
+      <Err e={err} />
+      <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady || !cameraReady}>
+        {setupBusy ? t("saving") : t("resume")}
+      </button>
+    </section>
+  );
+  if (mine) return (
+    <>
+      <Result aid={mine.id} next={afterResult} nextLabel={afterLabel} />
+      {kind === "post" && <Uplift />}
+    </>
+  );
+  if (kind === "post" && done.length === 0) return <p className="note">{t("needPre")}</p>;
+  return (
+    <section className="card narrow exam-setup">
+      <h2>{kind === "pre" ? t("startTest") : t("steps").retest}</h2>
+      <p>{kind === "pre" ? t("testIntro") : t("retestIntro")}</p>
+      <p className="exam-integrity-note">{t("examIntegrityIntro")}</p>
+      <div className="card exam-setup-steps">
+        <p><strong>System check</strong></p>
+        <p>{mobileDevice ? "✕ Desktop device required" : "✓ Desktop device"} · {browserSupported ? "✓ Browser APIs supported" : "✕ Screen sharing/full-screen unsupported"} · {navigator.onLine ? "✓ Network available" : "✕ Network offline"}</p>
+        <div className="row">
+          <span>{shareReady ? "✓" : "1."} {t("shareSetupStep")}</span>
+          <button type="button" className="btn ghost sm" onClick={enableScreenShare} disabled={setupBusy}>
+            {shareReady ? t("shareActive") : t("restartShare")}
+          </button>
+        </div>
+        <div className="row">
+          <span>{cameraReady ? "✓" : "2."} Enable webcam for local AI analysis</span>
+          <button type="button" className="btn ghost sm" onClick={enableCamera} disabled={setupBusy}>
+            {cameraReady ? "Camera ready" : "Enable camera"}
+          </button>
+        </div>
+        <p className="muted">The webcam is analyzed in this browser. Only alert logs and limited JPEG evidence snapshots may be uploaded; no continuous video or audio is recorded.</p>
+        <div className="row">
+          <span>{fullscreenReady ? "✓" : "3."} {t("fullscreenSetupStep")}</span>
+          <button type="button" className="btn ghost sm" onClick={enableFullscreen} disabled={setupBusy}>
+            {fullscreenReady ? t("fullscreenActive") : t("restartFullscreen")}
+          </button>
+        </div>
+        <p className="muted">{t("examSetupHint")}</p>
+      </div>
       {banner && <p className="note">{banner}</p>}
       <Err e={err} />
-      <button
-        className="btn"
-        onClick={start}
-        disabled={setupBusy || !shareReady || !fullscreenReady}
-      >
-        {setupBusy
-          ? t("saving")
-          : act && act.kind === kind
-            ? t("resume")
-            : t("startTest")}
+      <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady || !cameraReady}>
+        {setupBusy ? t("saving") : t("startTest")}
       </button>
     </section>
   );
 }
-
 /* ---------- learning path ---------- */
 function Learn({ onNext }) {
   const [data, setData] = useState(null),
@@ -2457,55 +2998,33 @@ function Learn({ onNext }) {
 /* ---------- passport ---------- */
 function Passport({ st, refresh }) {
   const t = useT();
-  const [res, setRes] = useState(null);
-  const [sel, setSel] = useState([]);
+  const eligible = st.attempts.filter((attempt) => attempt.status === "done" && attempt.review_decision === "approved")
+    .sort((a, b) => (b.reviewed_at || 0) - (a.reviewed_at || 0));
+  const [selectedId, setSelectedId] = useState(eligible[0]?.id || "");
   const [name, setName] = useState(false);
   const [err, setErr] = useState(null);
   const [copied, setCopied] = useState(null);
   const [journey, setJourney] = useState(null);
-  const done = st.attempts
-    .filter((a) => a.status === "done")
-    .sort((a, b) => (a.finished || 0) - (b.finished || 0));
-  const latest = done[done.length - 1];
   useEffect(() => {
-    api("/skill-journey")
-      .then(setJourney)
-      .catch(() => {});
-  }, [latest?.id]);
-  useEffect(() => {
-    if (latest)
-      api(`/attempts/${latest.id}/result`)
-        .then((r) => {
-          setRes(r);
-          setSel(Object.keys(r.topics));
-        })
-        .catch(setErr);
-  }, [latest?.id]);
+    api("/skill-journey").then(setJourney).catch(() => {});
+  }, []);
+  const selected = eligible.find((attempt) => attempt.id === selectedId) || eligible[0];
+  const topics = selected?.topics || {};
   const create = async () => {
+    if (!selected) return;
+    setErr(null);
     try {
-      await api("/passport", {
-        method: "POST",
-        body: { topics: sel, show_name: name },
-      });
-      refresh();
-    } catch (e) {
-      setErr(e);
-    }
+      await api("/passport", { method: "POST", body: { attempt_id: selected.id, show_name: name } });
+      await refresh();
+    } catch (e) { setErr(e); }
   };
-  const revoke = async (id) => {
-    await api(`/passport/${id}`, { method: "DELETE" });
-    refresh();
+  const selectAttempt = (id) => {
+    setSelectedId(id);
+    setErr(null);
   };
+  const revoke = async (id) => { await api(`/passport/${id}`, { method: "DELETE" }); refresh(); };
   const link = (id) => `${location.origin}/#/p/${id}`;
-  const copy = async (id) => {
-    try {
-      await navigator.clipboard.writeText(link(id));
-      setCopied(id);
-    } catch {
-      /* ignore */
-    }
-  };
-  if (!latest) return <p className="note">{t("needVerified")}</p>;
+  const copy = async (id) => { try { await navigator.clipboard.writeText(link(id)); setCopied(id); } catch { /* ignore */ } };
   const autoPassports = (st.passports || []).filter((p) => p.auto && !p.revoked);
   return (
     <section>
@@ -2524,40 +3043,33 @@ function Passport({ st, refresh }) {
       )}
       <div className="card">
         <p>{t("passportHelp")}</p>
-        {res && (
-          <ul className="skills">
-            {Object.entries(res.topics).map(([k, v]) => (
-              <li key={k}>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={sel.includes(k)}
-                    onChange={() =>
-                      setSel(
-                        sel.includes(k)
-                          ? sel.filter((x) => x !== k)
-                          : [...sel, k],
-                      )
-                    }
-                  />{" "}
-                  <strong>{v.label || k}</strong> · {v.score}% · {t("levels")[v.level]}
-                </label>
-              </li>
-            ))}
-          </ul>
-        )}
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={name}
-            onChange={(e) => setName(e.target.checked)}
-          />{" "}
-          {t("showName")}
-        </label>
+        {!eligible.length ? <p className="assessment-pending-banner">{t("passportRequiresReviewed")}</p> : <>
+          <label className="passport-attempt-select">{t("selectReviewedAssessment")}
+            <select value={selected?.id || ""} onChange={(event) => selectAttempt(event.target.value)}>
+              {eligible.map((attempt) => <option key={attempt.id} value={attempt.id}>
+                {(attempt.kind === "post" ? t("attemptRetest") : t("attemptInitial"))} · {new Date(Number(attempt.finished) * 1000).toLocaleDateString()} · {attempt.overall ?? "—"}%
+              </option>)}
+            </select>
+          </label>
+          {selected && <div className="passport-reviewed-result">
+            <div className="passport-reviewed-summary"><span>{t("reviewedResult")}</span><strong>{selected.overall ?? "—"}<small> / 100</small></strong></div>
+            <p>{t("assessmentReview_approved")}{selected.reviewed_at ? ` · ${new Date(Number(selected.reviewed_at) * 1000).toLocaleDateString()}` : ""}</p>
+          </div>}
+          <p className="passport-skill-note">{t("allReviewedSkillsIncluded")}</p>
+          <ul className="gaps passport-skills">{Object.entries(topics).map(([key, topic]) => (
+            <li key={key}>
+              <div className="passport-skill-choice">
+                <span className="passport-skill-info"><strong>{t(`topic_${key}`) === `topic_${key}` ? key : t(`topic_${key}`)}</strong><small>{t("levels")[topic.level]} · {topic.n} {t("questionsAnswered")}</small></span>
+                <span className="passport-skill-score">{topic.score}%</span>
+              </div>
+              <Bar score={topic.score} />
+              <span className="passport-skill-reviewed"><span aria-hidden="true">✓</span> {t("skillReviewed")}</span>
+            </li>
+          ))}</ul>
+          <label className="check"><input type="checkbox" checked={name} onChange={(e) => setName(e.target.checked)} /> {t("showName")}</label>
+        </>}
         <Err e={err} />
-        <button className="btn" onClick={create} disabled={!sel.length}>
-          {t("createPass")}
-        </button>
+        {eligible.length > 0 && <button className="btn" onClick={create}>{t("createPass")}</button>}
       </div>
       {st.passports.length > 0 && (
         <div className="card">
@@ -2573,23 +3085,12 @@ function Passport({ st, refresh }) {
                   <span className="chip chip-rev">{t("revoked")}</span>
                 ) : (
                   <span className="row">
-                    <a
-                      className="btn ghost sm"
-                      href={`#/p/${p.id}`}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {t("open")}
-                    </a>
-                    <button className="btn ghost sm" onClick={() => copy(p.id)}>
-                      {copied === p.id ? t("copied") : t("copy")}
-                    </button>
-                    <button
-                      className="btn ghost sm"
-                      onClick={() => revoke(p.id)}
-                    >
-                      {t("revoke")}
-                    </button>
+                    {p.reviewed && <>
+                      <a className="btn ghost sm" href={`#/p/${p.id}`} target="_blank" rel="noreferrer">{t("open")}</a>
+                      <button className="btn ghost sm" onClick={() => copy(p.id)}>{copied === p.id ? t("copied") : t("copy")}</button>
+                    </>}
+                    {!p.reviewed && <span className="chip chip-rev">{t("passportReviewRequired")}</span>}
+                    <button className="btn ghost sm" onClick={() => revoke(p.id)}>{t("revoke")}</button>
                   </span>
                 )}
               </li>
@@ -2640,86 +3141,46 @@ function PublicPassport({ id }) {
   const t = useT();
   const [d, setD] = useState(null);
   const [nf, setNf] = useState(false);
-  useEffect(() => {
-    api(`/public/passport/${id}`)
-      .then(setD)
-      .catch(() => setNf(true));
-  }, [id]);
-  if (nf)
-    return (
-      <main className="wrap">
-        <p className="note">{t("passNotFound")}</p>
-      </main>
-    );
-  if (!d)
-    return (
-      <main className="wrap">
-        <p>{t("loading")}</p>
-      </main>
-    );
-  if (d.revoked)
-    return (
-      <main className="wrap">
-        <p className="note">{t("passRevoked")}</p>
-      </main>
-    );
+  useEffect(() => { api(`/public/passport/${id}`).then(setD).catch(() => setNf(true)); }, [id]);
+  if (nf) return <main className="wrap"><p className="note">{t("passNotFound")}</p></main>;
+  if (!d) return <main className="wrap"><p>{t("loading")}</p></main>;
+  if (d.review_required) return <main className="wrap"><p className="note">{t("publicPassportReviewRequired")}</p></main>;
+  if (d.revoked) return <main className="wrap"><p className="note">{t("passRevoked")}</p></main>;
   const p = d.passport;
+  const totalQuestions = p.skills.reduce((total, skill) => total + (skill.questions || 0), 0);
   return (
-    <main className="wrap">
-      <article className="card passport">
-        <header>
-          <h1>{t("passportTitle")}</h1>
-          <span
-            className={"chip " + (d.signature_valid ? "chip-ok" : "chip-rev")}
-          >
-            {d.signature_valid ? t("sigOk") : t("sigBad")}
-          </span>
+    <main className="wrap public-passport-page">
+      <article className="card passport public-passport">
+        <header className="public-passport-header">
+          <div className="public-passport-brand"><span className="public-passport-mark">S</span><span>{t("brand")}<small>{t("passportCredential")}</small></span></div>
+          <span className={"passport-signature " + (d.signature_valid ? "valid" : "invalid")}><span aria-hidden="true">{d.signature_valid ? "✓" : "!"}</span>{d.signature_valid ? t("sigOk") : t("sigBad")}</span>
         </header>
         {d.expired && <p className="err">{t("passExpired")}</p>}
-        <dl className="facts">
-          <div>
-            <dt>{t("holder")}</dt>
-            <dd>{p.holder}</dd>
-          </div>
-          <div>
-            <dt>{t("issued")}</dt>
-            <dd>{p.issued}</dd>
-          </div>
-          <div>
-            <dt>{t("expires")}</dt>
-            <dd>{p.expires}</dd>
-          </div>
-        </dl>
-        <h3>{t("verified")}</h3>
-        <ul className="gaps">
+        <section className="public-passport-hero">
+          <div><span className="public-passport-kicker">{t("reviewedCredential")}</span><h1>{p.holder}</h1><p>{t("assessmentReview_approved")}{p.assessment?.reviewed_at ? ` · ${new Date(Number(p.assessment.reviewed_at) * 1000).toLocaleDateString()}` : ""}</p></div>
+          {p.assessment && <div className="public-passport-overall"><span>{t("overall")}</span><strong>{p.assessment.overall}<small>/100</small></strong><span>{t("overallReviewedScore")}</span></div>}
+        </section>
+        <div className="public-passport-meta">
+          <div><span>{t("issued")}</span><strong>{p.issued}</strong></div>
+          <div><span>{t("expires")}</span><strong>{p.expires}</strong></div>
+          <div><span>{t("assessedSkills")}</span><strong>{p.skills.length}</strong></div>
+          <div><span>{t("questionsAssessed")}</span><strong>{totalQuestions}</strong></div>
+        </div>
+        <section className="public-passport-skills">
+          <div className="public-passport-section-heading"><div><h2>{t("verified")}</h2><p>{t("individualSkillsReviewed")}</p></div><span>{p.skills.length} {t("skillsLabel")}</span></div>
+          <ul className="gaps">
           {p.skills.map((s) => (
-            <li key={s.skill}>
-              <div className="gaprow">
-                <strong>{s.name}</strong>
-                <span className="muted">
-                  {t("levels")[s.level]} · {s.date}
-                </span>
-                <span>
-                  {s.score}% <TrustChip trust={s.trust} />
-                </span>
-              </div>
+            <li key={s.skill} className="public-skill-card">
+              <div className="public-skill-card-heading"><span className="public-skill-icon" aria-hidden="true">{s.name.slice(0, 1).toUpperCase()}</span><div className="public-skill-title"><strong>{s.name}</strong><span>{t("levels")[s.level]}</span></div><span className="public-skill-assessed"><span aria-hidden="true">✓</span>{t("skillReviewed")}</span></div>
+              <div className="public-skill-score"><strong>{s.score}<small>%</small></strong><span>{s.questions} {t("questionsAssessed")}</span></div>
               <Bar score={s.score} />
+              <div className="public-skill-card-footer"><span>{t("date")}: {s.date}</span></div>
             </li>
           ))}
-        </ul>
-        {p.uplift && (
-          <p className="note">
-            {t("upliftTitle")}: {p.uplift.pre}% → {p.uplift.post}% (
-            {p.uplift.delta >= 0 ? "+" : ""}
-            {p.uplift.delta})
-          </p>
-        )}
-        <small className="muted">{p.issuer}</small>
-        <p>
-          <a href="#/" className="link">
-            {t("back")}
-          </a>
-        </p>
+          </ul>
+        </section>
+        {p.uplift && <p className="note">{t("upliftTitle")}: {p.uplift.pre}% → {p.uplift.post}% ({p.uplift.delta >= 0 ? "+" : ""}{p.uplift.delta})</p>}
+        <footer className="public-passport-footer"><span>{p.issuer} · {t("mockLabel")}</span><a href="#/" className="link">{t("brand")}</a></footer>
       </article>
     </main>
   );

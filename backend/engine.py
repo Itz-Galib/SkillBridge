@@ -132,13 +132,18 @@ def public_question(q, state):
     else: d["schema"] = SQL_SCHEMA
     return d
 
-def record_answer(state, q, answer, seconds):
+def record_answer(state, q, answer, seconds, answer_text=None, started_at=None, submitted_at=None):
     if q["type"] == "mcq":
         try: correct = int(answer) == q["answer"]
         except (TypeError, ValueError): correct = False
     else:
         correct = grade_sql(state["seed"], q, str(answer or ""))
-    state["answers"].append({"qid": q["id"], "topic": q["topic"], "difficulty": q["difficulty"], "type": q["type"], "answer": str(answer or ""), "correct": correct, "seconds": round(seconds, 1)})
+    state["answers"].append({
+        "qid": q["id"], "topic": q["topic"], "difficulty": q["difficulty"], "type": q["type"],
+        "correct": correct, "seconds": round(max(0, seconds), 1),
+        "answer": str(answer_text if answer_text is not None else answer or ""),
+        "started_at": started_at, "submitted_at": submitted_at,
+    })
     state["used"].append(q["id"])
     if q["topic"] == "sql": state["sql_taken"] += 1
     state["level"] = max(1, min(3, state["level"] + (1 if correct else -1)))
@@ -160,17 +165,19 @@ def score(answers):
     return {"overall": overall, "level": level_of(overall), "topics": out}
 
 TRUST_RULES = {
-    "rule_version": "phase1-v1",
+    "rule_version": "phase2-v1",
     "normalize_per_30_minutes": True,
     "weights": {
         "external_clipboard": 2, "leave_window": 1,
         "fullscreen_exit": 1, "screen_share_stopped": 3,
         "wrong_share_surface": 3, "heartbeat_gap": 2,
+        "ai_gaze_away": 0.5, "ai_multiple_faces": 1, "ai_no_face": 0.5, "ai_phone_detected": 1,
     },
     "caps": {
         "external_clipboard": 3, "leave_window": 4,
         "fullscreen_exit": 3, "screen_share_stopped": 2,
         "wrong_share_surface": 1, "heartbeat_gap": 3, "fast": 4,
+        "ai_gaze_away": 2, "ai_multiple_faces": 1, "ai_no_face": 2, "ai_phone_detected": 1,
     },
 }
 
@@ -216,7 +223,8 @@ def trust_label(events, answers, rules=None, exam_seconds=1200, question_times=N
     points = 0
     reasons = []
     hard_flags = set()
-    weights, caps = rules.get("weights", {}), rules.get("caps", {})
+    weights = {**TRUST_RULES.get("weights", {}), **(rules.get("weights") or {})}
+    caps = {**TRUST_RULES.get("caps", {}), **(rules.get("caps") or {})}
     clipboard_n = sum(1 for e in events if _event_value(e, "type") in {"copy", "cut", "paste"} and _event_value(e, "external", True))
     clipboard_charged = min(clipboard_n, caps.get("external_clipboard", 3))
     if clipboard_charged:
@@ -261,6 +269,14 @@ def trust_label(events, answers, rules=None, exam_seconds=1200, question_times=N
             value = charged * weights.get(reason_key, 2 if reason_key == "heartbeat_gap" else 1)
             points += value
             reasons.append({"key": reason_key, "n": charged, "points": value})
+    # Client-side AI signals are advisory only, capped and never treated as hard flags.
+    for kind in ("ai_gaze_away", "ai_multiple_faces", "ai_no_face", "ai_phone_detected"):
+        n = sum(1 for e in events if _event_value(e, "type") == kind)
+        charged = min(n, caps.get(kind, 1))
+        if charged:
+            value = charged * weights.get(kind, 1)
+            points += value
+            reasons.append({"key": kind, "n": charged, "points": value, "advisory": True})
     for event in events:
         flag = _event_value(event, "hard_flag")
         if flag:
@@ -661,7 +677,6 @@ def compute_result_scores(rows, fundamental_weight=0.6):
                    "label": "CV & development skills (AI/ML, Git, Docker and other confirmed CV skills)"},
         },
     }
-
 
 # ---------- gap map + learning path ----------
 def gap_map(topic_scores):

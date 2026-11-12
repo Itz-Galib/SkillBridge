@@ -155,7 +155,7 @@ summary { cursor: pointer; font-weight: 600; margin: .4rem 0; }
 .sidebar-profile strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.82rem}.sidebar-profile small{display:block;color:#7b879a;font-size:.7rem}
 .sidebar-group{margin-bottom:17px}.sidebar-group>p{font-size:.63rem;font-weight:800;letter-spacing:.13em;color:#a0aabd;padding:0 10px;margin:0 0 7px}
 .sidebar-group button{width:100%;display:flex;align-items:center;gap:12px;text-align:left;border:0;background:transparent;color:#65738a;padding:10px 12px;margin:3px 0;border-radius:10px;font-size:.83rem;font-weight:600;cursor:pointer;transition:background .15s,color .15s}
-.sidebar-group button>span{width:21px;font-size:1.05rem;text-align:center}.sidebar-group button.active{background:#edf1ff;color:#315ce8}.sidebar-group button:hover:not(.active){background:#f7f8fc;color:#23354b}
+.sidebar-group button>span{width:21px;font-size:1.05rem;text-align:center}.sidebar-group button.active{background:#edf1ff;color:#315ce8}.sidebar-group button:hover:not(.active){background:#f7f8fc;color:#23354b}.sidebar-group button:disabled{opacity:.55;cursor:not-allowed}.sidebar-nav-count{display:grid;place-items:center;min-width:21px;height:21px;margin-left:auto;padding:0 6px;border-radius:99px;background:#edf1ff;color:#315ce8;font-size:.67rem;font-weight:800}
 .sidebar-bottom{margin-top:auto}.sidebar-tip{padding:15px;background:#f0f5ff;border-radius:14px;border:1px solid #e2eaff}.sidebar-tip strong{font-size:.84rem}.sidebar-tip p{font-size:.74rem;color:#65738a;margin:.4rem 0 .7rem}.sidebar-tip button{padding:0;border:0;background:none;color:#315ce8;font-size:.76rem;font-weight:800;cursor:pointer}.sidebar-version{font-size:.68rem;color:#a0aabd;padding:13px 5px 0;margin:0}
 .candidate-main{min-width:0}.candidate-topbar{height:68px;position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:18px;padding:0 clamp(18px,3vw,40px);background:#ffffffed;backdrop-filter:blur(12px);border-bottom:1px solid var(--sb-border)}
 .breadcrumb{color:#8792a5;font-size:.78rem}.breadcrumb span{padding:0 8px;color:#c1c9d5}.topbar-actions{margin-left:auto;display:flex;align-items:center;gap:16px}.language-switch select{border:1px solid var(--sb-border);border-radius:9px;padding:7px 9px;background:#fff;color:#41506a;font:inherit;font-size:.75rem}.topbar-avatar{width:34px;height:34px;border-radius:50%;background:#e1f5ef;color:#11765f}.mobile-brand{display:none;align-items:center;gap:8px}
@@ -1124,3 +1124,166 @@ button,input,select,textarea{font-family:inherit}
 select{max-width:100%}
 .cr-table td,.ad-table td,.cr-applicant-table td{overflow-wrap:anywhere}
 .cr-panel,.ad-panel{overflow-wrap:anywhere}
+.exam-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}
+.exam-quit{border-color:#d6a5a0;color:#9c3329}
+.exam-quit:hover:not(:disabled){background:#fff0ee;border-color:#c77d75}
+
+
+/* Phase 2: local AI proctoring and compact evidence review */
+.ai-proctor-panel {
+  display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+  margin: 12px 0; border: 1px solid var(--line); border-radius: 12px;
+  background: var(--card); color: var(--ink); font-size: .9rem;
+}
+.ai-proctor-panel video { width: 84px; height: 64px; object-fit: cover; border-radius: 8px; background: #17252a; transform: scaleX(-1); }
+.ai-proctor-panel div { display: grid; gap: 3px; }
+.ai-proctor-panel span, .ai-proctor-panel small { color: var(--muted); }
+.ai-evidence-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(180px,1fr)); gap: 12px; margin: 12px 0 20px; }
+.ai-evidence-grid figure { margin: 0; padding: 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+.ai-evidence-grid img { display: block; width: 100%; max-height: 190px; object-fit: contain; border-radius: 6px; background: #17252a; }
+.ai-evidence-grid figcaption { margin-top: 6px; color: var(--muted); font-size: .78rem; }
+@media (max-width: 520px) { .ai-proctor-panel { align-items: flex-start; } .ai-proctor-panel video { width: 68px; height: 54px; } }
+
+
+/* Candidate assessment review status and verified score history */
+.assessment-history{margin:22px 0}
+.assessment-featured{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:18px;padding:20px;margin:12px 0;border:1px solid #b8d9c8;border-radius:14px;background:linear-gradient(120deg,#f0faf5,#fff)}
+.assessment-featured h3{margin:5px 0}.assessment-featured p,.assessment-history-row small{display:block;margin:4px 0 0;color:var(--muted);font-size:.82rem}
+.assessment-featured>strong{font-size:2rem;color:#176b4a}.assessment-featured>strong small,.assessment-history-row>strong small{font-size:.78rem;color:var(--muted);margin-left:3px}
+.assessment-pending-banner{padding:16px 18px;margin:12px 0;border:1px solid #edc98d;border-radius:12px;background:#fff8eb;color:#80520b}
+.assessment-pending-banner p{margin:5px 0 0;font-size:.86rem}
+.assessment-history-list{display:grid;gap:8px;margin-top:10px}
+.assessment-history-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:14px;padding:13px 15px;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+.assessment-history-row>strong{font-size:1.1rem}
+.status-valid{background:#e8f7f0;color:#116047}.status-review{background:#fff4e5;color:#80520b}.status-invalid{background:#fdecec;color:#9b2525}
+@media(max-width:560px){.assessment-featured,.assessment-history-row{grid-template-columns:1fr auto}.assessment-featured>.status-pill,.assessment-history-row>.status-pill{justify-self:start;grid-column:1/-1}}
+.assessment-notifications{position:fixed;right:20px;bottom:20px;z-index:20;width:min(390px,calc(100vw - 32px));font-size:.84rem}
+.assessment-notification-toggle{display:flex;align-items:center;gap:8px;margin-left:auto;padding:10px 14px;border:0;border-radius:999px;background:#145b4c;color:#fff;font:700 .8rem system-ui,sans-serif;box-shadow:0 6px 20px #14232b35;cursor:pointer}
+.assessment-notification-toggle span{display:grid;place-items:center;min-width:21px;height:21px;padding:0 5px;border-radius:99px;background:#fff;color:#145b4c;font-size:.7rem}
+.assessment-notification-panel{max-height:min(65vh,540px);overflow:auto;margin-bottom:10px;padding:16px;border:1px solid #d5e0dc;border-radius:14px;background:#fff;box-shadow:0 10px 36px #14232b2e}
+.assessment-notification-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding-bottom:12px;border-bottom:1px solid #e6ece9}
+.assessment-notification-heading div{display:grid;gap:4px}.assessment-notification-heading small{color:var(--muted)}.assessment-notification-heading strong{font-size:1.35rem;color:var(--river)}
+.assessment-notification-heading button{border:0;background:transparent;color:var(--muted);font-size:1.4rem;cursor:pointer}
+.assessment-notification-item{padding:12px 0;border-bottom:1px solid #e6ece9}.assessment-notification-item:last-child{border-bottom:0;padding-bottom:0}
+.assessment-notification-meta{display:grid;grid-template-columns:1fr auto;align-items:center;gap:6px}.assessment-notification-meta small{grid-column:1/-1;color:var(--muted)}
+.assessment-notification-score{display:block;margin-top:8px;font-size:1.05rem}.assessment-notification-item>p,.assessment-review-result p,.attempt-appeal-status p{margin:6px 0;color:var(--muted)}
+.assessment-review-result,.attempt-appeal-status{padding:10px 12px;border-radius:9px;background:#f3f6f5}
+.attempt-appeal-form{display:grid;gap:8px;margin-top:10px}.attempt-appeal-form label{display:grid;gap:6px;color:var(--muted);font-size:.78rem}
+.attempt-appeal-form textarea{width:100%;padding:9px;border:1px solid var(--line);border-radius:8px;font:inherit;resize:vertical}
+.assessment-notifications .status-pill{font-size:.65rem}
+@media(max-width:560px){.assessment-notifications{right:12px;bottom:12px;width:calc(100vw - 24px)}}
+.assessment-records{max-width:1000px;margin:0 auto}
+.assessment-records-heading{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin:4px 0 24px}
+.assessment-records-heading h1{margin:0 0 7px;font-size:clamp(1.8rem,3vw,2.4rem);letter-spacing:-.045em}
+.assessment-records-heading p{margin:0;color:#718097;font-size:.88rem}
+.assessment-total{display:grid;min-width:76px;padding:10px 15px;text-align:center;border:1px solid var(--sb-border);border-radius:14px;background:#fff}
+.assessment-total strong{font-size:1.35rem;color:#315ce8}.assessment-total small{color:#748197;font-size:.68rem}
+.assessment-record-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0 0 20px}
+.assessment-summary-card{display:flex;align-items:center;gap:12px;min-width:0;padding:16px;border:1px solid var(--sb-border);border-radius:14px;background:#fff}
+.assessment-summary-icon{display:grid;place-items:center;flex:0 0 36px;height:36px;border-radius:12px;background:#e8f7f0;color:#116047;font-weight:900}
+.assessment-summary-icon.pending{background:#fff4e5;color:#80520b}.assessment-summary-icon.rejected{background:#fdecec;color:#9b2525}
+.assessment-summary-card div{display:grid;gap:2px}.assessment-summary-card strong{font-size:1.2rem}.assessment-summary-card small{color:#748197;font-size:.72rem}
+.assessment-record-filters{display:flex;gap:8px;overflow-x:auto;margin:0 0 16px;padding:4px 1px 9px;border-bottom:1px solid #e4e9f1}
+.assessment-record-filters button{display:inline-flex;align-items:center;gap:8px;flex:0 0 auto;padding:8px 11px;border:1px solid transparent;border-radius:9px;background:transparent;color:#68768b;font:600 .76rem system-ui,sans-serif;cursor:pointer}
+.assessment-record-filters button:hover{background:#f3f5fa}.assessment-record-filters button.active{border-color:#dbe3ff;background:#edf1ff;color:#315ce8}
+.assessment-record-filters button span{display:grid;place-items:center;min-width:20px;height:20px;padding:0 5px;border-radius:99px;background:#edf0f5;color:#66758b;font-size:.65rem}
+.assessment-record-filters button.active span{background:#fff;color:#315ce8}
+.assessment-record-card{margin:12px 0;padding:18px 20px;border:1px solid #e1e7ef;border-radius:15px;background:#fff;box-shadow:0 3px 12px #20304a08;transition:border-color .15s,box-shadow .15s}
+.assessment-record-card:hover{border-color:#cdd8f5;box-shadow:0 8px 24px #20304a10}
+.assessment-record-header{display:flex;justify-content:space-between;align-items:center;gap:14px}
+.assessment-record-title{display:flex;align-items:center;gap:11px;min-width:0}
+.assessment-record-title>div{display:grid;gap:4px}.assessment-record-title strong{color:#273851;font-size:.9rem}.assessment-record-title small{color:#8792a5;font-size:.72rem}
+.assessment-record-icon{display:grid;place-items:center;width:37px;height:37px;border-radius:12px;background:#edf1ff;color:#315ce8;font-size:1.1rem;font-weight:800}
+.assessment-record-approved .assessment-record-icon{background:#e8f7f0;color:#116047}
+.assessment-record-invalidated .assessment-record-icon{background:#fdecec;color:#9b2525}
+.assessment-record-score-row{display:flex;align-items:center;gap:20px;margin:18px 0 4px}
+.assessment-record-score{display:flex;align-items:baseline;gap:8px;min-width:106px}.assessment-record-score>span{color:#8792a5;font-size:.72rem}.assessment-record-score>strong{color:#24354c;font-size:1.35rem;letter-spacing:-.04em}
+.assessment-record-score>strong small{color:#8792a5;font-size:.72rem;font-weight:600;letter-spacing:0}
+.assessment-score-track{height:7px;flex:1;overflow:hidden;border-radius:99px;background:#eef1f5}
+.assessment-score-track span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,#315ce8,#25a98b)}
+.assessment-record-reason{margin:14px 0 0;padding:11px 13px;border-left:3px solid #d6a53a;border-radius:0 8px 8px 0;background:#fff9ed;color:#6b5b39;font-size:.78rem;line-height:1.55}
+.assessment-record-empty{display:grid;justify-items:center;padding:56px 20px;text-align:center;border:1px dashed #d4dce8;border-radius:16px;background:#fff}
+.assessment-record-empty>span{display:grid;place-items:center;width:48px;height:48px;margin-bottom:10px;border-radius:15px;background:#edf1ff;color:#315ce8;font-size:1.35rem}
+.assessment-record-empty h2{margin:4px 0;font-size:1rem}.assessment-record-empty p{margin:3px 0;color:#748197;font-size:.82rem}
+.assessment-notification-toggle{font-family:system-ui,sans-serif}
+@media(max-width:620px){.assessment-record-summary{grid-template-columns:1fr}.assessment-summary-card{padding:12px}.assessment-records-heading{align-items:flex-start}.assessment-record-card{padding:15px}.assessment-record-header{align-items:flex-start;flex-direction:column}.assessment-record-score-row{gap:12px}}
+.assessment-topic-details{margin-top:15px;border-top:1px solid #edf0f5}
+.assessment-topic-details>summary{display:flex;align-items:center;gap:8px;padding:13px 0 2px;color:#40506a;font-size:.78rem;font-weight:750;cursor:pointer;list-style:none}
+.assessment-topic-details>summary::-webkit-details-marker{display:none}
+.assessment-topic-details>summary::before{content:"＋";display:grid;place-items:center;width:20px;height:20px;border-radius:6px;background:#edf1ff;color:#315ce8;font-size:.8rem}
+.assessment-topic-details[open]>summary::before{content:"−"}
+.assessment-topic-details>summary span{display:grid;place-items:center;min-width:20px;height:20px;padding:0 5px;border-radius:99px;background:#f0f3f8;color:#718097;font-size:.65rem}
+.assessment-topic-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 20px;padding:14px 0 4px}
+.assessment-topic-row{display:grid;gap:7px;min-width:0}
+.assessment-topic-label{display:flex;justify-content:space-between;gap:10px;font-size:.76rem}
+.assessment-topic-label strong{color:#35465f}.assessment-topic-label span{color:#315ce8;font-weight:800}
+.assessment-topic-row>small{color:#8792a5;font-size:.68rem}
+@media(max-width:620px){.assessment-topic-list{grid-template-columns:1fr}}
+.passport-attempt-select{display:grid;gap:7px;max-width:560px;margin:18px 0;color:#52637a;font-size:.82rem;font-weight:700}
+.passport-attempt-select select{width:100%;padding:11px 12px;border:1px solid #d8e0ec;border-radius:10px;background:#fff;color:#273851;font:inherit}
+.passport-reviewed-result{display:flex;justify-content:space-between;align-items:center;gap:14px;margin:14px 0;padding:14px 16px;border:1px solid #b8d9c8;border-radius:12px;background:linear-gradient(120deg,#f0faf5,#fff)}
+.passport-reviewed-result p{margin:0;color:#176b4a;font-size:.78rem}
+.passport-reviewed-summary{display:grid;gap:2px;color:#617188;font-size:.72rem}
+.passport-reviewed-summary strong{color:#176b4a;font-size:1.55rem}
+.passport-reviewed-summary small{color:#8792a5;font-size:.72rem}
+.passport-skills{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:16px 0;padding:0;list-style:none}
+.passport-skills>li{padding:12px;border:1px solid #e1e7ef;border-radius:11px;background:#fff}
+.passport-skill-choice{display:flex;align-items:center;gap:9px;min-width:0;cursor:pointer}
+.passport-skill-choice input{accent-color:#176b4a}
+.passport-skill-info{display:grid;gap:3px;min-width:0;flex:1}
+.passport-skill-info strong{color:#35465f;font-size:.82rem}
+.passport-skill-info small{color:#8792a5;font-size:.68rem}
+.passport-skill-score{color:#176b4a;font-size:.9rem}
+.passport-skills .bar{margin-top:9px}
+@media(max-width:620px){.passport-skills{grid-template-columns:1fr}.passport-reviewed-result{align-items:flex-start;flex-direction:column}}
+.public-passport-page{max-width:920px;padding-top:34px;padding-bottom:48px}
+.public-passport{overflow:hidden;padding:0;border:1px solid #e0e7f0;border-top:0;border-radius:20px;box-shadow:0 20px 60px #24364d12}
+.public-passport-header{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:20px 28px;border-bottom:1px solid #edf0f5;background:#fff}
+.public-passport-brand{display:flex;align-items:center;gap:11px;color:#21324a;font-size:.95rem;font-weight:850;letter-spacing:-.02em}
+.public-passport-brand>span:last-child{display:grid;gap:3px}
+.public-passport-brand small{color:#8792a5;font-size:.61rem;font-weight:750;letter-spacing:.11em}
+.public-passport-mark{display:grid;place-items:center;width:39px;height:39px;border-radius:13px;background:linear-gradient(145deg,#315ce8,#24a984);color:#fff;font-size:1.15rem}
+.passport-signature{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;border-radius:99px;font-size:.7rem;font-weight:750}
+.passport-signature>span{display:grid;place-items:center;width:17px;height:17px;border-radius:50%;font-size:.68rem}
+.passport-signature.valid{background:#e8f7f0;color:#116047}.passport-signature.valid>span{background:#c9ebda}
+.passport-signature.invalid{background:#fdecec;color:#9b2525}
+.public-passport-hero{display:flex;justify-content:space-between;align-items:center;gap:24px;padding:34px 32px;background:radial-gradient(ellipse at 92% 20%,#e0f6ed 0,transparent 42%),linear-gradient(120deg,#f3f6ff,#f8fcfa)}
+.public-passport-kicker{color:#315ce8;font-size:.68rem;font-weight:800;letter-spacing:.12em}
+.public-passport-hero h1{margin:8px 0 5px;color:#1f3048;font-size:clamp(1.7rem,4vw,2.4rem);letter-spacing:-.045em}
+.public-passport-hero p{margin:0;color:#63728a;font-size:.82rem}
+.public-passport-overall{display:grid;justify-items:end;gap:3px;min-width:135px}
+.public-passport-overall>span:first-child{color:#697a91;font-size:.72rem;font-weight:700}
+.public-passport-overall>strong{color:#176b4a;font-size:2.55rem;letter-spacing:-.06em;line-height:1}
+.public-passport-overall>strong small{margin-left:3px;color:#8792a5;font-size:.85rem;letter-spacing:0}
+.public-passport-overall>span:last-child{color:#8792a5;font-size:.65rem}
+.public-passport-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;border-bottom:1px solid #edf0f5;background:#edf0f5}
+.public-passport-meta>div{display:grid;gap:5px;padding:15px 20px;background:#fff}
+.public-passport-meta span{color:#8792a5;font-size:.67rem}
+.public-passport-meta strong{color:#34445c;font-size:.86rem}
+.public-passport-skills{padding:25px 28px 14px}
+.public-passport-section-heading{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:16px}
+.public-passport-section-heading h2{margin:0;color:#263851;font-size:1.13rem}
+.public-passport-section-heading p{margin:4px 0 0;color:#8792a5;font-size:.76rem}
+.public-passport-section-heading>span{padding:6px 10px;border-radius:99px;background:#edf1ff;color:#315ce8;font-size:.67rem;font-weight:750}
+.public-passport-skills .gaps{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.public-passport-skills .gaps>li{min-width:0;margin:0;padding:15px;border:1px solid #e4e9f1;border-radius:13px;background:#fff}
+.public-skill-card-heading{display:flex;align-items:center;gap:9px}
+.public-skill-icon{display:grid;place-items:center;flex:0 0 34px;height:34px;border-radius:10px;background:#edf1ff;color:#315ce8;font-size:.85rem;font-weight:800}
+.public-skill-title{display:grid;gap:3px;min-width:0;flex:1}
+.public-skill-title strong{overflow:hidden;color:#35465f;font-size:.84rem;text-overflow:ellipsis;white-space:nowrap}
+.public-skill-title>span{color:#8792a5;font-size:.68rem}
+.public-skill-assessed{display:flex;align-items:center;gap:4px;color:#176b4a;font-size:.61rem;font-weight:750}
+.public-skill-assessed>span{display:grid;place-items:center;width:16px;height:16px;border-radius:50%;background:#e8f7f0}
+.public-skill-score{display:flex;justify-content:space-between;align-items:baseline;margin:15px 0 5px}
+.public-skill-score strong{color:#24354c;font-size:1.55rem;letter-spacing:-.04em}
+.public-skill-score strong small{margin-left:2px;color:#8792a5;font-size:.74rem}
+.public-skill-score>span{color:#8792a5;font-size:.67rem}
+.public-skill-card .bar{margin-bottom:10px}
+.public-skill-card-footer{display:flex;justify-content:space-between;align-items:center;gap:8px;color:#8792a5;font-size:.65rem}
+.public-skill-card-footer .chip{margin:0;font-size:.6rem}
+.public-passport-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:6px 28px 0;padding:15px 0;border-top:1px solid #edf0f5;color:#8792a5;font-size:.68rem}
+.public-passport-footer .link{font-size:.72rem;font-weight:750}
+.passport-skill-note{margin:12px 0;color:#617188;font-size:.8rem}
+.passport-skill-reviewed{display:inline-flex;align-items:center;gap:5px;margin-top:8px;color:#176b4a;font-size:.67rem;font-weight:750}
+.passport-skill-reviewed>span{display:grid;place-items:center;width:16px;height:16px;border-radius:50%;background:#e8f7f0}
+@media(max-width:620px){.public-passport-page{padding:15px 10px 28px}.public-passport-header{padding:15px 17px}.public-passport-hero{align-items:flex-start;flex-direction:column;padding:25px 19px}.public-passport-overall{justify-items:start}.public-passport-meta{grid-template-columns:repeat(2,minmax(0,1fr))}.public-passport-meta>div{padding:12px 15px}.public-passport-skills{padding:20px 16px 10px}.public-passport-skills .gaps{grid-template-columns:1fr}.public-passport-footer{margin:6px 16px 0;align-items:flex-start;flex-direction:column}}
