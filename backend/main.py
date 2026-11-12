@@ -297,10 +297,12 @@ def latest_done(uid, kind=None):
 def state(u=Depends(current_user)):
     prof = one("SELECT * FROM profiles WHERE user_id=?", (u["id"],))
     atts = allr("""SELECT a.id,a.kind,a.status,a.result,a.finished,
-                   r.decision AS review_decision,r.reviewed_at
+                   r.decision AS review_decision,r.reason AS review_reason,r.reviewed_at,
+                   a.appeal,d.decision AS appeal_decision,d.reason AS appeal_reason,d.decided_at AS appeal_decided_at
                    FROM attempts a LEFT JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+                   LEFT JOIN admin_appeal_decisions d ON d.attempt_id=a.id
                    WHERE a.user_id=? ORDER BY a.finished DESC,a.started DESC""", (u["id"],))
-    pp = allr("SELECT id,created,revoked FROM passports WHERE user_id=? ORDER BY created DESC", (u["id"],))
+    pp = allr("SELECT id,created,revoked,payload FROM passports WHERE user_id=? ORDER BY created DESC", (u["id"],))
     attempt_items = []
     for a in atts:
         try:
@@ -309,8 +311,27 @@ def state(u=Depends(current_user)):
             result = {}
         attempt_items.append({
             "id": a["id"], "kind": a["kind"], "status": a["status"],
-            "overall": result.get("overall"), "finished": a["finished"],
-            "review_decision": a["review_decision"], "reviewed_at": a["reviewed_at"],
+            "overall": result.get("overall"), "level": result.get("level"),
+            "trust": result.get("trust"), "date": result.get("date"),
+            "finished": a["finished"],
+            "topics": result.get("topics", {}),
+            "review_decision": a["review_decision"], "review_reason": a["review_reason"],
+            "reviewed_at": a["reviewed_at"], "appeal": a["appeal"],
+            "appeal_decision": a["appeal_decision"], "appeal_reason": a["appeal_reason"],
+            "appeal_decided_at": a["appeal_decided_at"],
+        })
+    passport_items = []
+    for p in pp:
+        payload = json.loads(p["payload"])
+        attempt_id = payload.get("assessment", {}).get("attempt_id")
+        reviewed = bool(attempt_id and one(
+            """SELECT 1 FROM attempts a JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+               WHERE a.id=? AND a.user_id=? AND a.status='done' AND r.decision='approved'""",
+            (attempt_id, u["id"]),
+        ))
+        passport_items.append({
+            "id": p["id"], "created": p["created"], "revoked": bool(p["revoked"]),
+            "reviewed": reviewed,
         })
     return {
         "user": {"name": u["name"], "email": u["email"]},
@@ -318,7 +339,7 @@ def state(u=Depends(current_user)):
         "has_cv": bool(prof and prof["extracted"]),
         "confirmed": json.loads(prof["confirmed"]) if prof and prof["confirmed"] else None,
         "attempts": attempt_items,
-        "passports": [{"id": p["id"], "created": p["created"], "revoked": bool(p["revoked"])} for p in pp],
+        "passports": passport_items,
     }
 
 
@@ -537,6 +558,9 @@ class Ans(BaseModel):
     answer: Optional[str] = None
     session_id: str = Field(min_length=20, max_length=100)
 
+class QuitAttempt(BaseModel):
+    session_id: str = Field(min_length=20, max_length=100)
+
 
 @app.post("/api/attempts/{aid}/answer")
 def answer(aid: str, b: Ans, u=Depends(current_user)):
@@ -565,6 +589,17 @@ def answer(aid: str, b: Ans, u=Depends(current_user)):
 class SqlRun(BaseModel):
     sql: str = Field(max_length=12000)
     session_id: str = Field(min_length=20, max_length=100)
+
+
+@app.post("/api/attempts/{aid}/quit")
+def quit_attempt(aid: str, b: QuitAttempt, u=Depends(current_user)):
+    att = get_att(aid, u["id"])
+    if att["status"] != "active":
+        raise HTTPException(409, "attempt_not_active")
+    _check_exam_session(att, b.session_id)
+    run("UPDATE attempts SET status='quit', finished=? WHERE id=? AND status='active'", (time.time(), aid))
+    audit(u["id"], "attempt_quit", aid)
+    return {"status": "quit"}
 
 
 @app.post("/api/attempts/{aid}/sql-run")
@@ -730,7 +765,17 @@ def heartbeat(aid: str, b: Heartbeat, request: Request, u=Depends(current_user))
 def result(aid: str, u=Depends(current_user)):
     att = get_att(aid, u["id"])
     if att["status"] != "done": raise HTTPException(409, "Attempt not finished")
-    r = json.loads(att["result"]); r["appeal"] = att["appeal"]; r["attempt_id"] = aid
+    r = json.loads(att["result"])
+    review = one("SELECT decision,reason,reviewed_at FROM admin_attempt_reviews WHERE attempt_id=?", (aid,))
+    appeal_review = one("SELECT decision,reason,decided_at FROM admin_appeal_decisions WHERE attempt_id=?", (aid,))
+    r.update({
+        "appeal": att["appeal"], "attempt_id": aid,
+        "review_decision": review["decision"] if review else None,
+        "review_reason": review["reason"] if review else None,
+        "reviewed_at": review["reviewed_at"] if review else None,
+        "appeal_decision": appeal_review["decision"] if appeal_review else None,
+        "appeal_reason": appeal_review["reason"] if appeal_review else None,
+    })
     return r
 
 
@@ -740,7 +785,14 @@ class Appeal(BaseModel):
 
 @app.post("/api/attempts/{aid}/appeal")
 def appeal(aid: str, b: Appeal, u=Depends(current_user)):
-    get_att(aid, u["id"])
+    att = get_att(aid, u["id"])
+    if att["status"] != "done":
+        raise HTTPException(409, "attempt_not_finished")
+    review = one("SELECT decision FROM admin_attempt_reviews WHERE attempt_id=?", (aid,))
+    if not review or review["decision"] != "invalidated":
+        raise HTTPException(409, "appeal_only_available_for_invalidated_results")
+    if att.get("appeal"):
+        raise HTTPException(409, "appeal_already_submitted")
     run("UPDATE attempts SET appeal=? WHERE id=?", (b.note, aid))     # queued for human review; never changes score automatically
     audit(u["id"], "appeal", aid)
     return {"ok": True}
@@ -767,24 +819,29 @@ def uplift(u=Depends(current_user)):
 
 # ------------------------------------------------------------------ Skill Passport
 class PassBody(BaseModel):
-    topics: List[str]
+    attempt_id: str = Field(min_length=1, max_length=100)
+    topics: List[str] = Field(default_factory=list)
     show_name: bool = False
 
 
 @app.post("/api/passport")
 def make_passport(b: PassBody, u=Depends(current_user)):
     need_consent(u)
-    a = latest_done(u["id"])
-    if not a: raise HTTPException(409, "Take the assessment first")
+    a = one("""SELECT a.*,r.reviewed_at FROM attempts a JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+               WHERE a.id=? AND a.user_id=? AND a.status='done' AND r.decision='approved'""",
+            (b.attempt_id, u["id"]))
+    if not a:
+        raise HTTPException(409, "passport_requires_approved_reviewed_assessment")
     r = json.loads(a["result"])
-    skills = [{"skill": t, "name": TAXONOMY[t]["name"], "score": r["topics"][t]["score"], "level": r["topics"][t]["level"], "trust": r["trust"], "date": r["date"]}
-              for t in b.topics if t in r["topics"]]
-    if not skills: raise HTTPException(422, "Choose at least one verified skill")
-    up = uplift(u)
+    skills = [{"skill": t, "name": TAXONOMY[t]["name"], "score": topic["score"], "level": topic["level"], "questions": topic["n"], "trust": r["trust"], "date": r["date"], "reviewed": True}
+              for t, topic in r["topics"].items() if t in TAXONOMY]
+    if not skills: raise HTTPException(409, "reviewed_assessment_has_no_skill_breakdown")
     pid = secrets.token_urlsafe(9)
     payload = {"pid": pid, "issued": time.strftime("%Y-%m-%d"), "expires": time.strftime("%Y-%m-%d", time.localtime(time.time() + 365 * 86400)),
                "holder": u["name"] if b.show_name else "Anonymous candidate", "skills": skills,
-               "uplift": up["overall"] if up["available"] else None, "issuer": "SkillBridge Global R0 prototype"}
+               "assessment": {"attempt_id": a["id"], "overall": r["overall"], "review_decision": "approved",
+                              "reviewed_at": a["reviewed_at"], "kind": a["kind"]},
+               "uplift": None, "issuer": "SkillBridge Global R0 prototype"}
     run("INSERT INTO passports(id,user_id,payload,signature,created) VALUES (?,?,?,?,?)", (pid, u["id"], json.dumps(payload), E.sign_payload(payload, SECRET), time.time()))
     audit(u["id"], "passport_create", pid)
     return {"id": pid}
@@ -806,7 +863,14 @@ def public_passport(pid: str):
     payload = json.loads(p["payload"])
     valid = hmac.compare_digest(p["signature"], E.sign_payload(payload, SECRET))
     if p["revoked"]: return {"revoked": True, "signature_valid": valid}
-    return {"revoked": False, "expired": payload["expires"] < time.strftime("%Y-%m-%d"), "signature_valid": valid, "signature": p["signature"][:16], "passport": payload}
+    assessment = payload.get("assessment", {})
+    current_review = one("""SELECT 1 FROM attempts a JOIN admin_attempt_reviews r ON r.attempt_id=a.id
+                            WHERE a.id=? AND a.user_id=? AND a.status='done' AND r.decision='approved'""",
+                         (assessment.get("attempt_id"), p["user_id"])) if assessment.get("attempt_id") else None
+    if assessment.get("review_decision") != "approved" or not current_review:
+        return {"revoked": True, "review_required": True, "signature_valid": valid}
+    public_payload = {**payload, "assessment": {key: value for key, value in assessment.items() if key != "attempt_id"}}
+    return {"revoked": False, "expired": payload["expires"] < time.strftime("%Y-%m-%d"), "signature_valid": valid, "signature": p["signature"][:16], "passport": public_payload}
 
 
 # Initialise the base schema before enterprise/admin modules create their extension tables.

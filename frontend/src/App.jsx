@@ -436,6 +436,7 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
   const [out, setOut] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [quitting, setQuitting] = useState(false);
   const [left, setLeft] = useState(initial.remaining);
   const [unlimitedTime, setUnlimitedTime] = useState(Boolean(initial.unlimited_time));
   const [stream, setStream] = useState(screenStream || null);
@@ -515,14 +516,23 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
   useEffect(() => {
     const inCodeEditor = (target) => Boolean(target?.closest?.("textarea.code, [contenteditable='true']"));
     const clipboard = (event) => {
-      // Candidate may use normal clipboard shortcuts inside the SQL editor.
-      if (inCodeEditor(event.target)) return;
+      if (event.type !== "paste" && inCodeEditor(event.target)) return;
       event.preventDefault();
-      report(event.type, { editor: false });
+      report(event.type, { editor: inCodeEditor(event.target) });
       setIntegrityNotice(t("clipboardBlocked"));
     };
     const keyboard = (event) => {
       const key = String(event.key || "").toLowerCase();
+      if (key === "f11" || (key === "escape" && document.fullscreenElement)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      if (inCodeEditor(event.target) && (event.ctrlKey || event.metaKey) && key === "v") {
+        event.preventDefault();
+        report("paste", { editor: true });
+        setIntegrityNotice(t("clipboardBlocked"));
+        return;
+      }
       if (inCodeEditor(event.target)) return;
       if ((event.ctrlKey || event.metaKey) && ["c", "v", "x"].includes(key)) {
         event.preventDefault();
@@ -549,10 +559,18 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
       }
     };
     const focus = () => report("focus");
+    const blockOutsideExam = (event) => {
+      if (event.target?.closest?.(".exam")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      setIntegrityNotice(t("examNavigationLocked"));
+    };
     document.addEventListener("copy", clipboard, true);
     document.addEventListener("cut", clipboard, true);
     document.addEventListener("paste", clipboard, true);
     document.addEventListener("keydown", keyboard, true);
+    document.addEventListener("click", blockOutsideExam, true);
     document.addEventListener("contextmenu", contextMenu, true);
     document.addEventListener("visibilitychange", visibility);
     document.addEventListener("fullscreenchange", fullscreen);
@@ -563,6 +581,7 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
       document.removeEventListener("cut", clipboard, true);
       document.removeEventListener("paste", clipboard, true);
       document.removeEventListener("keydown", keyboard, true);
+      document.removeEventListener("click", blockOutsideExam, true);
       document.removeEventListener("contextmenu", contextMenu, true);
       document.removeEventListener("visibilitychange", visibility);
       document.removeEventListener("fullscreenchange", fullscreen);
@@ -645,6 +664,18 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
       if (r.status === "done") onFinished(aid);
     } catch (e) { setErr(e); } finally { setBusy(false); }
   };
+  const quit = async () => {
+    if (!window.confirm(t("quitConfirm"))) return;
+    setQuitting(true);
+    setErr(null);
+    try {
+      await api(`/attempts/${aid}/quit`, { method: "POST", body: { session_id: sessionId.current } });
+      await onFinished(aid);
+    } catch (e) {
+      setErr(e);
+      setQuitting(false);
+    }
+  };
   const runSql = async () => {
     if (!shareActive) { setShareNotice(t("shareRequired")); return; }
     try { setOut(await api(`/attempts/${aid}/sql-run`, { method: "POST", body: { sql: ans, session_id: sessionId.current } })); } catch (e) { setErr(e); }
@@ -694,20 +725,20 @@ function ExamRun({ initial, onFinished, screenStream, cameraStream }) {
         </>
       )}
       <Err e={err} />
-      <button className="btn" onClick={submit} disabled={busy || !shareActive || !fullscreenActive || String(ans).trim() === ""}>{busy ? t("saving") : t("submit")}</button>
+      <div className="exam-actions">
+        <button className="btn" onClick={submit} disabled={busy || quitting || !shareActive || !fullscreenActive || String(ans).trim() === ""}>{busy ? t("saving") : t("submit")}</button>
+        <button type="button" className="btn ghost exam-quit" onClick={quit} disabled={busy || quitting}>{quitting ? t("quitBusy") : t("quitButton")}</button>
+      </div>
     </section>
   );
 }
 function Result({ aid, next, nextLabel }) {
   const t = useT();
   const [r, setR] = useState(null);
-  const [note, setNote] = useState("");
-  const [sent, setSent] = useState(false);
   const [err, setErr] = useState(null);
   useEffect(() => { api(`/attempts/${aid}/result`).then(setR).catch(setErr); }, [aid]);
   if (err) return <Err e={err} />;
   if (!r) return <p>{t("loading")}</p>;
-  const sendAppeal = async () => { try { await api(`/attempts/${aid}/appeal`, { method: "POST", body: { note } }); setSent(true); } catch (e) { setErr(e); } };
   return (
     <section>
       <h2>{t("resultTitle")}</h2>
@@ -734,15 +765,177 @@ function Result({ aid, next, nextLabel }) {
       <div className="card quiet">
         <p>{t("trustNote")}</p>
         {r.trust_reasons.length > 0 && <ul>{r.trust_reasons.map((x) => <li key={x.key}>{x.n} × {t("reasonLabels")[x.key]}</li>)}</ul>}
-        <h3>{t("appealTitle")}</h3>
-        {r.appeal || sent ? <p className="note">{t("appealSent")}</p> : (
-          <div className="row">
-            <input value={note} onChange={(e) => setNote(e.target.value)} placeholder={t("appealPh")} />
-            <button className="btn ghost" disabled={note.trim().length < 3} onClick={sendAppeal}>{t("appealBtn")}</button>
-          </div>
-        )}
+        {r.review_decision && <div className="assessment-review-result">
+          <strong>{t(`assessmentReview_${r.review_decision}`)}</strong>
+          {r.review_reason && <p>{r.review_reason}</p>}
+        </div>}
+        {r.review_decision === "invalidated" && <><h3>{t("appealTitle")}</h3><AttemptAppeal attempt={r} onSubmitted={async () => {
+          const updated = await api(`/attempts/${aid}/result`);
+          setR(updated);
+        }} /></>}
       </div>
       {next && <button className="btn" onClick={next}>{nextLabel}</button>}
+    </section>
+  );
+}
+
+function AttemptAppeal({ attempt, onSubmitted }) {
+  const t = useT();
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [submitted, setSubmitted] = useState(false);
+  const submit = async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    setErr(null);
+    try {
+      await api(`/attempts/${attempt.id || attempt.attempt_id}/appeal`, { method: "POST", body: { note } });
+      setNote("");
+      await onSubmitted();
+      setSubmitted(true);
+    } catch (error) {
+      setErr(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (attempt.appeal || submitted) return (
+    <div className="attempt-appeal-status">
+      <strong>{attempt.appeal_decision ? t(`appeal_${attempt.appeal_decision}`) : t("appealPending")}</strong>
+      {attempt.appeal_reason && <p>{attempt.appeal_reason}</p>}
+    </div>
+  );
+  if (attempt.review_decision !== "invalidated") return null;
+  return (
+    <form className="attempt-appeal-form" onSubmit={submit}>
+      <label>{t("appealHelp")}<textarea value={note} onChange={(event) => setNote(event.target.value)} minLength={3} maxLength={1000} rows={3} required /></label>
+      {err && <Err e={err} />}
+      <button className="btn ghost sm" disabled={busy || note.trim().length < 3}>{busy ? t("saving") : t("appealBtn")}</button>
+    </form>
+  );
+}
+
+function AssessmentNotifications({ attempts, onRefresh }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  const latest = attempts[0];
+  const latestKey = latest ? `${latest.id}:${latest.reviewed_at}:${latest.review_decision}` : "";
+  const previousKey = useRef(latestKey);
+  useEffect(() => {
+    if (previousKey.current && latestKey && previousKey.current !== latestKey) setOpen(true);
+    previousKey.current = latestKey;
+  }, [latestKey]);
+  if (!attempts.length) return null;
+  const date = (timestamp) => timestamp
+    ? new Date(Number(timestamp) * 1000).toLocaleString()
+    : "";
+  const statusKey = (decision) => `assessmentReview_${decision}`;
+  return (
+    <aside className="assessment-notifications" aria-live="polite">
+      <button className="assessment-notification-toggle" onClick={() => setOpen((value) => !value)}>
+        {t("assessmentUpdates")} <span>{attempts.length}</span>
+      </button>
+      {open && <div className="assessment-notification-panel">
+        <div className="assessment-notification-heading">
+          <div><small>{t("latestReviewed")}</small><strong>{latest.overall ?? "—"} / 100</strong></div>
+          <button type="button" aria-label={t("close")} onClick={() => setOpen(false)}>×</button>
+        </div>
+        {attempts.slice(0, 3).map((attempt) => (
+          <article className="assessment-notification-item" key={attempt.id}>
+            <div className="assessment-notification-meta">
+              <strong>{attempt.kind === "post" ? t("attemptRetest") : t("attemptInitial")}</strong>
+              <span className={"status-pill " + (attempt.review_decision === "approved" ? "status-valid" : attempt.review_decision === "invalidated" ? "status-invalid" : "status-review")}>
+                {t(statusKey(attempt.review_decision))}
+              </span>
+              <small>{date(attempt.reviewed_at)}</small>
+            </div>
+            <strong className="assessment-notification-score">{attempt.overall ?? "—"} / 100</strong>
+            {attempt.review_reason && <p>{attempt.review_reason}</p>}
+            {attempt.review_decision === "invalidated" && <AttemptAppeal attempt={attempt} onSubmitted={onRefresh} />}
+          </article>
+        ))}
+      </div>}
+    </aside>
+  );
+}
+
+function AssessmentRecords({ attempts, onRefresh }) {
+  const t = useT();
+  const [filter, setFilter] = useState("all");
+  const records = [...attempts].filter((attempt) => attempt.status === "done")
+    .sort((a, b) => (b.finished || 0) - (a.finished || 0));
+  const counts = {
+    all: records.length,
+    approved: records.filter((attempt) => attempt.review_decision === "approved").length,
+    pending: records.filter((attempt) => !attempt.review_decision || attempt.review_decision === "needs_more_info").length,
+    invalidated: records.filter((attempt) => attempt.review_decision === "invalidated").length,
+  };
+  const visibleRecords = filter === "all" ? records : records.filter((attempt) =>
+    filter === "pending"
+      ? !attempt.review_decision || attempt.review_decision === "needs_more_info"
+      : attempt.review_decision === filter);
+  const date = (timestamp) => timestamp
+    ? new Date(Number(timestamp) * 1000).toLocaleString()
+    : "";
+  const filters = [
+    ["all", t("allRecords")],
+    ["approved", t("assessmentReview_approved")],
+    ["pending", t("assessmentReview_pending")],
+    ["invalidated", t("assessmentReview_invalidated")],
+  ];
+  return (
+    <section className="assessment-records">
+      <header className="assessment-records-heading">
+        <div><span className="eyebrow">{t("assessmentUpdates")}</span><h1>{t("assessmentRecords")}</h1><p>{t("assessmentRecordsHelp")}</p></div>
+        <span className="assessment-total"><strong>{records.length}</strong><small>{t("records")}</small></span>
+      </header>
+      {!!records.length && <div className="assessment-record-summary">
+        <article className="assessment-summary-card"><span className="assessment-summary-icon">✓</span><div><strong>{counts.approved}</strong><small>{t("assessmentReview_approved")}</small></div></article>
+        <article className="assessment-summary-card"><span className="assessment-summary-icon pending">◷</span><div><strong>{counts.pending}</strong><small>{t("assessmentReview_pending")}</small></div></article>
+        <article className="assessment-summary-card"><span className="assessment-summary-icon rejected">!</span><div><strong>{counts.invalidated}</strong><small>{t("assessmentReview_invalidated")}</small></div></article>
+      </div>}
+      <nav className="assessment-record-filters" aria-label={t("filterAssessments")}>
+        {filters.map(([id, label]) => <button key={id} type="button" aria-pressed={filter === id} className={filter === id ? "active" : ""} onClick={() => setFilter(id)}>
+          {label}<span>{counts[id]}</span>
+        </button>)}
+      </nav>
+      {!visibleRecords.length ? <div className="assessment-record-empty"><span aria-hidden="true">◷</span><h2>{records.length ? t("noMatchingAssessments") : t("noAssessmentRecords")}</h2><p>{records.length ? t("changeAssessmentFilter") : t("assessmentRecordsHelp")}</p></div> : visibleRecords.map((attempt) => {
+        const status = attempt.review_decision || "pending";
+        const label = status === "pending" ? t("assessmentReview_pending") : t(`assessmentReview_${status}`);
+        return (
+          <article className={`assessment-record-card assessment-record-${status}`} key={attempt.id}>
+            <header className="assessment-record-header">
+              <div className="assessment-record-title"><span className="assessment-record-icon">{attempt.kind === "post" ? "↻" : "✓"}</span><div><strong>{attempt.kind === "post" ? t("attemptRetest") : t("attemptInitial")}</strong><small>{date(attempt.finished)}</small></div></div>
+              <span className={"status-pill " + (status === "approved" ? "status-valid" : status === "invalidated" ? "status-invalid" : "status-review")}>{label}</span>
+            </header>
+            <div className="assessment-record-score-row">
+              <div className="assessment-record-score"><span>{t("score")}</span><strong>{attempt.overall ?? "—"}<small> / 100</small></strong></div>
+              <div className="assessment-score-track" role="img" aria-label={`${t("score")}: ${attempt.overall ?? 0}%`}>
+                <span style={{ width: `${Math.max(0, Math.min(100, Number(attempt.overall) || 0))}%` }} />
+              </div>
+            </div>
+            {Object.keys(attempt.topics || {}).length > 0 && <details className="assessment-topic-details">
+              <summary>{t("topicBreakdown")} <span>{Object.keys(attempt.topics).length}</span></summary>
+              <div className="assessment-topic-list">
+                {["sql", "python", "statistics", "visualization", ...Object.keys(attempt.topics)]
+                  .filter((topic, index, topics) => topic in attempt.topics && topics.indexOf(topic) === index)
+                  .map((topic) => {
+                    const topicResult = attempt.topics[topic];
+                    const topicScore = Math.max(0, Math.min(100, Number(topicResult.score) || 0));
+                    return <div className="assessment-topic-row" key={topic}>
+                      <div className="assessment-topic-label"><strong>{t(`topic_${topic}`)}</strong><span>{topicScore}%</span></div>
+                      <div className="assessment-score-track"><span style={{ width: `${topicScore}%` }} /></div>
+                      <small>{topicResult.n} {t("questionsAnswered")}</small>
+                    </div>;
+                  })}
+              </div>
+            </details>}
+            {attempt.review_reason && <p className="assessment-record-reason"><strong>{t("reviewReason")}:</strong> {attempt.review_reason}</p>}
+            <AttemptAppeal attempt={attempt} onSubmitted={onRefresh} />
+          </article>
+        );
+      })}
     </section>
   );
 }
@@ -938,8 +1131,32 @@ function Exam({ kind, st, refresh, afterResult, afterLabel }) {
     <section className="card narrow">
       <h2>{t("resume")}</h2>
       <p>{t("shareBeforeResume")}</p>
-      <button className="btn" onClick={start}>{t("resume")}</button>
+      <div className="card exam-setup-steps">
+        <p><strong>System check</strong></p>
+        <p>{mobileDevice ? "✕ Desktop device required" : "✓ Desktop device"} · {browserSupported ? "✓ Browser APIs supported" : "✕ Screen sharing/full-screen unsupported"} · {navigator.onLine ? "✓ Network available" : "✕ Network offline"}</p>
+        <div className="row">
+          <span>{shareReady ? "✓" : "1."} {t("shareSetupStep")}</span>
+          <button type="button" className="btn ghost sm" onClick={enableScreenShare} disabled={setupBusy}>
+            {shareReady ? t("shareActive") : t("restartShare")}
+          </button>
+        </div>
+        <div className="row">
+          <span>{cameraReady ? "✓" : "2."} Enable webcam for local AI analysis</span>
+          <button type="button" className="btn ghost sm" onClick={enableCamera} disabled={setupBusy}>
+            {cameraReady ? "Camera ready" : "Enable camera"}
+          </button>
+        </div>
+        <div className="row">
+          <span>{fullscreenReady ? "✓" : "3."} {t("fullscreenSetupStep")}</span>
+          <button type="button" className="btn ghost sm" onClick={enableFullscreen} disabled={setupBusy}>
+            {fullscreenReady ? t("fullscreenActive") : t("restartFullscreen")}
+          </button>
+        </div>
+      </div>
       <Err e={err} />
+      <button className="btn" onClick={start} disabled={setupBusy || mobileDevice || !browserSupported || !navigator.onLine || !shareReady || !fullscreenReady || !cameraReady}>
+        {setupBusy ? t("saving") : t("resume")}
+      </button>
     </section>
   );
   if (mine) return (
@@ -1021,32 +1238,61 @@ function Learn({ onNext }) {
 /* ---------- passport ---------- */
 function Passport({ st, refresh }) {
   const t = useT();
-  const [res, setRes] = useState(null);
-  const [sel, setSel] = useState([]);
+  const eligible = st.attempts.filter((attempt) => attempt.status === "done" && attempt.review_decision === "approved")
+    .sort((a, b) => (b.reviewed_at || 0) - (a.reviewed_at || 0));
+  const [selectedId, setSelectedId] = useState(eligible[0]?.id || "");
   const [name, setName] = useState(false);
   const [err, setErr] = useState(null);
   const [copied, setCopied] = useState(null);
-  const done = st.attempts.filter((a) => a.status === "done");
-  const latest = done[done.length - 1];
-  useEffect(() => {
-    if (latest) api(`/attempts/${latest.id}/result`).then((r) => { setRes(r); setSel(Object.keys(r.topics)); }).catch(setErr);
-  }, [latest?.id]);
-  const create = async () => { try { await api("/passport", { method: "POST", body: { topics: sel, show_name: name } }); refresh(); } catch (e) { setErr(e); } };
+  const selected = eligible.find((attempt) => attempt.id === selectedId) || eligible[0];
+  const topics = selected?.topics || {};
+  const create = async () => {
+    if (!selected) return;
+    setErr(null);
+    try {
+      await api("/passport", { method: "POST", body: { attempt_id: selected.id, show_name: name } });
+      await refresh();
+    } catch (e) { setErr(e); }
+  };
+  const selectAttempt = (id) => {
+    setSelectedId(id);
+    setErr(null);
+  };
   const revoke = async (id) => { await api(`/passport/${id}`, { method: "DELETE" }); refresh(); };
   const link = (id) => `${location.origin}/#/p/${id}`;
   const copy = async (id) => { try { await navigator.clipboard.writeText(link(id)); setCopied(id); } catch { /* ignore */ } };
-  if (!latest) return <p className="note">{t("needVerified")}</p>;
   return (
     <section>
       <h2>{t("passportTitle")}</h2>
       <div className="card">
         <p>{t("passportHelp")}</p>
-        {res && <ul className="skills">{Object.entries(res.topics).map(([k, v]) => (
-          <li key={k}><label className="check"><input type="checkbox" checked={sel.includes(k)} onChange={() => setSel(sel.includes(k) ? sel.filter((x) => x !== k) : [...sel, k])} /> <strong>{k}</strong> · {v.score}% · {t("levels")[v.level]}</label></li>
-        ))}</ul>}
-        <label className="check"><input type="checkbox" checked={name} onChange={(e) => setName(e.target.checked)} /> {t("showName")}</label>
+        {!eligible.length ? <p className="assessment-pending-banner">{t("passportRequiresReviewed")}</p> : <>
+          <label className="passport-attempt-select">{t("selectReviewedAssessment")}
+            <select value={selected?.id || ""} onChange={(event) => selectAttempt(event.target.value)}>
+              {eligible.map((attempt) => <option key={attempt.id} value={attempt.id}>
+                {(attempt.kind === "post" ? t("attemptRetest") : t("attemptInitial"))} · {new Date(Number(attempt.finished) * 1000).toLocaleDateString()} · {attempt.overall ?? "—"}%
+              </option>)}
+            </select>
+          </label>
+          {selected && <div className="passport-reviewed-result">
+            <div className="passport-reviewed-summary"><span>{t("reviewedResult")}</span><strong>{selected.overall ?? "—"}<small> / 100</small></strong></div>
+            <p>{t("assessmentReview_approved")}{selected.reviewed_at ? ` · ${new Date(Number(selected.reviewed_at) * 1000).toLocaleDateString()}` : ""}</p>
+          </div>}
+          <p className="passport-skill-note">{t("allReviewedSkillsIncluded")}</p>
+          <ul className="gaps passport-skills">{Object.entries(topics).map(([key, topic]) => (
+            <li key={key}>
+              <div className="passport-skill-choice">
+                <span className="passport-skill-info"><strong>{t(`topic_${key}`) === `topic_${key}` ? key : t(`topic_${key}`)}</strong><small>{t("levels")[topic.level]} · {topic.n} {t("questionsAnswered")}</small></span>
+                <span className="passport-skill-score">{topic.score}%</span>
+              </div>
+              <Bar score={topic.score} />
+              <span className="passport-skill-reviewed"><span aria-hidden="true">✓</span> {t("skillReviewed")}</span>
+            </li>
+          ))}</ul>
+          <label className="check"><input type="checkbox" checked={name} onChange={(e) => setName(e.target.checked)} /> {t("showName")}</label>
+        </>}
         <Err e={err} />
-        <button className="btn" onClick={create} disabled={!sel.length}>{t("createPass")}</button>
+        {eligible.length > 0 && <button className="btn" onClick={create}>{t("createPass")}</button>}
       </div>
       {st.passports.length > 0 && (
         <div className="card">
@@ -1057,8 +1303,11 @@ function Passport({ st, refresh }) {
                 <code>{link(p.id)}</code>
                 {p.revoked ? <span className="chip chip-rev">{t("revoked")}</span> : (
                   <span className="row">
-                    <a className="btn ghost sm" href={`#/p/${p.id}`} target="_blank" rel="noreferrer">{t("open")}</a>
-                    <button className="btn ghost sm" onClick={() => copy(p.id)}>{copied === p.id ? t("copied") : t("copy")}</button>
+                    {p.reviewed && <>
+                      <a className="btn ghost sm" href={`#/p/${p.id}`} target="_blank" rel="noreferrer">{t("open")}</a>
+                      <button className="btn ghost sm" onClick={() => copy(p.id)}>{copied === p.id ? t("copied") : t("copy")}</button>
+                    </>}
+                    {!p.reviewed && <span className="chip chip-rev">{t("passportReviewRequired")}</span>}
                     <button className="btn ghost sm" onClick={() => revoke(p.id)}>{t("revoke")}</button>
                   </span>
                 )}
@@ -1096,33 +1345,43 @@ function PublicPassport({ id }) {
   useEffect(() => { api(`/public/passport/${id}`).then(setD).catch(() => setNf(true)); }, [id]);
   if (nf) return <main className="wrap"><p className="note">{t("passNotFound")}</p></main>;
   if (!d) return <main className="wrap"><p>{t("loading")}</p></main>;
+  if (d.review_required) return <main className="wrap"><p className="note">{t("publicPassportReviewRequired")}</p></main>;
   if (d.revoked) return <main className="wrap"><p className="note">{t("passRevoked")}</p></main>;
   const p = d.passport;
+  const totalQuestions = p.skills.reduce((total, skill) => total + (skill.questions || 0), 0);
   return (
-    <main className="wrap">
-      <article className="card passport">
-        <header>
-          <h1>{t("passportTitle")}</h1>
-          <span className={"chip " + (d.signature_valid ? "chip-ok" : "chip-rev")}>{d.signature_valid ? t("sigOk") : t("sigBad")}</span>
+    <main className="wrap public-passport-page">
+      <article className="card passport public-passport">
+        <header className="public-passport-header">
+          <div className="public-passport-brand"><span className="public-passport-mark">S</span><span>{t("brand")}<small>{t("passportCredential")}</small></span></div>
+          <span className={"passport-signature " + (d.signature_valid ? "valid" : "invalid")}><span aria-hidden="true">{d.signature_valid ? "✓" : "!"}</span>{d.signature_valid ? t("sigOk") : t("sigBad")}</span>
         </header>
         {d.expired && <p className="err">{t("passExpired")}</p>}
-        <dl className="facts">
-          <div><dt>{t("holder")}</dt><dd>{p.holder}</dd></div>
-          <div><dt>{t("issued")}</dt><dd>{p.issued}</dd></div>
-          <div><dt>{t("expires")}</dt><dd>{p.expires}</dd></div>
-        </dl>
-        <h3>{t("verified")}</h3>
-        <ul className="gaps">
+        <section className="public-passport-hero">
+          <div><span className="public-passport-kicker">{t("reviewedCredential")}</span><h1>{p.holder}</h1><p>{t("assessmentReview_approved")}{p.assessment?.reviewed_at ? ` · ${new Date(Number(p.assessment.reviewed_at) * 1000).toLocaleDateString()}` : ""}</p></div>
+          {p.assessment && <div className="public-passport-overall"><span>{t("overall")}</span><strong>{p.assessment.overall}<small>/100</small></strong><span>{t("overallReviewedScore")}</span></div>}
+        </section>
+        <div className="public-passport-meta">
+          <div><span>{t("issued")}</span><strong>{p.issued}</strong></div>
+          <div><span>{t("expires")}</span><strong>{p.expires}</strong></div>
+          <div><span>{t("assessedSkills")}</span><strong>{p.skills.length}</strong></div>
+          <div><span>{t("questionsAssessed")}</span><strong>{totalQuestions}</strong></div>
+        </div>
+        <section className="public-passport-skills">
+          <div className="public-passport-section-heading"><div><h2>{t("verified")}</h2><p>{t("individualSkillsReviewed")}</p></div><span>{p.skills.length} {t("skillsLabel")}</span></div>
+          <ul className="gaps">
           {p.skills.map((s) => (
-            <li key={s.skill}>
-              <div className="gaprow"><strong>{s.name}</strong><span className="muted">{t("levels")[s.level]} · {s.date}</span><span>{s.score}% <TrustChip trust={s.trust} /></span></div>
+            <li key={s.skill} className="public-skill-card">
+              <div className="public-skill-card-heading"><span className="public-skill-icon" aria-hidden="true">{s.name.slice(0, 1).toUpperCase()}</span><div className="public-skill-title"><strong>{s.name}</strong><span>{t("levels")[s.level]}</span></div><span className="public-skill-assessed"><span aria-hidden="true">✓</span>{t("skillReviewed")}</span></div>
+              <div className="public-skill-score"><strong>{s.score}<small>%</small></strong><span>{s.questions} {t("questionsAssessed")}</span></div>
               <Bar score={s.score} />
+              <div className="public-skill-card-footer"><span>{t("date")}: {s.date}</span></div>
             </li>
           ))}
-        </ul>
+          </ul>
+        </section>
         {p.uplift && <p className="note">{t("upliftTitle")}: {p.uplift.pre}% → {p.uplift.post}% ({p.uplift.delta >= 0 ? "+" : ""}{p.uplift.delta})</p>}
-        <small className="muted">{p.issuer} · {t("mockBanner")}</small>
-        <p><a href="#/" className="link">{t("back")}</a></p>
+        <footer className="public-passport-footer"><span>{p.issuer} · {t("mockLabel")}</span><a href="#/" className="link">{t("brand")}</a></footer>
       </article>
     </main>
   );
@@ -1170,19 +1429,21 @@ function CandidateApplications() {
  return <section className="portal-panel"><div className="section-toolbar"><div><span className="eyebrow">YOUR JOB SEARCH</span><h2>My applications</h2><p>Track submitted applications and control result sharing.</p></div><span className="count-badge">{items.length} total</span></div>{error&&<p className="err">{error}</p>}{!items.length&&<div className="empty-state"><h3>No applications yet</h3><p>Browse jobs and apply to a role that matches your interests.</p></div>}{items.map(a=><article className="application-row" key={a.application_id}><div className="application-logo">SB</div><div className="application-main"><h3>{a.title}</h3><p>{a.company_name} · {a.location}</p><span className="status-pill">{a.status}</span></div><div className="application-consent"><label className="check"><input type="checkbox" checked={!!a.results_shared} onChange={e=>share(a.application_id,e.target.checked)}/> Share assessment results with this employer</label><small className="muted">You can change this choice at any time.</small></div></article>)}</section>;
 }
 function CandidatePortal({st,refresh,tick,setTick,onLogout}) {
- const [section,setSection]=useState("overview");const [journeyView,setJourneyView]=useState(st.confirmed?"gap":"profile");const t=useT();const done=(st?.attempts||[]).filter(a=>a.status==="done");const latest=done[done.length-1];
- const nav=[{id:"overview",label:"Overview",icon:"⌂",group:"WORKSPACE"},{id:"profile",label:"My profile",icon:"◉",group:"WORKSPACE"},{id:"jobs",label:"Find jobs",icon:"↗",group:"WORKSPACE"},{id:"applications",label:"Applications",icon:"▤",group:"WORKSPACE"},{id:"journey",label:"Skill journey",icon:"⌁",group:"GROWTH"},{id:"passport",label:"Skill Passport",icon:"◇",group:"GROWTH"},{id:"privacy",label:"Data & privacy",icon:"▣",group:"ACCOUNT"}];
- const go=id=>{setSection(id);window.scrollTo({top:0,behavior:"smooth"});};
- return <div className="candidate-shell"><aside className="candidate-sidebar"><div className="sidebar-brand"><span className="brand-mark">S</span><span>SkillBridge<small>CAREER WORKSPACE</small></span></div><div className="sidebar-profile"><div className="avatar-small">{(st.user?.name||"C").split(" ").map(x=>x[0]).join("").slice(0,2).toUpperCase()}</div><div><strong>{st.user?.name}</strong><small>Candidate account</small></div></div>{["WORKSPACE","GROWTH","ACCOUNT"].map(group=><div className="sidebar-group" key={group}><p>{group}</p>{nav.filter(n=>n.group===group).map(n=><button key={n.id} className={section===n.id?"active":""} onClick={()=>go(n.id)}><span>{n.icon}</span>{n.label}</button>)}</div>)}<div className="sidebar-bottom"><div className="sidebar-tip"><strong>Keep growing</strong><p>Verify skills, learn from gaps and build proof of progress.</p><button onClick={()=>go("journey")}>Continue learning →</button></div><p className="sidebar-version">SkillBridge · Candidate</p></div></aside>
- <main className="candidate-main"><header className="candidate-topbar"><div className="mobile-brand"><span className="brand-mark">S</span><strong>SkillBridge</strong></div><div className="breadcrumb">Candidate workspace <span>/</span> {nav.find(n=>n.id===section)?.label}</div><div className="topbar-actions"><div className="language-switch"><select aria-label="Language" value={localStorage.getItem("sb_lang")||"en"} onChange={e=>{localStorage.setItem("sb_lang",e.target.value);location.reload();}}><option value="en">English</option><option value="bn">বাংলা</option></select></div><div className="topbar-avatar">{(st.user?.name||"C")[0]?.toUpperCase()}</div><button className="candidate-logout" onClick={onLogout}>Sign out</button></div></header><div className="candidate-page">
+ const activeAttempt=st?.attempts?.find(a=>a.status==="active");const [section,setSection]=useState(()=>activeAttempt?"journey":"overview");const [journeyView,setJourneyView]=useState(()=>activeAttempt?(activeAttempt.kind==="post"?"retest":"assess"):st.confirmed?"gap":"profile");const t=useT();const done=(st?.attempts||[]).filter(a=>a.status==="done");const reviewedAttempts=done.filter(a=>a.review_decision).sort((a,b)=>(b.reviewed_at||0)-(a.reviewed_at||0));const latestReviewed=reviewedAttempts[0];const latest=latestReviewed;
+ useEffect(()=>{const poll=()=>{if(document.visibilityState==="visible")refresh();};const timer=setInterval(poll,30000);window.addEventListener("focus",poll);return()=>{clearInterval(timer);window.removeEventListener("focus",poll);};},[refresh]);
+ const nav=[{id:"overview",label:"Overview",icon:"⌂",group:"WORKSPACE"},{id:"profile",label:"My profile",icon:"◉",group:"WORKSPACE"},{id:"jobs",label:"Find jobs",icon:"↗",group:"WORKSPACE"},{id:"applications",label:"Applications",icon:"▤",group:"WORKSPACE"},{id:"journey",label:"Skill journey",icon:"⌁",group:"GROWTH"},{id:"assessment-records",label:t("assessmentRecords"),icon:"◷",group:"GROWTH"},{id:"passport",label:"Skill Passport",icon:"◇",group:"GROWTH"},{id:"privacy",label:"Data & privacy",icon:"▣",group:"ACCOUNT"}];
+ const go=id=>{if(activeAttempt)return;setSection(id);window.scrollTo({top:0,behavior:"smooth"});};
+ return <div className="candidate-shell"><aside className="candidate-sidebar"><div className="sidebar-brand"><span className="brand-mark">S</span><span>SkillBridge<small>CAREER WORKSPACE</small></span></div><div className="sidebar-profile"><div className="avatar-small">{(st.user?.name||"C").split(" ").map(x=>x[0]).join("").slice(0,2).toUpperCase()}</div><div><strong>{st.user?.name}</strong><small>Candidate account</small></div></div>{["WORKSPACE","GROWTH","ACCOUNT"].map(group=><div className="sidebar-group" key={group}><p>{group}</p>{nav.filter(n=>n.group===group).map(n=><button key={n.id} className={section===n.id?"active":""} disabled={!!activeAttempt} onClick={()=>go(n.id)}><span>{n.icon}</span>{n.label}{n.id==="assessment-records"&&done.length>0&&<small className="sidebar-nav-count">{done.length}</small>}</button>)}</div>)}<div className="sidebar-bottom"><div className="sidebar-tip"><strong>Keep growing</strong><p>Verify skills, learn from gaps and build proof of progress.</p><button disabled={!!activeAttempt} onClick={()=>go("journey")}>Continue learning →</button></div><p className="sidebar-version">SkillBridge · Candidate</p></div></aside>
+ <main className="candidate-main"><header className="candidate-topbar"><div className="mobile-brand"><span className="brand-mark">S</span><strong>SkillBridge</strong></div><div className="breadcrumb">Candidate workspace <span>/</span> {nav.find(n=>n.id===section)?.label}</div><div className="topbar-actions"><div className="language-switch"><select aria-label="Language" value={localStorage.getItem("sb_lang")||"en"} onChange={e=>{localStorage.setItem("sb_lang",e.target.value);location.reload();}}><option value="en">English</option><option value="bn">বাংলা</option></select></div><div className="topbar-avatar">{(st.user?.name||"C")[0]?.toUpperCase()}</div><button className="candidate-logout" disabled={!!activeAttempt} onClick={onLogout}>Sign out</button></div></header><div className="candidate-page">
  {section==="overview"&&<><section className="welcome-banner"><div><span className="eyebrow light">YOUR CAREER, YOUR PROGRESS</span><h1>Welcome back, {(st.user?.name||"Candidate").split(" ")[0]}.</h1><p>Build your profile, verify your skills and discover opportunities that fit your goals.</p><div className="welcome-actions"><button className="btn btn-light" onClick={()=>go("profile")}>Complete my profile →</button><button className="welcome-link" onClick={()=>go("journey")}>Continue skill journey ↗</button></div></div><div className="welcome-art" aria-hidden="true"><div className="art-orbit orbit-one"/><div className="art-orbit orbit-two"/><div className="art-center">SB</div><span className="art-node node-one">✦</span><span className="art-node node-two">✓</span><span className="art-node node-three">↗</span></div></section><div className="dashboard-section-heading"><div><span className="eyebrow">YOUR WORKSPACE</span><h2>Your career at a glance</h2></div></div><div className="metric-grid"><button className="metric-card" onClick={()=>go("profile")}><span className="metric-icon">◉</span><span className="metric-label">Profile & CV</span><strong>{st.has_cv?"CV added":"Build profile"}</strong><small>{st.confirmed?.length||0} confirmed skills</small></button><button className="metric-card" onClick={()=>go("journey")}><span className="metric-icon">✓</span><span className="metric-label">Assessments</span><strong>{done.length} completed</strong><small>{latest?"Latest score: "+(latest.overall??"—")+"%":"Verify your skills"}</small></button><button className="metric-card" onClick={()=>go("applications")}><span className="metric-icon">▤</span><span className="metric-label">Applications</span><strong>Track progress</strong><small>Manage result sharing</small></button><button className="metric-card" onClick={()=>go("passport")}><span className="metric-icon">◇</span><span className="metric-label">Skill Passport</span><strong>{st.passports?.filter(x=>!x.revoked).length||0} active</strong><small>Share verified evidence</small></button></div><div className="dashboard-lower"><section className="portal-panel"><span className="eyebrow">RECOMMENDED NEXT STEP</span><h2>{!st.confirmed?"Build your candidate profile":done.length===0?"Verify your skills":"Keep growing your skills"}</h2><p>{!st.confirmed?"Add your background and review the skills extracted from your CV.":done.length===0?"Take an assessment to understand your strengths and learning gaps.":"Use your learning path to practice and measure your progress."}</p><button className="btn" onClick={()=>go(!st.confirmed?"profile":"journey")}>{!st.confirmed?"Open profile":"Open skill journey"} →</button></section><section className="portal-panel quick-links"><h2>Quick links</h2>{[{id:"profile",label:"Edit professional profile"},{id:"jobs",label:"Browse opportunities"},{id:"applications",label:"Manage result sharing"},{id:"privacy",label:"Export or delete data"}].map(x=><button key={x.id} onClick={()=>go(x.id)}>{x.label}<b>→</b></button>)}</section></div></>}
  {section==="profile"&&<><div className="page-title"><div><span className="eyebrow">CANDIDATE DETAILS</span><h1>My profile</h1><p>Manage your professional story, education, experience, projects and job preferences.</p></div></div><CandidateProfileEditor onSaved={refresh}/><section className="portal-panel assessment-history"><div className="dashboard-section-heading"><div><span className="eyebrow">VERIFIED ASSESSMENT RESULTS</span><h2>Assessment results</h2><p>Only an administrator-approved assessment is treated as valid.</p></div></div>{(()=>{const approved=(st.attempts||[]).filter(a=>a.status==="done"&&a.review_decision==="approved").sort((a,b)=>(b.finished||0)-(a.finished||0));const other=(st.attempts||[]).filter(a=>a.status==="done"&&(!approved.length||a.id!==approved[0].id)).sort((a,b)=>(b.finished||0)-(a.finished||0));const latest=approved[0];const date=v=>v?new Date(Number(v)*1000).toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"}):"Date unavailable";const status=a=>a.review_decision==="approved"?"Valid exam":a.review_decision==="invalidated"?"Invalidated":"Under review";return <>{latest?<div className="assessment-featured"><div><span className="eyebrow">LATEST VALID EXAM</span><h3>{latest.kind==="pre"?"Initial assessment":latest.kind==="post"?"Reassessment":"Assessment"}</h3><p>{date(latest.finished)}</p></div><strong>{latest.overall??"—"}<small>/ 100</small></strong><span className="status-pill">Valid exam</span></div>:<div className="assessment-pending-banner"><strong>No valid exam result yet</strong><p>Your completed exam marks will remain under review until an administrator reviews them.</p></div>}{other.length>0&&<><h3>Other exam attempts</h3><div className="assessment-history-list">{other.map(a=><div className="assessment-history-row" key={a.id}><div><strong>{a.kind==="pre"?"Initial assessment":a.kind==="post"?"Reassessment":"Assessment"}</strong><small>{date(a.finished)}</small></div><strong>{a.overall??"—"}<small>/ 100</small></strong><span className={"status-pill "+(a.review_decision==="approved"?"status-valid":a.review_decision==="invalidated"?"status-invalid":"status-review")}>{status(a)}</span></div>)}</div></>}</>;})()}</section><div className="page-title cv-title"><div><span className="eyebrow">CV & SKILLS</span><h2>Resume and skills</h2><p>Upload a CV, review extracted skills and confirm what represents you.</p></div></div><Profile st={st} onDone={async()=>{await refresh();go("journey");}}/></>}
  {section==="jobs"&&<><div className="page-title"><div><span className="eyebrow">OPPORTUNITIES</span><h1>Find jobs</h1><p>Search the current marketplace and apply to a suitable role.</p></div></div><CandidateJobs/></>}
  {section==="applications"&&<><div className="page-title"><div><span className="eyebrow">YOUR JOB SEARCH</span><h1>Applications</h1><p>Track submitted applications and manage assessment result sharing.</p></div></div><CandidateApplications/></>}
- {section==="journey"&&<><div className="page-title"><div><span className="eyebrow">SKILL DEVELOPMENT</span><h1>Skill journey</h1><p>Move from claimed skills to verified evidence, learning and re-assessment.</p></div></div><nav className="steps">{STEPS.map((s,i)=><button key={s} className={(journeyView===s?"on ":"")+(done.length===0&&["learn","retest","passport"].includes(s)?"dim":"")} onClick={()=>setJourneyView(s)}><span className="n">{i+1}</span>{t("steps")[s]}</button>)}</nav><div className="portal-panel journey-content"><ProfileJourneyRouter st={st} refresh={refresh} tick={tick} setTick={setTick} done={done} v={journeyView} setV={setJourneyView}/></div></>}
+ {section==="assessment-records"&&<AssessmentRecords attempts={done} onRefresh={refresh}/>}
+ {section==="journey"&&<><div className="page-title"><div><span className="eyebrow">SKILL DEVELOPMENT</span><h1>Skill journey</h1><p>Move from claimed skills to verified evidence, learning and re-assessment.</p></div></div><nav className="steps">{STEPS.map((s,i)=><button key={s} disabled={!!activeAttempt&&s!==(activeAttempt.kind==="post"?"retest":"assess")} className={(journeyView===s?"on ":"")+(done.length===0&&["learn","retest","passport"].includes(s)?"dim":"")} onClick={()=>setJourneyView(s)}><span className="n">{i+1}</span>{t("steps")[s]}</button>)}</nav><div className="portal-panel journey-content"><ProfileJourneyRouter st={st} refresh={refresh} tick={tick} setTick={setTick} done={done} v={journeyView} setV={setJourneyView}/></div></>}
  {section==="passport"&&<><div className="page-title"><div><span className="eyebrow">VERIFIABLE PROOF</span><h1>Skill Passport</h1><p>Choose verified topics to share and revoke public links whenever you need.</p></div></div><Passport st={st} refresh={refresh}/></>}
  {section==="privacy"&&<><div className="page-title"><div><span className="eyebrow">YOUR DATA</span><h1>Data & privacy</h1><p>Export a copy of your data or request account deletion.</p></div></div><DataRights/><section className="portal-panel"><h2>Privacy basics</h2><ul className="privacy-list"><li>Review CV-extracted skills before confirming them.</li><li>Assessment integrity signals are review signals, not automatic proof of misconduct.</li><li>Sharing results with an employer is optional and revocable.</li></ul></section></>}
- </div><footer className="candidate-footer"><span>SkillBridge Candidate Workspace</span><span>Build skills. Show evidence. Keep growing.</span></footer></main></div>;
+ </div><AssessmentNotifications attempts={reviewedAttempts} onRefresh={refresh}/><footer className="candidate-footer"><span>SkillBridge Candidate Workspace</span><span>Build skills. Show evidence. Keep growing.</span></footer></main></div>;
 }
 function ProfileJourneyRouter({st,refresh,tick,setTick,done,v,setV}) {
  const unlimitedCandidate = (st?.user?.email || "").trim().toLowerCase() === "i@gmail.com";
